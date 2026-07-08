@@ -102,6 +102,13 @@ of real agentic use.
 
 ## Quick Start
 
+> 🤖 **Setting up with an AI agent?** Hand your agent
+> [docs/AGENT_SETUP.md](docs/AGENT_SETUP.md) — a guided procedure where the
+> agent discovers your hardware, installs dependencies, asks you the human
+> questions (model location, pipeline split), and boots + verifies the
+> cluster for you.
+
+
 This project assumes two Apple Silicon Macs with SSH between them and a local
 MiniMax-M3 MLX model.
 
