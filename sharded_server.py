@@ -1,0 +1,12671 @@
+#!/usr/bin/env python3
+"""
+Pipeline-parallel OpenAI server for MiniMax-M3 across two Macs.
+
+WHAT THIS IS
+  A 2-rank pipeline-parallel server. Rank 0 owns the last
+  layers + lm_head and serves the OpenAI API; rank 1 owns
+  the first layers (embeddings) and mirrors rank 0's generation in
+  lockstep. Communication goes over the configured MLX/JACCL data link.
+
+ROBUSTNESS DESIGN (the hard-won lessons)
+  - Memory crashes: every generation is wrapped in try/except on BOTH
+    ranks. On any error both ranks call mx.clear_cache() to release Metal
+    memory back to the OS. The HTTP layer never hangs and never orphans.
+  - The 4th-request crash: stream_generate runs on a module-level
+    thread-local generation_stream that accumulates Metal command buffers.
+    We refresh it with a FRESH stream per request (see _refresh_generation_stream).
+  - Reasoning vs content routing: MiniMax-M3 emits <mm:think>...</mm:think>
+    before the answer. We split reasoning/content the SAME way the official
+    mlx_vlm server does (split_stream_thinking_delta), not via naive
+    string-splitting. This is what makes OpenWebUI show the thinking
+    dropdown correctly.
+
+COORDINATION
+  - Rank 0 broadcasts each request; both ranks run stream_generate in lockstep.
+  - The model's send/recv (in __call__) + all_gather keep ranks synced.
+  - thinking_mode defaults to "enabled" for OpenWebUI. Agent/coding clients
+    can use the m3-agent/m3-coder/m3-no-think aliases or override per request.
+  - Vision (image-to-text) is preserved via OpenAI multimodal format.
+"""
+import logging
+import asyncio
+import gc
+import hashlib
+import importlib.metadata
+import json
+import os
+import pickle
+import queue
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import traceback
+import uuid
+from array import array
+from collections import OrderedDict
+from contextlib import asynccontextmanager, contextmanager
+
+import mlx.core as mx
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [rank ?] %(levelname)s %(message)s")
+logger = logging.getLogger("sharded_server")
+
+MODEL = os.environ.get("MLX_M3_MODEL", "mlx-community/MiniMax-M3-4bit")
+MODEL_ID = os.environ.get("MLX_M3_MODEL_ID", "mlx-community/MiniMax-M3-4bit")
+SHARDING_MODE = os.environ.get("M3_SHARDING_MODE", "tensor").strip().lower()
+VISIBLE_THINK_MODEL_ID = "Minimax-M3"
+VISIBLE_NO_THINK_MODEL_ID = "Minimax-M3-No-Think"
+VISIBLE_WEB_MODEL_ID = "M3-Web"
+MODEL_MODE_ALIASES = {
+    "m3": "enabled",
+    "minimax-m3": "enabled",
+    "minimax-m3-think": "enabled",
+    "minimax-m3-thinking": "enabled",
+    "m3-think": "enabled",
+    "m3-web": "enabled",
+    "m3 web": "enabled",
+    "minimax-m3-web": "enabled",
+    "minimax m3 web": "enabled",
+    "m3-openwebui": "enabled",
+    "m3-adaptive": "adaptive",
+    "minimax-m3-adaptive": "adaptive",
+    "m3-agent": "disabled",
+    "m3-coder": "disabled",
+    "m3-no-think": "disabled",
+    "m3-nothink": "disabled",
+    "m3-no-thinking": "disabled",
+    "minimax-m3-no-think": "disabled",
+    "minimax-m3-nothink": "disabled",
+    "minimax-m3-no-thinking": "disabled",
+}
+WEB_MODEL_ALIASES = {
+    "m3-web",
+    "m3 web",
+    "minimax-m3-web",
+    "minimax m3 web",
+}
+MODEL_ALIASES = tuple(
+    dict.fromkeys([
+        MODEL_ID,
+        MODEL,
+        VISIBLE_THINK_MODEL_ID,
+        VISIBLE_NO_THINK_MODEL_ID,
+        VISIBLE_WEB_MODEL_ID,
+        *MODEL_MODE_ALIASES.keys(),
+    ])
+)
+VISIBLE_MODEL_IDS = (
+    VISIBLE_THINK_MODEL_ID,
+    VISIBLE_NO_THINK_MODEL_ID,
+    VISIBLE_WEB_MODEL_ID,
+)
+HOST = os.environ.get("MLX_M3_HOST", "0.0.0.0")
+PORT = int(os.environ.get("MLX_M3_PORT", "8080"))
+REQUEST_HISTORY_MAX = int(os.environ.get("MLX_M3_REQUEST_HISTORY_MAX", "32") or "32")
+PREFILL_STEP_SIZE = int(os.environ.get("MLX_M3_PREFILL_STEP_SIZE", "128"))
+MLX_MAX_OPS_PER_BUFFER = int(os.environ.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
+MLX_MAX_MB_PER_BUFFER = int(os.environ.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
+MAX_KV_SIZE = int(os.environ.get("MLX_M3_MAX_KV_SIZE", "250000"))
+KV_QUANT_ENABLED = os.environ.get(
+    "MLX_M3_KV_QUANT_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+KV_BITS = float(os.environ.get("MLX_M3_KV_BITS", "4") or "4")
+KV_GROUP_SIZE = int(os.environ.get("MLX_M3_KV_GROUP_SIZE", "64") or "64")
+KV_QUANT_SCHEME = os.environ.get("MLX_M3_KV_QUANT_SCHEME", "uniform").strip().lower()
+if KV_QUANT_SCHEME not in {"uniform", "turboquant"}:
+    logger.warning(
+        "invalid MLX_M3_KV_QUANT_SCHEME=%r; falling back to uniform",
+        KV_QUANT_SCHEME,
+    )
+    KV_QUANT_SCHEME = "uniform"
+QUANTIZED_KV_START = int(os.environ.get("MLX_M3_QUANTIZED_KV_START", "5000") or "5000")
+DEFAULT_MAX_TOKENS = int(os.environ.get("MLX_M3_DEFAULT_MAX_TOKENS", "4096"))
+NONSTREAM_DEFAULT_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_NONSTREAM_DEFAULT_MAX_TOKENS", "512") or "512"
+)
+OPENWEBUI_DEFAULT_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_OPENWEBUI_DEFAULT_MAX_TOKENS", "2048") or "2048"
+)
+DEFAULT_TEMPERATURE = float(os.environ.get("MLX_M3_DEFAULT_TEMPERATURE", "0") or "0")
+DEFAULT_TOP_P = float(os.environ.get("MLX_M3_DEFAULT_TOP_P", "1.0") or "1.0")
+DEFAULT_TOP_K = int(os.environ.get("MLX_M3_DEFAULT_TOP_K", "0") or "0")
+DEFAULT_MIN_P = float(os.environ.get("MLX_M3_DEFAULT_MIN_P", "0.0") or "0.0")
+TOOL_DEFAULT_TEMPERATURE = float(
+    os.environ.get("MLX_M3_TOOL_DEFAULT_TEMPERATURE", "0") or "0"
+)
+TOOL_DEFAULT_TOP_P = float(os.environ.get("MLX_M3_TOOL_DEFAULT_TOP_P", "1.0") or "1.0")
+TOOL_DEFAULT_TOP_K = int(os.environ.get("MLX_M3_TOOL_DEFAULT_TOP_K", "0") or "0")
+TOOL_DEFAULT_MIN_P = float(os.environ.get("MLX_M3_TOOL_DEFAULT_MIN_P", "0.0") or "0.0")
+TOOL_COMPAT_OVERLAY = os.environ.get(
+    "MLX_M3_TOOL_COMPAT_OVERLAY", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+TOOL_THINKING_MODE = os.environ.get("MLX_M3_TOOL_THINKING_MODE", "request").strip().lower()
+if TOOL_THINKING_MODE not in {"request", "enabled", "disabled", "adaptive"}:
+    logger.warning(
+        "invalid MLX_M3_TOOL_THINKING_MODE=%r; using request",
+        TOOL_THINKING_MODE,
+    )
+    TOOL_THINKING_MODE = "request"
+TOOL_SYSTEM_HINT_ENABLED = os.environ.get(
+    "MLX_M3_TOOL_SYSTEM_HINT", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+TOOL_SYSTEM_HINT_TEXT = os.environ.get(
+    "MLX_M3_TOOL_SYSTEM_HINT_TEXT",
+    (
+        "When tools are available and a tool is needed, emit the actual tool "
+        "call using the provided tool-call format. Do not merely say that you "
+        "will search, inspect, run, or use a tool. After tool results are "
+        "available, answer from those results as soon as you have enough "
+        "evidence. Do not repeat the same file-listing or file-reading command "
+        "unless the previous result clearly failed or new information is "
+        "required. If tool results already answer the user's request, provide "
+        "the final answer now instead of calling another tool just to list "
+        "files or re-read already seen context. Only call tool names that are "
+        "present in the current request's tool list."
+    ),
+)
+TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS = int(
+    os.environ.get("MLX_M3_TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS", "0") or "0"
+)
+TOOL_LOOP_STEER_MAX_REPEATED_TOOL = int(
+    os.environ.get("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_TOOL", "0") or "0"
+)
+TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS = int(
+    os.environ.get("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS", "0") or "0"
+)
+TOOL_LOOP_FORCE_FINAL_AFTER = int(
+    os.environ.get("MLX_M3_TOOL_LOOP_FORCE_FINAL_AFTER", "0") or "0"
+)
+TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS = int(
+    os.environ.get(
+        "MLX_M3_TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS",
+        "0",
+    )
+    or "0"
+)
+TOOL_LOOP_FILTER_CONTROL_TOOLS = {
+    name.strip()
+    for name in os.environ.get(
+        "MLX_M3_TOOL_LOOP_FILTER_CONTROL_TOOLS",
+        "update_plan,create_goal,update_goal",
+    ).split(",")
+    if name.strip()
+}
+TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS = {
+    name.strip()
+    for name in os.environ.get(
+        "MLX_M3_TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS",
+        "",
+    ).split(",")
+    if name.strip()
+}
+TOOL_UNUSABLE_RETRY_ATTEMPTS = int(
+    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_ATTEMPTS", "2") or "0"
+)
+TOOL_UNUSABLE_RETRY_TEMPERATURES = [
+    float(part)
+    for part in os.environ.get(
+        "MLX_M3_TOOL_UNUSABLE_RETRY_TEMPERATURES", "0.3,0.7"
+    ).split(",")
+    if part.strip()
+] or [0.3, 0.7]
+# Hard cap on a retry's decode budget. A valid tool call stops decode early,
+# so this only bounds pathological thinking rambles; long hot-suffix decodes
+# are also the JACCL wedge-prone regime, so keep retries short.
+TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "4096") or "0"
+)
+DEFAULT_REPETITION_PENALTY = float(
+    os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
+)
+# Tool turns only: a mild penalty breaks the quantized model's repetition
+# spirals ("keep it nice" x100s) that burn whole tool budgets without ever
+# forming a call. Chat sampling is unaffected.
+TOOL_DEFAULT_REPETITION_PENALTY = float(
+    os.environ.get("MLX_M3_TOOL_DEFAULT_REPETITION_PENALTY", "0") or "0"
+)
+# Tools to hide from the model (comma-separated). MiniMax-4bit reliably
+# invents its own patch dialects for apply_patch while its exec_command
+# shell writes are dependable; hiding the patch tool routes file work
+# through the shell instead of a doomed format.
+TOOL_HIDE_NAMES = {
+    name.strip()
+    for name in os.environ.get("MLX_M3_TOOL_HIDE_NAMES", "").split(",")
+    if name.strip()
+}
+DEFAULT_PRESENCE_PENALTY = float(
+    os.environ.get("MLX_M3_DEFAULT_PRESENCE_PENALTY", "0") or "0"
+)
+DEFAULT_FREQUENCY_PENALTY = float(
+    os.environ.get("MLX_M3_DEFAULT_FREQUENCY_PENALTY", "0") or "0"
+)
+IMAGE_DEFAULT_MAX_TOKENS = int(os.environ.get("MLX_M3_IMAGE_DEFAULT_MAX_TOKENS", "768"))
+IMAGE_MAX_TOKENS = int(os.environ.get("MLX_M3_IMAGE_MAX_TOKENS", "0"))
+
+def _rank_scoped_float_env(base_name, default="0"):
+    rank = os.environ.get("MLX_RANK", "").strip()
+    if rank:
+        scoped = os.environ.get(f"{base_name}_RANK{rank}")
+        if scoped not in (None, ""):
+            return float(scoped)
+    return float(os.environ.get(base_name, default) or default)
+
+
+WIRED_LIMIT_GB = _rank_scoped_float_env("MLX_M3_WIRED_LIMIT_GB", "0")
+MEMORY_LIMIT_GB = float(os.environ.get("MLX_M3_MEMORY_LIMIT_GB", "0") or "0")
+CACHE_LIMIT_GB = float(os.environ.get("MLX_M3_CACHE_LIMIT_GB", "4") or "4")
+STREAM_MODE = os.environ.get("MLX_M3_STREAM_MODE", "buffered").strip().lower()
+if STREAM_MODE not in {"buffered"}:
+    logger.warning(
+        "MLX_M3_STREAM_MODE=%r is not supported in this distributed gateway; "
+        "using buffered SSE",
+        STREAM_MODE,
+    )
+    STREAM_MODE = "buffered"
+MAX_CONCURRENT_REQUESTS = max(
+    1, int(os.environ.get("MLX_M3_MAX_CONCURRENT_REQUESTS", "1") or "1")
+)
+# Distributed MiniMax-M3 generation is intentionally single-flight for now:
+# both ranks share one model/prompt-cache state and must stay in lockstep.
+EFFECTIVE_MAX_CONCURRENT_REQUESTS = 1
+SSE_KEEPALIVE_SECONDS = float(os.environ.get("MLX_M3_SSE_KEEPALIVE_SECONDS", "5"))
+# Stream visible content live during tool-bearing turns (agent clients like
+# opencode otherwise see total silence for the whole turn). A small tail is
+# held back so tool-call markup can never leak, and streaming goes silent at
+# the first '<' out of caution (code-heavy turns fall back to buffered UX).
+# Truncation protections are UNCHANGED — decode stops still require a closed
+# tool block; only delta visibility changes. Default off = buffered baseline.
+TOOL_STREAM_CONTENT = os.environ.get("MLX_M3_TOOL_STREAM_CONTENT", "0") == "1"
+TOOL_STREAM_HOLDBACK_CHARS = max(
+    8, int(os.environ.get("MLX_M3_TOOL_STREAM_HOLDBACK_CHARS", "24") or "24")
+)
+# Synthesizing a `justification` argument the model never wrote puts
+# server-authored text into clients' audit/approval flows. Off unless an
+# operator explicitly wants the convenience (2026-07-06 audit).
+TOOL_SYNTH_JUSTIFICATION = os.environ.get(
+    "MLX_M3_TOOL_SYNTH_JUSTIFICATION", "0"
+) == "1"
+RANK1_IDLE_SLEEP_SECONDS = max(
+    0.0, float(os.environ.get("MLX_M3_RANK1_IDLE_SLEEP_SECONDS", "0.01") or "0.01")
+)
+DEFAULT_SEED = int(os.environ.get("MLX_M3_DEFAULT_SEED", "1"))
+TOOL_DEFAULT_SEED = int(os.environ.get("MLX_M3_TOOL_DEFAULT_SEED", str(DEFAULT_SEED)))
+DECODE_EVAL_EVERY = int(os.environ.get("MLX_M3_DECODE_EVAL_EVERY", "0"))
+DECODE_EVAL_AFTER_TOKENS = int(os.environ.get("MLX_M3_DECODE_EVAL_AFTER_TOKENS", "512"))
+DECODE_EVAL_AFTER_EVERY = int(os.environ.get("MLX_M3_DECODE_EVAL_AFTER_EVERY", "1"))
+THINKING_DECODE_EVAL_EVERY = int(os.environ.get("MLX_M3_THINKING_DECODE_EVAL_EVERY", "1"))
+LONG_CONTEXT_DECODE_EVAL_TOKENS = int(
+    os.environ.get("MLX_M3_LONG_CONTEXT_DECODE_EVAL_TOKENS", "24576") or "24576"
+)
+LONG_CONTEXT_DECODE_EVAL_EVERY = int(
+    os.environ.get("MLX_M3_LONG_CONTEXT_DECODE_EVAL_EVERY", "3") or "3"
+)
+ADAPTIVE_LONG_CONTEXT_DECODE_EVAL = os.environ.get(
+    "MLX_M3_ADAPTIVE_LONG_CONTEXT_DECODE_EVAL", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+MID_CONTEXT_DECODE_EVAL_TOKENS = int(
+    os.environ.get("MLX_M3_MID_CONTEXT_DECODE_EVAL_TOKENS", "24576") or "24576"
+)
+MID_CONTEXT_DECODE_EVAL_EVERY = int(
+    os.environ.get("MLX_M3_MID_CONTEXT_DECODE_EVAL_EVERY", "4") or "4"
+)
+HIGH_CONTEXT_DECODE_EVAL_TOKENS = int(
+    os.environ.get("MLX_M3_HIGH_CONTEXT_DECODE_EVAL_TOKENS", "98304") or "98304"
+)
+HIGH_CONTEXT_DECODE_EVAL_EVERY = int(
+    os.environ.get("MLX_M3_HIGH_CONTEXT_DECODE_EVAL_EVERY", "3") or "3"
+)
+SPARSE_TOPK_BLOCKS_OVERRIDE = int(
+    os.environ.get("MLX_M3_SPARSE_TOPK_BLOCKS_OVERRIDE", "0") or "0"
+)
+ADAPTIVE_PREFILL_STEP_TOKENS = int(
+    os.environ.get("MLX_M3_ADAPTIVE_PREFILL_STEP_TOKENS", "262144") or "262144"
+)
+ADAPTIVE_PREFILL_STEP_SIZE = int(
+    os.environ.get("MLX_M3_ADAPTIVE_PREFILL_STEP_SIZE", "2048") or "2048"
+)
+ALLOW_UNSAFE_RUNTIME_TUNING = os.environ.get(
+    "MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_MIN_SUFFIX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_MIN_SUFFIX_TOKENS", "0") or "0"
+)
+PROMPT_CACHE_FAST_MIN_SUFFIX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_FAST_MIN_SUFFIX_TOKENS", "1") or "1"
+)
+PROMPT_CACHE_FAST_THINKING_MIN_SUFFIX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_FAST_THINKING_MIN_SUFFIX_TOKENS", "64") or "64"
+)
+PROMPT_CACHE_REUSE_BUCKET_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_REUSE_BUCKET_TOKENS", "0") or "0"
+)
+_runtime_tuning_lock = threading.RLock()
+_runtime_tuning = {
+    "prefill_step_size": PREFILL_STEP_SIZE,
+    "long_context_decode_eval_tokens": LONG_CONTEXT_DECODE_EVAL_TOKENS,
+    "long_context_decode_eval_every": LONG_CONTEXT_DECODE_EVAL_EVERY,
+    "thinking_decode_eval_every": THINKING_DECODE_EVAL_EVERY,
+    "adaptive_long_context_decode_eval": int(ADAPTIVE_LONG_CONTEXT_DECODE_EVAL),
+    "mid_context_decode_eval_tokens": MID_CONTEXT_DECODE_EVAL_TOKENS,
+    "mid_context_decode_eval_every": MID_CONTEXT_DECODE_EVAL_EVERY,
+    "high_context_decode_eval_tokens": HIGH_CONTEXT_DECODE_EVAL_TOKENS,
+    "high_context_decode_eval_every": HIGH_CONTEXT_DECODE_EVAL_EVERY,
+    "prompt_cache_min_suffix_tokens": PROMPT_CACHE_MIN_SUFFIX_TOKENS,
+    "prompt_cache_reuse_bucket_tokens": PROMPT_CACHE_REUSE_BUCKET_TOKENS,
+    "visible_transcript_prewarm_min_generated": int(
+        os.environ.get("MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED", "16") or "16"
+    ),
+    "sparse_topk_blocks": SPARSE_TOPK_BLOCKS_OVERRIDE,
+    "decode_topk_reuse_tokens": int(
+        os.environ.get("MLX_M3_DECODE_TOPK_REUSE_TOKENS", "0") or "0"
+    ),
+    "compact_decode_sort_topk": int(
+        os.environ.get("MLX_M3_COMPACT_DECODE_SORT_TOPK", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ),
+}
+_applied_decode_runtime = {
+    "decode_topk_reuse_tokens": None,
+    "compact_decode_sort_topk": None,
+}
+
+
+def _runtime_tuning_status():
+    with _runtime_tuning_lock:
+        return dict(_runtime_tuning)
+
+
+def _runtime_prefill_step_size(prompt_tokens=None, suffix_tokens=None):
+    with _runtime_tuning_lock:
+        base = int(_runtime_tuning.get("prefill_step_size") or PREFILL_STEP_SIZE)
+    if (
+        ADAPTIVE_PREFILL_STEP_TOKENS > 0
+        and ADAPTIVE_PREFILL_STEP_SIZE > 0
+        and prompt_tokens is not None
+        and int(prompt_tokens) >= ADAPTIVE_PREFILL_STEP_TOKENS
+        and base > ADAPTIVE_PREFILL_STEP_SIZE
+    ):
+        return ADAPTIVE_PREFILL_STEP_SIZE
+    return base
+
+
+def _runtime_visible_transcript_prewarm_min_generated():
+    with _runtime_tuning_lock:
+        value = _runtime_tuning.get("visible_transcript_prewarm_min_generated")
+        if value is None:
+            return int(VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED)
+        return int(value)
+
+
+def _runtime_prompt_cache_min_suffix_tokens():
+    with _runtime_tuning_lock:
+        value = _runtime_tuning.get("prompt_cache_min_suffix_tokens")
+        if value is None:
+            return int(PROMPT_CACHE_MIN_SUFFIX_TOKENS)
+        return int(value)
+
+
+def _effective_prompt_cache_min_suffix_tokens(
+    thinking_mode,
+    session_source,
+    *,
+    session_id=None,
+    cached_session_id=None,
+    miss_reason=None,
+):
+    """Pick the min suffix floor for the current cache reuse path.
+
+    A larger floor protects ambiguous visible-thinking reuse where the cached
+    assistant reasoning boundary may differ across turns. Same-session reuse
+    is rank-stable and should keep the fast suffix floor; otherwise short
+    OpenWebUI thinking turns spend seconds re-prefilling tokens already in KV.
+    """
+    configured = _runtime_prompt_cache_min_suffix_tokens()
+    if configured <= PROMPT_CACHE_FAST_MIN_SUFFIX_TOKENS:
+        return configured
+    visible_thinking = (
+        _enable_thinking_for_generation(thinking_mode)
+        and PROMPT_CACHE_THINKING_MODE == "visible"
+    )
+    if visible_thinking:
+        same_session = bool(
+            session_id
+            and cached_session_id
+            and session_id == cached_session_id
+        )
+        exact_or_same_prompt = miss_reason in {
+            None,
+            "exact_prior_transcript",
+            "exact_prompt",
+        }
+        if same_session or exact_or_same_prompt:
+            return max(
+                0,
+                min(configured, PROMPT_CACHE_FAST_THINKING_MIN_SUFFIX_TOKENS),
+            )
+        return configured
+    return max(0, min(configured, PROMPT_CACHE_FAST_MIN_SUFFIX_TOKENS))
+
+
+def _runtime_prompt_cache_reuse_bucket_tokens():
+    with _runtime_tuning_lock:
+        value = _runtime_tuning.get("prompt_cache_reuse_bucket_tokens")
+        if value is None:
+            return int(PROMPT_CACHE_REUSE_BUCKET_TOKENS)
+        return int(value)
+
+
+def _set_runtime_tuning(values):
+    allowed = {
+        "prefill_step_size": (128, 16384),
+        "long_context_decode_eval_tokens": (0, 1_000_000),
+        "long_context_decode_eval_every": (
+            0,
+            16 if ALLOW_UNSAFE_RUNTIME_TUNING else max(3, LONG_CONTEXT_DECODE_EVAL_EVERY),
+        ),
+        "thinking_decode_eval_every": (0, 16),
+        "adaptive_long_context_decode_eval": (0, 1),
+        "mid_context_decode_eval_tokens": (0, 1_000_000),
+        "mid_context_decode_eval_every": (0, 16),
+        "high_context_decode_eval_tokens": (0, 1_000_000),
+        "high_context_decode_eval_every": (0, 16),
+        "prompt_cache_min_suffix_tokens": (0, 4096),
+        "prompt_cache_reuse_bucket_tokens": (0, 4096),
+        "visible_transcript_prewarm_min_generated": (0, 16_384),
+        "sparse_topk_blocks": (0, 64),
+        "decode_topk_reuse_tokens": (0, 64),
+        "compact_decode_sort_topk": (0, 1),
+    }
+    changed = {}
+    with _runtime_tuning_lock:
+        proposed = dict(_runtime_tuning)
+        for key, value in values.items():
+            if key not in allowed:
+                continue
+            lo, hi = allowed[key]
+            try:
+                intval = int(value)
+            except Exception as exc:
+                raise ValueError(f"{key} must be an integer") from exc
+            if intval < lo or intval > hi:
+                suffix = ""
+                if key == "long_context_decode_eval_every" and not ALLOW_UNSAFE_RUNTIME_TUNING:
+                    suffix = (
+                        "; higher values reproduced a 107k decode stall/orphan path. "
+                        "Set MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING=1 only for controlled A/B"
+                    )
+                raise ValueError(f"{key} must be between {lo} and {hi}{suffix}")
+            if (
+                key == "prefill_step_size"
+                and not ALLOW_UNSAFE_RUNTIME_TUNING
+                and intval < 4096
+            ):
+                raise ValueError(
+                    "prefill_step_size below 4096 requires "
+                    "MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING=1; "
+                    "3072 reproduced a short-decode stall/orphan path"
+                )
+            proposed[key] = intval
+            if (
+                key == "high_context_decode_eval_every"
+                and not ALLOW_UNSAFE_RUNTIME_TUNING
+                and intval > LONG_CONTEXT_DECODE_EVAL_EVERY
+            ):
+                raise ValueError(
+                    "high_context_decode_eval_every above the safe launch cadence "
+                    "requires MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING=1"
+                )
+            if _runtime_tuning.get(key) != intval:
+                changed[key] = intval
+        if (
+            not ALLOW_UNSAFE_RUNTIME_TUNING
+            and int(proposed.get("adaptive_long_context_decode_eval") or 0)
+            and int(proposed.get("mid_context_decode_eval_every") or 0)
+            > LONG_CONTEXT_DECODE_EVAL_EVERY
+        ):
+            raise ValueError(
+                "adaptive mid-context cadence above the safe launch cadence "
+                "requires MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING=1; "
+                "mid cadence 4 reproduced a 33k cached decode stall/orphan path"
+            )
+        for key, intval in changed.items():
+            _runtime_tuning[key] = intval
+    return changed
+
+
+def _apply_sparse_topk_to_model(model, value):
+    """Update loaded MiniMax sparse attention modules for controlled A/B tests."""
+    try:
+        intval = int(value or 0)
+    except Exception:
+        intval = 0
+    if intval <= 0:
+        return {"requested": intval, "updated": 0, "skipped": "non_positive"}
+
+    seen = set()
+    updated = 0
+
+    def visit(obj, depth=0):
+        nonlocal updated
+        if obj is None or depth > 12:
+            return
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        if hasattr(obj, "sparse_topk_blocks"):
+            try:
+                old = int(getattr(obj, "sparse_topk_blocks"))
+                if old != intval:
+                    setattr(obj, "sparse_topk_blocks", intval)
+                    updated += 1
+            except Exception:
+                pass
+        if isinstance(obj, dict):
+            for child in obj.values():
+                visit(child, depth + 1)
+            return
+        if isinstance(obj, (list, tuple)):
+            for child in obj:
+                visit(child, depth + 1)
+            return
+        attrs = getattr(obj, "__dict__", None)
+        if not attrs:
+            return
+        for child in attrs.values():
+            if isinstance(child, (str, bytes, int, float, bool)):
+                continue
+            visit(child, depth + 1)
+
+    visit(model)
+    return {"requested": intval, "updated": updated}
+
+
+def _clear_decode_topk_caches(model):
+    seen = set()
+    cleared = 0
+
+    def visit(obj, depth=0):
+        nonlocal cleared
+        if obj is None or depth > 12:
+            return
+        oid = id(obj)
+        if oid in seen:
+            return
+        seen.add(oid)
+        if hasattr(obj, "_minimax_m3_decode_topk_cache"):
+            try:
+                delattr(obj, "_minimax_m3_decode_topk_cache")
+                cleared += 1
+            except Exception:
+                pass
+        if isinstance(obj, dict):
+            for child in obj.values():
+                visit(child, depth + 1)
+            return
+        if isinstance(obj, (list, tuple)):
+            for child in obj:
+                visit(child, depth + 1)
+            return
+        attrs = getattr(obj, "__dict__", None)
+        if not attrs:
+            return
+        for child in attrs.values():
+            if isinstance(child, (str, bytes, int, float, bool)):
+                continue
+            visit(child, depth + 1)
+
+    visit(model)
+    return cleared
+
+
+def _apply_decode_runtime_to_model(model, runtime):
+    result = {}
+    minimax_language = None
+    try:
+        from mlx_vlm.models.minimax_m3_vl import language as minimax_language
+    except Exception as exc:
+        import sys
+
+        for name, module in sys.modules.items():
+            if name.endswith("minimax_m3_vl.language"):
+                minimax_language = module
+                break
+        if minimax_language is None:
+            return {"skipped": repr(exc)}
+    if "decode_topk_reuse_tokens" in runtime:
+        value = int(runtime.get("decode_topk_reuse_tokens") or 0)
+        current = getattr(minimax_language, "_MSA_DECODE_TOPK_REUSE_TOKENS", None)
+        applied = minimax_language.set_decode_topk_reuse_tokens(value)
+        previous = _applied_decode_runtime.get("decode_topk_reuse_tokens")
+        baseline = previous if previous is not None else current
+        changed = baseline != applied
+        cleared = _clear_decode_topk_caches(model) if changed else 0
+        _applied_decode_runtime["decode_topk_reuse_tokens"] = applied
+        result["decode_topk_reuse_tokens"] = {
+            "requested": value,
+            "previous": baseline,
+            "applied": applied,
+            "changed": changed,
+            "cleared_layer_caches": cleared,
+        }
+    if "compact_decode_sort_topk" in runtime:
+        value = int(runtime.get("compact_decode_sort_topk") or 0)
+        current = getattr(minimax_language, "_MSA_COMPACT_DECODE_SORT_TOPK", None)
+        applied = minimax_language.set_compact_decode_sort_topk(value)
+        previous = _applied_decode_runtime.get("compact_decode_sort_topk")
+        baseline = previous if previous is not None else current
+        _applied_decode_runtime["compact_decode_sort_topk"] = bool(applied)
+        result["compact_decode_sort_topk"] = {
+            "requested": value,
+            "previous": bool(baseline) if baseline is not None else None,
+            "applied": bool(applied),
+            "changed": (
+                bool(baseline) != bool(applied)
+                if baseline is not None else False
+            ),
+        }
+    return result
+
+
+def _apply_runtime_model_tuning(model):
+    runtime = _runtime_tuning_status()
+    sparse_result = _apply_sparse_topk_to_model(
+        model, runtime.get("sparse_topk_blocks")
+    )
+    decode_result = _apply_decode_runtime_to_model(model, runtime)
+    if int(sparse_result.get("updated") or 0) > 0:
+        decode_result["cleared_after_sparse_topk_change"] = _clear_decode_topk_caches(
+            model
+        )
+    return {
+        "sparse_topk_blocks": sparse_result,
+        "decode_runtime": decode_result,
+    }
+
+
+REFRESH_GENERATION_STREAM = os.environ.get(
+    "MLX_M3_REFRESH_GENERATION_STREAM", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+DEFAULT_THINKING_BUDGET = int(os.environ.get("MLX_M3_THINKING_BUDGET", "0"))
+MIN_THINKING_BUDGET = int(os.environ.get("MLX_M3_MIN_THINKING_BUDGET", "16"))
+ALLOW_THINKING_BUDGET = os.environ.get(
+    "MLX_M3_ALLOW_THINKING_BUDGET", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+VALID_THINKING_MODES = {"enabled", "disabled", "adaptive"}
+DEFAULT_THINKING_MODE = os.environ.get("MLX_M3_THINKING_MODE", "enabled").strip().lower()
+if DEFAULT_THINKING_MODE not in VALID_THINKING_MODES:
+    logger.warning(
+        "invalid MLX_M3_THINKING_MODE=%r; falling back to enabled",
+        DEFAULT_THINKING_MODE,
+    )
+    DEFAULT_THINKING_MODE = "enabled"
+GEN_PARAM_KEYS = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "repetition_penalty",
+    "repetition_context_size",
+    "presence_penalty",
+    "presence_context_size",
+    "frequency_penalty",
+    "frequency_context_size",
+    "logit_bias",
+    "thinking_budget",
+    "thinking_start_token",
+    "thinking_end_token",
+    "resize_shape",
+    "max_long_side_pixel",
+    "skip_special_tokens",
+)
+_SHUTTING_DOWN = False
+_WATCHDOG_TICK = None
+_METAL_LIMITS = {}
+_DECODE_EVAL_CONTEXT = threading.local()
+
+# Cross-request prompt cache (KV reuse across turns). Gated by env so the
+# proven no-cache path remains the fallback.
+PROMPT_CACHE_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_PROMPT_CACHE_THINKING_FLAG = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_THINKING", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_THINKING_MODE = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_THINKING_MODE",
+    "full" if _PROMPT_CACHE_THINKING_FLAG else "off",
+).strip().lower()
+if PROMPT_CACHE_THINKING_MODE not in {"off", "visible", "full"}:
+    logger.warning(
+        "invalid MLX_M3_PROMPT_CACHE_THINKING_MODE=%r; using off",
+        PROMPT_CACHE_THINKING_MODE,
+    )
+    PROMPT_CACHE_THINKING_MODE = "off"
+PROMPT_CACHE_THINKING_ENABLED = PROMPT_CACHE_THINKING_MODE != "off"
+PROMPT_CACHE_DIRECT_SUFFIX_IDS = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_DIRECT_SUFFIX_IDS", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_MIN_REUSE = int(os.environ.get("MLX_M3_PROMPT_CACHE_MIN_REUSE", "32"))
+PROMPT_CACHE_TTL_SECONDS = int(os.environ.get("MLX_M3_PROMPT_CACHE_TTL_SECONDS", "10800"))
+PROMPT_CACHE_MAX_TOKENS = int(os.environ.get("MLX_M3_PROMPT_CACHE_MAX_TOKENS", "0"))
+PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS", "4096") or "4096"
+)
+PROMPT_CACHE_PROTECT_LARGE_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_PROTECT_LARGE", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_PROTECT_MIN_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_PROTECT_MIN_TOKENS", "32768") or "32768"
+)
+PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS", "8192") or "8192"
+)
+PROMPT_CACHE_SESSION_PROTECT_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SESSION_PROTECT", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS", "256") or "256"
+)
+PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS", "8192") or "8192"
+)
+PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS", "512") or "512"
+)
+PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO", "0.915") or "0.915"
+)
+PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_TOKENS", "0") or "0"
+)
+PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_SUFFIX_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_SUFFIX_TOKENS", "0") or "0"
+)
+PROMPT_CACHE_KEEPWARM_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_KEEPWARM", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_KEEPWARM_MODE = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_KEEPWARM_MODE", "metal"
+).strip().lower()
+if PROMPT_CACHE_KEEPWARM_MODE not in {"metal", "prewarm"}:
+    logger.warning(
+        "invalid MLX_M3_PROMPT_CACHE_KEEPWARM_MODE=%r; using metal",
+        PROMPT_CACHE_KEEPWARM_MODE,
+    )
+    PROMPT_CACHE_KEEPWARM_MODE = "metal"
+PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS", "15") or "15"
+)
+PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS", "10") or "10"
+)
+PROMPT_CACHE_KEEPWARM_MATRIX_SIZE = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_MATRIX_SIZE", "1") or "1"
+)
+PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS", "8192") or "8192"
+)
+PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS", "60") or "60"
+)
+PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS", "60") or "60"
+)
+PROMPT_CACHE_REQUEST_START_KEEPWARM_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_REQUEST_START_KEEPWARM", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_REQUEST_START_KEEPWARM_IDLE_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_REQUEST_START_KEEPWARM_IDLE_SECONDS", "2") or "2"
+)
+PROMPT_CACHE_REQUEST_START_KEEPWARM_MATRIX_SIZE = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_REQUEST_START_KEEPWARM_MATRIX_SIZE", "128") or "128"
+)
+PROMPT_CACHE_REQUEST_START_KEEPWARM_REPEATS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_REQUEST_START_KEEPWARM_REPEATS", "1") or "1"
+)
+PROMPT_CACHE_POST_RESPONSE_KEEPWARM_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_POST_RESPONSE_KEEPWARM", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_POST_RESPONSE_KEEPWARM_DELAY_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_POST_RESPONSE_KEEPWARM_DELAY_SECONDS", "5") or "5"
+)
+PROMPT_CACHE_POST_RESPONSE_KEEPWARM_MATRIX_SIZE = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_POST_RESPONSE_KEEPWARM_MATRIX_SIZE", "128") or "128"
+)
+PROMPT_CACHE_POST_RESPONSE_KEEPWARM_REPEATS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_POST_RESPONSE_KEEPWARM_REPEATS", "1") or "1"
+)
+CLEAR_CACHE_AFTER_REQUEST = os.environ.get(
+    "MLX_M3_CLEAR_CACHE_AFTER_REQUEST", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+CLEAR_CACHE_AFTER_ERROR = os.environ.get(
+    "MLX_M3_CLEAR_CACHE_AFTER_ERROR", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SESSION_MAP_MAX = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SESSION_MAP_MAX", "16") or "16"
+)
+PROMPT_CACHE_RESIDENT_SLOTS = max(
+    1,
+    int(os.environ.get("MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS", "1") or "1"),
+)
+def _env_int_rank_aware(name, default):
+    """Per-rank env override: NAME_RANK<n> beats NAME. The ranks have very
+    different headroom (256GB vs 128GB); a shared budget sized for rank 0
+    paged rank 1 into a crawl on 2026-07-06 (the 'frozen decode' stall and
+    the earlier 0.69 t/s slow-turn signature)."""
+    rank = os.environ.get("MLX_RANK", "").strip()
+    if rank:
+        v = os.environ.get(f"{name}_RANK{rank}")
+        if v is not None and str(v).strip():
+            return int(v)
+    return int(os.environ.get(name, str(default)) or str(default))
+
+
+PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS = _env_int_rank_aware(
+    "MLX_M3_PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS", 0
+)
+PROMPT_CACHE_SESSION_MANIFEST_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SESSION_MANIFEST", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SESSION_MANIFEST_MAX = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SESSION_MANIFEST_MAX", "64") or "64"
+)
+PROMPT_CACHE_SESSION_MANIFEST_PATH = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SESSION_MANIFEST_PATH",
+    os.path.join(
+        os.environ.get("M3_LOG_DIR", os.path.dirname(os.path.abspath(__file__))),
+        "prompt_cache_sessions.json",
+    ),
+)
+PROMPT_CACHE_SSD_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_RESTORE_ENABLED = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_RESTORE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_AUTO_SAVE = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_DIR = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "thundermlx", "prompt-kv"),
+)
+PROMPT_CACHE_SSD_DIR_RANK0 = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_DIR_RANK0", ""
+).strip()
+PROMPT_CACHE_SSD_DIR_RANK1 = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_DIR_RANK1", ""
+).strip()
+PROMPT_CACHE_SSD_TTL_SECONDS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SSD_TTL_SECONDS", "432000") or "432000"
+)
+PROMPT_CACHE_SSD_MAX_BYTES = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SSD_MAX_BYTES", "429496729600") or "429496729600"
+)
+PROMPT_CACHE_SSD_MIN_TOKENS = int(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SSD_MIN_TOKENS", "8192") or "8192"
+)
+PROMPT_CACHE_SSD_SAVE_REASONING = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_SAVE_REASONING", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_PRIVACY = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_PRIVACY", "local"
+).strip().lower()
+PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS = float(
+    os.environ.get("MLX_M3_PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS", "10")
+    or "10"
+)
+VISIBLE_TRANSCRIPT_PREWARM_ENABLED = os.environ.get(
+    "MLX_M3_VISIBLE_TRANSCRIPT_PREWARM", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+VISIBLE_TRANSCRIPT_PREWARM_BLOCKING = os.environ.get(
+    "MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_BLOCKING", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED = int(
+    os.environ.get("MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED", "16") or "16"
+)
+VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS = int(
+    os.environ.get("MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS", "8192") or "8192"
+)
+VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS = int(
+    os.environ.get("MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS", "4096") or "4096"
+)
+VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS = int(
+    os.environ.get("MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS", "512") or "512"
+)
+REASONING_RECALL_ENABLED = os.environ.get(
+    "MLX_M3_REASONING_RECALL", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+# Default ON: the thinking model surfaces reasoning on tool turns exactly
+# like oMLX. Callers who want a silent agent lane use the non-thinking
+# model endpoint instead of suppressing reasoning one layer down here.
+EMIT_TOOL_REASONING = os.environ.get(
+    "MLX_M3_EMIT_TOOL_REASONING", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+REASONING_RECALL_MAX_SESSIONS = int(
+    os.environ.get("MLX_M3_REASONING_RECALL_MAX_SESSIONS", "16") or "16"
+)
+REASONING_RECALL_MAX_ITEMS = int(
+    os.environ.get("MLX_M3_REASONING_RECALL_MAX_ITEMS", "64") or "64"
+)
+REASONING_RECALL_MAX_CHARS = int(
+    os.environ.get("MLX_M3_REASONING_RECALL_MAX_CHARS", "65536") or "65536"
+)
+MAX_TOKENS_CEILING = int(os.environ.get("MLX_M3_MAX_TOKENS_CEILING", "16384"))
+OMLX_MINIMAX_OVERLAY = os.environ.get(
+    "MLX_M3_OMLX_MINIMAX_OVERLAY", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+USE_DIRECT_DECODE_KERNEL = os.environ.get(
+    "MLX_M3_USE_DIRECT_DECODE_KERNEL", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+DIRECT_DECODE_EVAL_MODE = os.environ.get(
+    "MLX_M3_DIRECT_DECODE_EVAL_MODE", "small"
+).strip().lower()
+# HARD-DISABLED 2026-07-06 (dead-code audit): the per-token cross-stream
+# all_sum stop-check was THE historical wedge root cause (racing the model's
+# collectives on the same QP/CQ). No env flag may resurrect it. The safe
+# replacement is the nonce-coordinated file stop (MLX_M3_SAFE_DECODE_STOP).
+UNSAFE_INFLIGHT_STOP = False
+# Decode-phase coordinated stop (nonce file-stop). Default OFF: the 2026-07-06
+# live iterations desynced ranks twice (stale rank1 code, then re-boot races).
+# The mechanism is sound on paper and both loops carry the check; it re-enables
+# via env after passing a dedicated offline acceptance rig.
+SAFE_DECODE_STOP = os.environ.get("MLX_M3_SAFE_DECODE_STOP", "0") == "1"
+STOP_ON_CLIENT_DISCONNECT = os.environ.get(
+    "MLX_M3_STOP_ON_CLIENT_DISCONNECT", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+STOP_CHECK_EVERY = max(
+    1,
+    int(os.environ.get("MLX_M3_STOP_CHECK_EVERY", "4") or "4"),
+)
+PREFILL_STOP_CHECK_EVERY = max(
+    0,
+    int(os.environ.get("MLX_M3_PREFILL_STOP_CHECK_EVERY", "0") or "0"),
+)
+PREFILL_STOP_FILE = os.path.expanduser(
+    os.environ.get(
+        "MLX_M3_PREFILL_STOP_FILE",
+        "/private/tmp/minimax_m3_prefill_stop_requested",
+    )
+)
+RANK1_SSH = os.environ.get("MLX_M3_RANK1_SSH", "").strip()
+THINKING_RAW_SILENT_LIMIT = int(
+    os.environ.get("MLX_M3_THINKING_RAW_SILENT_LIMIT", "64") or "64"
+)
+
+# In-flight generation stop. Set via POST /v1/stop or client disconnect.
+_STOP_FLAG = threading.Event()
+_STOP_KIND_LOCK = threading.Lock()
+_STOP_KIND = None
+
+
+def _clear_prefill_stop_file(reason="new request"):
+    if not PREFILL_STOP_FILE:
+        return
+    try:
+        os.unlink(PREFILL_STOP_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.debug("prefill stop file clear failed (%s): %s", reason, e)
+
+
+def _prefill_stop_at_from_active(active_info):
+    """Choose a future prefill chunk where both ranks should stop.
+
+    The stop file is observed locally by each rank after a prefill chunk
+    completes. Picking a future chunk avoids the race where one rank has just
+    passed the current callback while the other has not yet reached it.
+    """
+    if not active_info:
+        return None
+    try:
+        total_tokens = int(
+            active_info.get("prefill_total_tokens")
+            or (active_info.get("request_shape") or {}).get("full_prompt_tokens")
+            or 0
+        )
+        processed_tokens = int(active_info.get("prefill_processed_tokens") or 0)
+    except Exception:
+        return None
+    if total_tokens <= 0:
+        return None
+    step = max(1, _runtime_prefill_step_size(total_tokens))
+    stop_at = processed_tokens + (2 * step)
+    if processed_tokens <= 0:
+        stop_at = 2 * step
+    return max(step, min(total_tokens, stop_at))
+
+
+# Per-generation stop nonce: rank 0 mints it, ships it to rank 1 inside the
+# generation broadcast, and a decode stop file is honored only when its nonce
+# matches the current generation's. Clock-free (cross-machine wall-clock
+# freshness checks desynced the ranks — 2026-07-06), request-scoped, and
+# stale-proof. Single-flight serving makes the module global safe.
+
+def _thinking_template_kwargs(config, *, enable_thinking=False, thinking_mode=None):
+    """Compat shim: mlx-vlm 0.6.4 removed prompt_utils.thinking_template_kwargs
+    (the 0.6.3 helper) and folded its logic into apply_chat_template. This
+    replicates the 0.6.3 return exactly so our explicit thinking_mode routing
+    works across versions. MiniMax nuance preserved: omit enable_thinking only
+    when the model is MiniMax AND nothing was explicitly requested (adaptive).
+    """
+    kwargs = {}
+    model_type = str(getattr(config, "model_type", "") or "")
+    is_minimax = "minimax" in model_type.lower()
+    if enable_thinking or thinking_mode is not None or not is_minimax:
+        kwargs["enable_thinking"] = enable_thinking
+    if thinking_mode is not None:
+        kwargs["thinking_mode"] = thinking_mode
+    return kwargs
+
+_STOP_NONCE = {"value": None}
+# Decode-stop via EOS injection (2026-07-06 redesign): the file-based decode
+# stop desynced ranks — the stop file exists only on rank 0's filesystem, so
+# rank 0 broke while rank 1 kept decoding into a collective mismatch (caught
+# by the offline acceptance rig). Instead, when a stop is requested rank 0
+# swaps its next SAMPLED token for EOS inside the existing sampled-token
+# sync; both ranks receive EOS through the collective they already run and
+# end the generation identically, with zero new collectives.
+_FORCE_EOS = {"active": False, "eos_id": None}
+
+# Rank-0 op-channel mutex: _bcast frames each op as bare size+payload
+# all_sums with no interleaving protection, so two rank-0 threads running
+# broadcast transactions concurrently shred the words and rank 1 wedges in
+# recv (30-min hang -> guard exit-75 — 2026-07-06 P4 photograph). Hold this
+# for one COMPLETE op transaction at a time: the op _bcast plus every
+# follow-up collective until the op finishes on both ranks. RLock so the
+# request transaction can re-enter (request-start keepwarm runs inside it).
+# Lock order: generation_lock FIRST, then this mutex — never wait on
+# generation_lock while holding it.
+_RANK0_OP_MUTEX = threading.RLock()
+
+
+def _prefill_stop_payload(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+    payload = {
+        "version": 1,
+        "at": round(time.time(), 6),
+        "reason": str(reason),
+    }
+    if stop_at_tokens is not None:
+        try:
+            payload["stop_at_tokens"] = int(stop_at_tokens)
+        except Exception:
+            pass
+    if phase:
+        payload["phase"] = str(phase)
+    if nonce:
+        payload["nonce"] = str(nonce)
+    return payload
+
+
+def _read_prefill_stop_file():
+    if not PREFILL_STOP_FILE:
+        return None
+    try:
+        with open(PREFILL_STOP_FILE, "r", encoding="utf-8") as fh:
+            raw = fh.read(4096).strip()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.debug("prefill stop file read failed: %s", e)
+        return {"version": 0, "reason": "unreadable"}
+    if not raw:
+        return {"version": 0, "reason": "empty"}
+    try:
+        payload = json.loads(raw)
+        return payload if isinstance(payload, dict) else {"version": 0}
+    except Exception:
+        return {"version": 0, "reason": raw}
+
+
+def _touch_local_prefill_stop_file(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+    if not PREFILL_STOP_FILE:
+        return False
+    payload = _prefill_stop_payload(reason, stop_at_tokens, phase, nonce)
+    try:
+        parent = os.path.dirname(PREFILL_STOP_FILE)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(PREFILL_STOP_FILE, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+            fh.write("\n")
+        return True
+    except Exception as e:
+        logger.warning("prefill stop file touch failed (%s): %s", reason, e)
+        return False
+
+
+def _touch_remote_prefill_stop_file(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+    if not RANK1_SSH or not PREFILL_STOP_FILE:
+        return None
+    quoted_path = shlex.quote(PREFILL_STOP_FILE)
+    payload = json.dumps(
+        _prefill_stop_payload(reason, stop_at_tokens, phase, nonce),
+        separators=(",", ":"),
+    )
+    quoted_payload = shlex.quote(payload)
+    command = (
+        f"mkdir -p {shlex.quote(os.path.dirname(PREFILL_STOP_FILE) or '/tmp')} "
+        f"&& printf '%s\\n' {quoted_payload} > {quoted_path}"
+    )
+    try:
+        completed = subprocess.run(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=2",
+                "-o", "ConnectionAttempts=1",
+                RANK1_SSH,
+                command,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+        ok = completed.returncode == 0
+        if not ok:
+            logger.warning(
+                "remote prefill stop file touch failed on %s (rc=%s)",
+                RANK1_SSH,
+                completed.returncode,
+            )
+        return ok
+    except Exception as e:
+        logger.warning("remote prefill stop file touch failed on %s: %s", RANK1_SSH, e)
+        return False
+
+
+def _set_stop_request(kind="user"):
+    global _STOP_KIND
+    with _STOP_KIND_LOCK:
+        _STOP_KIND = str(kind or "user")
+        _STOP_FLAG.set()
+
+
+def _clear_stop_request():
+    global _STOP_KIND
+    with _STOP_KIND_LOCK:
+        _STOP_FLAG.clear()
+        _STOP_KIND = None
+
+
+def _local_stop_kind():
+    if not _STOP_FLAG.is_set():
+        return None
+    with _STOP_KIND_LOCK:
+        return _STOP_KIND or "user"
+
+
+def _user_stop_requested():
+    kind = _local_stop_kind()
+    return bool(kind and kind != "tool")
+
+
+def _request_inflight_stop(reason="stop", active_info=None):
+    _set_stop_request("user")
+    # Decode-phase stops use a token boundary a small margin ahead: both ranks
+    # process identical token indices and check the stop file on the same
+    # cadence, so they break at the same n — lockstep preserved, no collectives.
+    phase = None
+    stop_at_tokens = None
+    try:
+        emitted = int((active_info or {}).get("tokens_emitted") or 0)
+    except Exception:
+        emitted = 0
+    if emitted > 0:
+        stop_at_tokens = emitted + 16
+        phase = "decode"
+    else:
+        stop_at_tokens = _prefill_stop_at_from_active(active_info)
+    nonce = _STOP_NONCE.get("value")
+    remote_ok = _touch_remote_prefill_stop_file(reason, stop_at_tokens, phase, nonce)
+    local_ok = False
+    if remote_ok is not False:
+        local_ok = _touch_local_prefill_stop_file(reason, stop_at_tokens, phase, nonce)
+    else:
+        logger.warning(
+            "prefill stop file not armed locally because rank1 propagation failed; "
+            "decode token-boundary stop remains armed"
+        )
+    return {
+        "prefill_stop_local": local_ok,
+        "prefill_stop_remote": remote_ok,
+        "prefill_stop_at_tokens": stop_at_tokens,
+    }
+
+
+def _gb_to_bytes(value):
+    return int(float(value) * 1024**3)
+
+
+def _bytes_to_gb(value):
+    return round(int(value) / 1024**3, 2)
+
+
+# ---------------------------------------------------------------------------
+# Cross-request prompt cache (single slot — the cluster is single-flight)
+# ---------------------------------------------------------------------------
+# Both ranks maintain their own KV cache but apply IDENTICAL logic: rank 0
+# tokenizes the prompt and broadcasts token_ids to rank 1, so both compute the
+# same longest-common-prefix against their (identically-populated) cache. This
+# keeps the two ranks in lockstep while skipping already-processed context.
+import threading as _threading
+
+_prompt_cache_lock = _threading.RLock()
+_tokenizer_runtime_lock = _threading.RLock()
+_reasoning_recall_lock = _threading.RLock()
+_prompt_cache_holder = {
+    "cache": None,        # list of KV cache objects (reused across requests)
+    "token_ids": [],      # full token sequence currently held in the cache
+    "cache_len": 0,       # actual KV length: prompt tokens + generated tokens
+    "last_input_tokens": 0,
+    "last_generated_tokens": 0,
+    "last_exact_generated_ids": False,
+    "last_suffix_ids": None,
+    "prompt": None,
+    "session_id": None,
+    "session_source": None,
+    "max_kv_size": MAX_KV_SIZE,
+    "last_event": None,   # most recent cache decision/update for health/debug
+    "last_prepare_event": None,
+    "last_update_event": None,
+    "last_keepwarm_event": None,
+    "last_keepwarm_at": None,
+    "keepwarm_count": 0,
+    "created_at": None,
+    "last_access_at": None,
+    "in_use": False,
+    "in_use_started_at": None,
+}
+_prompt_cache_session_map = OrderedDict()
+_prompt_cache_resident_slots = OrderedDict()
+_reasoning_recall_sessions = OrderedDict()
+_prompt_cache_session_manifest_state = {
+    "loaded_entries": 0,
+    "entry_count": 0,
+    "last_loaded_at": None,
+    "last_written_at": None,
+    "last_cleared_at": None,
+    "last_error": None,
+}
+_prompt_cache_ssd_state = {
+    "last_save_at": None,
+    "last_restore_at": None,
+    "last_prune_at": None,
+    "last_clear_at": None,
+    "last_scan_at": None,
+    "last_error": None,
+    "last_restore_miss_reason": None,
+    "last_restore_attempt_reason": None,
+    "last_saved_session": None,
+    "last_restored_session": None,
+    "saved_sessions": 0,
+    "restored_sessions": 0,
+    "pruned_sessions": 0,
+    "last_saved_tokens": 0,
+    "last_saved_bytes": 0,
+    "last_restored_tokens": 0,
+}
+_prompt_cache_ssd_scan_cache = {"at": None, "scan": None}
+_metal_warmup_lock = _threading.RLock()
+_metal_warmup_last_event = None
+
+PROMPT_CACHE_SSD_SCHEMA_VERSION = 1
+PROMPT_CACHE_SSD_RECENT_ENTRIES = 12
+
+
+def _prompt_cache_session_key(session_id=None, session_source=None):
+    if session_id:
+        return str(session_id)
+    return "__default__"
+
+
+def _prompt_cache_current_session_key_unlocked():
+    return _prompt_cache_session_key(
+        _prompt_cache_holder.get("session_id"),
+        _prompt_cache_holder.get("session_source"),
+    )
+
+
+def _prompt_cache_resident_total_tokens_unlocked():
+    total = 0
+    if _prompt_cache_holder.get("cache") is not None:
+        total += int(_prompt_cache_holder.get("cache_len") or 0)
+    current_key = _prompt_cache_current_session_key_unlocked()
+    for key, entry in _prompt_cache_resident_slots.items():
+        if key == current_key:
+            continue
+        total += int(entry.get("cache_len") or 0)
+    return total
+
+
+def _prompt_cache_stash_current_unlocked(reason="stash"):
+    """Keep the current live KV slot available for a later same-session turn."""
+    if PROMPT_CACHE_RESIDENT_SLOTS <= 1:
+        return False
+    holder = _prompt_cache_holder
+    cache = holder.get("cache")
+    token_ids = list(holder.get("token_ids") or [])
+    if cache is None or not token_ids:
+        return False
+    key = _prompt_cache_current_session_key_unlocked()
+    if not key:
+        return False
+    _prompt_cache_resident_slots[key] = {
+        "cache": cache,
+        "token_ids": token_ids,
+        "prompt": holder.get("prompt"),
+        "cache_len": int(holder.get("cache_len") or 0),
+        "last_input_tokens": int(holder.get("last_input_tokens") or 0),
+        "last_generated_tokens": int(holder.get("last_generated_tokens") or 0),
+        "last_exact_generated_ids": bool(holder.get("last_exact_generated_ids")),
+        "session_id": holder.get("session_id"),
+        "session_source": holder.get("session_source"),
+        "created_at": holder.get("created_at"),
+        "last_access_at": round(time.time(), 3),
+        "stashed_at": round(time.time(), 3),
+        "stash_reason": reason,
+    }
+    _prompt_cache_resident_slots.move_to_end(key)
+    while len(_prompt_cache_resident_slots) > max(0, PROMPT_CACHE_RESIDENT_SLOTS - 1):
+        evicted_key, evicted = _prompt_cache_resident_slots.popitem(last=False)
+        logger.info(
+            "prompt-cache resident slot evicted: %s (%s tokens)",
+            evicted_key,
+            evicted.get("cache_len"),
+        )
+    if PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS > 0:
+        while (
+            _prompt_cache_resident_slots
+            and _prompt_cache_resident_total_tokens_unlocked()
+            > PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS
+        ):
+            evicted_key, evicted = _prompt_cache_resident_slots.popitem(last=False)
+            logger.info(
+                "prompt-cache resident slot evicted by token cap: %s (%s tokens)",
+                evicted_key,
+                evicted.get("cache_len"),
+            )
+    return True
+
+
+def _prompt_cache_restore_resident_unlocked(session_id=None, session_source=None):
+    """Swap in a previously stashed live KV slot for the requested session."""
+    if PROMPT_CACHE_RESIDENT_SLOTS <= 1 or not session_id:
+        return None
+    key = _prompt_cache_session_key(session_id, session_source)
+    slot = _prompt_cache_resident_slots.pop(key, None)
+    if not slot:
+        return None
+    current_key = _prompt_cache_current_session_key_unlocked()
+    if current_key != key:
+        _prompt_cache_stash_current_unlocked(reason=f"restore:{key}")
+    _prompt_cache_holder["cache"] = slot.get("cache")
+    _prompt_cache_holder["token_ids"] = list(slot.get("token_ids") or [])
+    _prompt_cache_holder["prompt"] = slot.get("prompt")
+    _prompt_cache_holder["cache_len"] = int(slot.get("cache_len") or 0)
+    _prompt_cache_holder["last_input_tokens"] = int(slot.get("last_input_tokens") or 0)
+    _prompt_cache_holder["last_generated_tokens"] = int(slot.get("last_generated_tokens") or 0)
+    _prompt_cache_holder["last_exact_generated_ids"] = bool(slot.get("last_exact_generated_ids"))
+    _prompt_cache_holder["session_id"] = slot.get("session_id")
+    _prompt_cache_holder["session_source"] = slot.get("session_source")
+    _prompt_cache_holder["created_at"] = slot.get("created_at")
+    _prompt_cache_holder["last_access_at"] = round(time.time(), 3)
+    logger.info(
+        "prompt-cache resident slot restored: %s (%s tokens)",
+        key,
+        _prompt_cache_holder["cache_len"],
+    )
+    return {
+        "restored_key": key,
+        "restored_cache_len": _prompt_cache_holder["cache_len"],
+        "restored_stashed_at": slot.get("stashed_at"),
+        "restored_reason": slot.get("stash_reason"),
+    }
+
+
+def _session_manifest_path():
+    return os.path.expanduser(PROMPT_CACHE_SESSION_MANIFEST_PATH)
+
+
+def _sanitize_prompt_cache_session_entry(key, entry):
+    """Persist only cache metadata, never raw prompt text or token ids."""
+    allowed = {
+        "session_id",
+        "session_source",
+        "first_seen_at",
+        "requests",
+        "updates",
+        "bypasses_preserved",
+        "last_prompt_tokens",
+        "last_reuse_tokens",
+        "last_suffix_tokens",
+        "last_missed_tokens",
+        "cache_len",
+        "key_tokens",
+        "protected_cache_tokens",
+        "last_reuse_ratio",
+        "last_miss_reason",
+        "last_action",
+        "last_phase",
+        "last_at",
+        "ssd_rehydratable",
+        "ssd_saved_at",
+        "ssd_cache_bytes",
+        "ssd_key_tokens",
+        "ssd_session_hash",
+    }
+    out = {"key": str(key)}
+    for field in allowed:
+        value = entry.get(field)
+        if value is None:
+            continue
+        if field.endswith("_tokens") or field in {
+            "cache_len",
+            "key_tokens",
+            "protected_cache_tokens",
+            "requests",
+            "updates",
+            "bypasses_preserved",
+            "ssd_cache_bytes",
+            "ssd_key_tokens",
+        }:
+            try:
+                value = int(value)
+            except Exception:
+                continue
+        elif field in {"first_seen_at", "last_at", "last_reuse_ratio", "ssd_saved_at"}:
+            try:
+                value = round(float(value), 6)
+            except Exception:
+                continue
+        elif field == "ssd_rehydratable":
+            value = bool(value)
+        else:
+            value = str(value)
+        out[field] = value
+    out["metadata_only"] = True
+    out["rehydratable"] = bool(out.get("ssd_rehydratable"))
+    return out
+
+
+def _load_prompt_cache_session_manifest_unlocked():
+    if (
+        not PROMPT_CACHE_SESSION_MANIFEST_ENABLED
+        or PROMPT_CACHE_SESSION_MAP_MAX <= 0
+        or PROMPT_CACHE_SESSION_MANIFEST_MAX <= 0
+    ):
+        return
+    path = _session_manifest_path()
+    try:
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        entries = payload.get("entries") if isinstance(payload, dict) else []
+        entry_count = len(entries) if isinstance(entries, list) else 0
+        loaded = 0
+        for raw in entries[-PROMPT_CACHE_SESSION_MAP_MAX:]:
+            if not isinstance(raw, dict):
+                continue
+            key = str(raw.get("key") or _prompt_cache_session_key(raw.get("session_id")))
+            entry = {
+                k: v for k, v in raw.items()
+                if k not in {"key", "resident"}
+            }
+            entry["metadata_only"] = True
+            entry["rehydratable"] = bool(entry.get("ssd_rehydratable"))
+            entry["loaded_from_manifest"] = True
+            _prompt_cache_session_map[key] = entry
+            loaded += 1
+        while len(_prompt_cache_session_map) > PROMPT_CACHE_SESSION_MAP_MAX:
+            _prompt_cache_session_map.popitem(last=False)
+        _prompt_cache_session_manifest_state.update({
+            "loaded_entries": loaded,
+            "entry_count": entry_count,
+            "last_loaded_at": round(time.time(), 3),
+            "last_error": None,
+        })
+        if loaded:
+            logger.info("prompt-cache session manifest loaded: %s entries", loaded)
+    except Exception as e:
+        _prompt_cache_session_manifest_state["last_error"] = str(e)
+        logger.warning("prompt-cache session manifest load failed: %s", e)
+
+
+def _write_prompt_cache_session_manifest_unlocked():
+    if (
+        not PROMPT_CACHE_SESSION_MANIFEST_ENABLED
+        or PROMPT_CACHE_SESSION_MAP_MAX <= 0
+        or PROMPT_CACHE_SESSION_MANIFEST_MAX <= 0
+    ):
+        return
+    path = _session_manifest_path()
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        merged = OrderedDict()
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                for raw in existing.get("entries") or []:
+                    if not isinstance(raw, dict):
+                        continue
+                    key = str(raw.get("key") or _prompt_cache_session_key(raw.get("session_id")))
+                    raw["metadata_only"] = True
+                    raw["rehydratable"] = bool(raw.get("ssd_rehydratable"))
+                    merged[key] = raw
+            except Exception as e:
+                logger.debug("prompt-cache session manifest merge read failed: %s", e)
+        for key, entry in _prompt_cache_session_map.items():
+            merged[str(key)] = _sanitize_prompt_cache_session_entry(key, entry)
+        while len(merged) > PROMPT_CACHE_SESSION_MANIFEST_MAX:
+            merged.popitem(last=False)
+        entries = list(merged.values())
+        payload = {
+            "schema": 1,
+            "model_id": MODEL_ID,
+            "updated_at": round(time.time(), 3),
+            "entries": entries,
+        }
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True)
+        os.replace(tmp, path)
+        _prompt_cache_session_manifest_state.update({
+            "entry_count": len(entries),
+            "last_written_at": payload["updated_at"],
+            "last_error": None,
+        })
+    except Exception as e:
+        _prompt_cache_session_manifest_state["last_error"] = str(e)
+        logger.debug("prompt-cache session manifest write failed: %s", e)
+
+
+def _prompt_cache_session_manifest_status_unlocked():
+    path = _session_manifest_path()
+    exists = os.path.exists(path)
+    size_bytes = None
+    if exists:
+        try:
+            size_bytes = os.path.getsize(path)
+        except Exception:
+            size_bytes = None
+    return {
+        "enabled": PROMPT_CACHE_SESSION_MANIFEST_ENABLED,
+        "path": path,
+        "max_entries": PROMPT_CACHE_SESSION_MANIFEST_MAX,
+        "exists": exists,
+        "size_bytes": size_bytes,
+        **_prompt_cache_session_manifest_state,
+    }
+
+
+def _sha256_text(value):
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        value = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
+
+
+def _sha256_file(path, limit_bytes=None):
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            remaining = int(limit_bytes) if limit_bytes else None
+            while True:
+                if remaining is not None:
+                    if remaining <= 0:
+                        break
+                    chunk = f.read(min(1024 * 1024, remaining))
+                    remaining -= len(chunk)
+                else:
+                    chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _token_ids_sha256(token_ids):
+    h = hashlib.sha256()
+    ids = list(token_ids or [])
+    h.update(len(ids).to_bytes(8, "little", signed=False))
+    chunk = array("I")
+    for tok in ids:
+        try:
+            chunk.append(int(tok) & 0xFFFFFFFF)
+        except Exception:
+            chunk.append(0)
+        if len(chunk) >= 16384:
+            if sys.byteorder != "little":
+                chunk.byteswap()
+            h.update(chunk.tobytes())
+            chunk = array("I")
+    if chunk:
+        if sys.byteorder != "little":
+            chunk.byteswap()
+        h.update(chunk.tobytes())
+    return h.hexdigest()
+
+
+def _prompt_cache_ssd_root(rank=None):
+    if rank is None:
+        rank, _ = _prompt_cache_ssd_current_rank_world()
+    scoped = ""
+    if int(rank) == 0:
+        scoped = PROMPT_CACHE_SSD_DIR_RANK0
+    elif int(rank) == 1:
+        scoped = PROMPT_CACHE_SSD_DIR_RANK1
+    return os.path.expanduser(scoped or PROMPT_CACHE_SSD_DIR)
+
+
+def _prompt_cache_ssd_session_hash(session_key):
+    return hashlib.sha256(str(session_key or "__default__").encode("utf-8")).hexdigest()
+
+
+def _prompt_cache_ssd_current_rank_world():
+    env_rank = os.environ.get("MLX_RANK", "").strip()
+    if env_rank:
+        try:
+            group = mx.distributed.init()
+            return int(env_rank), int(group.size())
+        except Exception:
+            world = int(os.environ.get("MLX_WORLD_SIZE", "1") or "1")
+            return int(env_rank), world
+    try:
+        group = mx.distributed.init()
+        return int(group.rank()), int(group.size())
+    except Exception:
+        rank = int(os.environ.get("MLX_RANK", "0") or "0")
+        world = int(os.environ.get("MLX_WORLD_SIZE", "1") or "1")
+        return rank, world
+
+
+def _prompt_cache_ssd_rank_dir(session_hash, rank=None):
+    if rank is None:
+        rank, _ = _prompt_cache_ssd_current_rank_world()
+    return os.path.join(_prompt_cache_ssd_root(), session_hash, f"rank{int(rank)}")
+
+
+def _prompt_cache_ssd_session_label(session_key):
+    text = str(session_key or "__default__")
+    if len(text) <= 96:
+        return text
+    return f"{text[:48]}...{text[-24:]}"
+
+
+def _prompt_cache_ssd_file_fingerprint():
+    root = os.path.dirname(os.path.abspath(__file__))
+    files = [
+        os.path.join(root, "sharded_server.py"),
+        os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "language.py"),
+        os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "msa.py"),
+    ]
+    parts = []
+    for path in files:
+        digest = _sha256_file(path)
+        if digest:
+            parts.append({"path": os.path.relpath(path, root), "sha256": digest})
+    return {
+        "files": parts,
+        "hash": _sha256_text(parts),
+    }
+
+
+def _safe_version(package):
+    try:
+        return importlib.metadata.version(package)
+    except Exception:
+        return None
+
+
+def _processor_fingerprint(processor):
+    tokenizer = getattr(processor, "tokenizer", None)
+    template = getattr(processor, "chat_template", None)
+    if not template and tokenizer is not None:
+        template = getattr(tokenizer, "chat_template", None)
+    fields = {
+        "processor_class": processor.__class__.__module__ + "." + processor.__class__.__name__,
+        "tokenizer_class": (
+            tokenizer.__class__.__module__ + "." + tokenizer.__class__.__name__
+            if tokenizer is not None else None
+        ),
+        "chat_template_hash": _sha256_text(template or ""),
+        "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+        "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+        "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+    }
+    fields["hash"] = _sha256_text(fields)
+    return fields
+
+
+def _model_path_fingerprint(model=None, processor=None):
+    resolved = (
+        getattr(model, "_thundermlx_model_path", None)
+        or getattr(processor, "_thundermlx_model_path", None)
+        or getattr(getattr(processor, "tokenizer", None), "name_or_path", None)
+    )
+    raw = os.path.expanduser(str(resolved or MODEL or ""))
+    exists = os.path.exists(raw)
+    stat = None
+    if exists:
+        try:
+            st = os.stat(raw)
+            stat = {
+                "path": os.path.abspath(raw),
+                "is_dir": os.path.isdir(raw),
+                "mtime_ns": int(st.st_mtime_ns),
+                "size": int(st.st_size),
+            }
+        except Exception:
+            stat = {"path": os.path.abspath(raw), "stat_error": True}
+    payload = {
+        "model": MODEL,
+        "model_id": MODEL_ID,
+        "resolved_path": str(resolved or ""),
+        "path_stat": stat,
+    }
+    payload["hash"] = _sha256_text(payload)
+    return payload
+
+
+def _cache_class_names(cache):
+    return [
+        c.__class__.__module__ + "." + c.__class__.__name__
+        for c in (cache or [])
+    ]
+
+
+def _prompt_cache_ssd_runtime_fingerprint(model, processor, cache=None):
+    payload = {
+        "schema": PROMPT_CACHE_SSD_SCHEMA_VERSION,
+        "model": _model_path_fingerprint(model, processor),
+        "processor": _processor_fingerprint(processor),
+        "sharding": {
+            "mode": SHARDING_MODE,
+            "pipeline_layers": os.environ.get("M3_PIPELINE_LAYERS", ""),
+            "backend": os.environ.get("M3_MLX_BACKEND", ""),
+        },
+        "rank_count": _prompt_cache_ssd_current_rank_world()[1],
+        "kv": {
+            "max_kv_size": MAX_KV_SIZE,
+            "quant_enabled": KV_QUANT_ENABLED,
+            "bits": KV_BITS,
+            "group_size": KV_GROUP_SIZE,
+            "scheme": KV_QUANT_SCHEME,
+            "quantized_start": QUANTIZED_KV_START,
+        },
+        "prompt_cache": {
+            "thinking_mode": PROMPT_CACHE_THINKING_MODE,
+            "generated_reuse_max_tokens": PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS,
+            "max_tokens": PROMPT_CACHE_MAX_TOKENS,
+        },
+        "versions": {
+            "mlx": _safe_version("mlx"),
+            "mlx-lm": _safe_version("mlx-lm"),
+            "mlx-vlm": _safe_version("mlx-vlm"),
+        },
+        "cache_impl": _prompt_cache_ssd_file_fingerprint(),
+        "cache_classes": _cache_class_names(cache),
+    }
+    payload["hash"] = _sha256_text(payload)
+    return payload
+
+
+def _is_mx_array(value):
+    return (
+        hasattr(value, "shape")
+        and hasattr(value, "dtype")
+        and hasattr(value, "nbytes")
+        and value.__class__.__module__.startswith("mlx.")
+    )
+
+
+def _flatten_cache_state(value, arrays, prefix="state"):
+    if value is None:
+        return {"type": "none"}
+    if _is_mx_array(value):
+        name = f"a{len(arrays):04d}"
+        try:
+            arrays[name] = mx.contiguous(value)
+        except Exception:
+            arrays[name] = value
+        return {
+            "type": "array",
+            "name": name,
+            "shape": [int(v) for v in value.shape],
+            "dtype": str(value.dtype),
+            "nbytes": int(value.nbytes),
+        }
+    if isinstance(value, tuple):
+        return {
+            "type": "tuple",
+            "items": [
+                _flatten_cache_state(v, arrays, f"{prefix}_{i}")
+                for i, v in enumerate(value)
+            ],
+        }
+    if isinstance(value, list):
+        return {
+            "type": "list",
+            "items": [
+                _flatten_cache_state(v, arrays, f"{prefix}_{i}")
+                for i, v in enumerate(value)
+            ],
+        }
+    if isinstance(value, (bool, int, float, str)):
+        return {"type": "scalar", "value": value}
+    raise TypeError(f"unsupported cache state value at {prefix}: {type(value)!r}")
+
+
+def _restore_cache_state(structure, arrays):
+    typ = structure.get("type") if isinstance(structure, dict) else None
+    if typ == "none":
+        return None
+    if typ == "scalar":
+        return structure.get("value")
+    if typ == "array":
+        name = structure.get("name")
+        if name not in arrays:
+            raise ValueError(f"missing array {name}")
+        arr = arrays[name]
+        expected_shape = tuple(int(v) for v in structure.get("shape") or [])
+        if tuple(arr.shape) != expected_shape:
+            raise ValueError(
+                f"array {name} shape mismatch {tuple(arr.shape)} != {expected_shape}"
+            )
+        expected_dtype = str(structure.get("dtype") or "")
+        if expected_dtype and str(arr.dtype) != expected_dtype:
+            raise ValueError(
+                f"array {name} dtype mismatch {arr.dtype} != {expected_dtype}"
+            )
+        return arr
+    if typ == "tuple":
+        return tuple(_restore_cache_state(v, arrays) for v in structure.get("items") or [])
+    if typ == "list":
+        return [_restore_cache_state(v, arrays) for v in structure.get("items") or []]
+    raise ValueError(f"unsupported cache state structure: {typ!r}")
+
+
+def _cache_state_arrays(value, out=None):
+    if out is None:
+        out = []
+    if _is_mx_array(value):
+        out.append(value)
+    elif isinstance(value, (tuple, list)):
+        for item in value:
+            _cache_state_arrays(item, out)
+    return out
+
+
+def _write_json_atomic(path, payload):
+    tmp = f"{path}.{os.getpid()}.{int(time.time() * 1000)}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _dir_size_bytes(path):
+    total = 0
+    if not os.path.exists(path):
+        return 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def _prompt_cache_ssd_scan_unlocked():
+    root = _prompt_cache_ssd_root()
+    rank, _ = _prompt_cache_ssd_current_rank_world()
+    entries = []
+    total_bytes = 0
+    if not os.path.isdir(root):
+        return {"entries": entries, "entry_count": 0, "total_bytes": 0}
+    for session_hash in sorted(os.listdir(root)):
+        if session_hash.startswith(".") or session_hash == "manifest.json":
+            continue
+        session_dir = os.path.join(root, session_hash)
+        if not os.path.isdir(session_dir):
+            continue
+        entry_bytes = _dir_size_bytes(session_dir)
+        total_bytes += entry_bytes
+        rank_dir = os.path.join(session_dir, f"rank{rank}")
+        meta_path = os.path.join(rank_dir, "session.json")
+        meta = {}
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except Exception as e:
+                meta = {"read_error": str(e)}
+        saved_at = meta.get("saved_at")
+        if saved_at is None:
+            try:
+                saved_at = os.path.getmtime(session_dir)
+            except Exception:
+                saved_at = None
+        entries.append({
+            "session_hash": session_hash,
+            "rank": rank,
+            "session_key": meta.get("session_key_label"),
+            "session_source": meta.get("session_source"),
+            "key_tokens": meta.get("key_tokens"),
+            "cache_len": meta.get("cache_len"),
+            "complete": bool(meta.get("complete")),
+            "saved_at": saved_at,
+            "last_access_at": meta.get("last_access_at") or saved_at,
+            "bytes": entry_bytes,
+            "rank_exists": os.path.isdir(rank_dir),
+            "restore_ready": bool(meta.get("complete")),
+            "runtime_hash": meta.get("runtime_hash"),
+            "token_ids_hash": meta.get("token_ids_hash"),
+            "error": meta.get("read_error"),
+        })
+    entries.sort(key=lambda row: float(row.get("last_access_at") or 0), reverse=True)
+    return {
+        "entries": entries,
+        "entry_count": len(entries),
+        "total_bytes": total_bytes,
+    }
+
+
+def _prompt_cache_ssd_invalidate_scan_cache_unlocked():
+    _prompt_cache_ssd_scan_cache["at"] = None
+    _prompt_cache_ssd_scan_cache["scan"] = None
+
+
+def _prompt_cache_ssd_scan_cached_unlocked(force=False):
+    now = time.time()
+    cached_at = _prompt_cache_ssd_scan_cache.get("at")
+    cached_scan = _prompt_cache_ssd_scan_cache.get("scan")
+    if (
+        not force
+        and cached_scan is not None
+        and cached_at is not None
+        and PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS > 0
+        and now - float(cached_at) < PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS
+    ):
+        return cached_scan
+    scan = _prompt_cache_ssd_scan_unlocked()
+    _prompt_cache_ssd_scan_cache["at"] = now
+    _prompt_cache_ssd_scan_cache["scan"] = scan
+    _prompt_cache_ssd_state["last_scan_at"] = round(now, 3)
+    return scan
+
+
+def _prompt_cache_ssd_write_manifest_unlocked(scan=None):
+    root = _prompt_cache_ssd_root()
+    os.makedirs(root, exist_ok=True)
+    scan = scan or _prompt_cache_ssd_scan_unlocked()
+    payload = {
+        "schema": PROMPT_CACHE_SSD_SCHEMA_VERSION,
+        "updated_at": round(time.time(), 3),
+        "entry_count": scan.get("entry_count", 0),
+        "total_bytes": scan.get("total_bytes", 0),
+        "entries": scan.get("entries", [])[:PROMPT_CACHE_SSD_RECENT_ENTRIES],
+    }
+    _write_json_atomic(os.path.join(root, "manifest.json"), payload)
+
+
+def _prompt_cache_ssd_prune_unlocked(reason="prune"):
+    if not PROMPT_CACHE_SSD_ENABLED:
+        return {"ok": True, "enabled": False, "removed": 0, "bytes_removed": 0}
+    root = _prompt_cache_ssd_root()
+    scan = _prompt_cache_ssd_scan_unlocked()
+    now = time.time()
+    entries = list(scan.get("entries") or [])
+    remove_hashes = set()
+    for row in entries:
+        saved_at = float(row.get("saved_at") or 0.0)
+        if (
+            PROMPT_CACHE_SSD_TTL_SECONDS > 0
+            and saved_at > 0
+            and now - saved_at > PROMPT_CACHE_SSD_TTL_SECONDS
+        ):
+            remove_hashes.add(row["session_hash"])
+    remaining = [row for row in entries if row["session_hash"] not in remove_hashes]
+    total = sum(int(row.get("bytes") or 0) for row in remaining)
+    if PROMPT_CACHE_SSD_MAX_BYTES > 0 and total > PROMPT_CACHE_SSD_MAX_BYTES:
+        for row in sorted(remaining, key=lambda r: float(r.get("last_access_at") or 0.0)):
+            if total <= PROMPT_CACHE_SSD_MAX_BYTES:
+                break
+            remove_hashes.add(row["session_hash"])
+            total -= int(row.get("bytes") or 0)
+    removed = 0
+    bytes_removed = 0
+    for session_hash in remove_hashes:
+        path = os.path.join(root, session_hash)
+        bytes_removed += _dir_size_bytes(path)
+        try:
+            shutil.rmtree(path)
+            removed += 1
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            _prompt_cache_ssd_state["last_error"] = str(e)
+            logger.warning("prompt-cache SSD prune failed for %s: %s", session_hash, e)
+    now_rounded = round(time.time(), 3)
+    _prompt_cache_ssd_state.update({
+        "last_prune_at": now_rounded,
+        "pruned_sessions": int(_prompt_cache_ssd_state.get("pruned_sessions") or 0) + removed,
+    })
+    _prompt_cache_ssd_invalidate_scan_cache_unlocked()
+    try:
+        _prompt_cache_ssd_write_manifest_unlocked()
+    except Exception as e:
+        _prompt_cache_ssd_state["last_error"] = str(e)
+    return {
+        "ok": True,
+        "enabled": True,
+        "reason": reason,
+        "removed": removed,
+        "bytes_removed": bytes_removed,
+    }
+
+
+def _prompt_cache_ssd_clear_unlocked(reason="clear"):
+    root = _prompt_cache_ssd_root()
+    removed_bytes = _dir_size_bytes(root)
+    try:
+        if os.path.isdir(root):
+            shutil.rmtree(root)
+        os.makedirs(root, exist_ok=True)
+        now = round(time.time(), 3)
+        _prompt_cache_ssd_state.update({
+            "last_clear_at": now,
+            "last_error": None,
+            "last_restore_miss_reason": f"cleared:{reason}",
+        })
+        _prompt_cache_ssd_invalidate_scan_cache_unlocked()
+        return {"ok": True, "removed_bytes": removed_bytes, "path": root}
+    except Exception as e:
+        _prompt_cache_ssd_state["last_error"] = str(e)
+        return {"ok": False, "error": str(e), "path": root}
+
+
+def _prompt_cache_ssd_layer_path(rank_dir, index):
+    return os.path.join(rank_dir, f"layer-{int(index):03d}.safetensors")
+
+
+def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"):
+    if not PROMPT_CACHE_SSD_ENABLED:
+        return False
+    holder = _prompt_cache_holder
+    cache = holder.get("cache")
+    token_ids = list(holder.get("token_ids") or [])
+    session_id = holder.get("session_id")
+    session_source = holder.get("session_source")
+    cache_len = int(holder.get("cache_len") or 0)
+    if cache is None:
+        return False
+    if not session_id:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "save_skipped:no_session_id"
+        return False
+    if len(token_ids) < PROMPT_CACHE_SSD_MIN_TOKENS:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "save_skipped:below_min_tokens"
+        return False
+    if cache_len <= 0 or len(token_ids) != cache_len:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "save_skipped:key_cache_len_mismatch"
+        return False
+    counted = _cache_token_count(cache)
+    if counted and counted != cache_len:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "save_skipped:cache_offset_mismatch"
+        return False
+    generated = int(holder.get("last_generated_tokens") or 0)
+    if generated > 0 and not holder.get("last_exact_generated_ids"):
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "save_skipped:generated_ids_not_exact"
+        return False
+
+    rank, world = _prompt_cache_ssd_current_rank_world()
+    session_key = _prompt_cache_session_key(session_id, session_source)
+    session_hash = _prompt_cache_ssd_session_hash(session_key)
+    root = _prompt_cache_ssd_root()
+    rank_dir = _prompt_cache_ssd_rank_dir(session_hash, rank)
+    tmp_dir = f"{rank_dir}.tmp.{os.getpid()}.{int(time.time() * 1000)}"
+    try:
+        if os.path.exists(tmp_dir):
+            shutil.rmtree(tmp_dir)
+        os.makedirs(tmp_dir, exist_ok=True)
+        runtime = _prompt_cache_ssd_runtime_fingerprint(model, processor, cache)
+        token_hash = _token_ids_sha256(token_ids)
+        tail_hash = _token_ids_sha256(token_ids[-min(len(token_ids), 4096):])
+        layer_meta = []
+        # Admin/manual save runs from an HTTP thread, not necessarily the MLX
+        # generation thread. Give MLX an explicit stream before evaluating and
+        # serializing tensors from the cached KV state.
+        with mx.stream(mx.default_device()):
+            mx.save_safetensors(
+                os.path.join(tmp_dir, "tokens.safetensors"),
+                {"token_ids": mx.array(token_ids, dtype=mx.int32)},
+            )
+            for idx, layer_cache in enumerate(cache):
+                arrays = {}
+                structure = _flatten_cache_state(layer_cache.state, arrays, f"layer_{idx}")
+                if arrays:
+                    mx.eval(*arrays.values())
+                layer_path = _prompt_cache_ssd_layer_path(tmp_dir, idx)
+                mx.save_safetensors(layer_path, arrays)
+                layer_meta.append({
+                    "index": idx,
+                    "class": layer_cache.__class__.__module__ + "." + layer_cache.__class__.__name__,
+                    "file": os.path.basename(layer_path),
+                    "structure": structure,
+                    "arrays": {
+                        name: {
+                            "shape": meta.get("shape"),
+                            "dtype": meta.get("dtype"),
+                            "nbytes": meta.get("nbytes"),
+                        }
+                        for name, meta in _flatten_arrays_from_structure(structure).items()
+                    },
+                })
+        total_bytes = _dir_size_bytes(tmp_dir)
+        now = round(time.time(), 3)
+        metadata = {
+            "schema": PROMPT_CACHE_SSD_SCHEMA_VERSION,
+            "complete": True,
+            "saved_at": now,
+            "last_access_at": now,
+            "reason": reason,
+            "rank": rank,
+            "rank_count": world,
+            "session_hash": session_hash,
+            "session_key_label": _prompt_cache_ssd_session_label(session_key),
+            "session_id": session_id,
+            "session_source": session_source,
+            "model_id": MODEL_ID,
+            "model": MODEL,
+            "runtime": runtime,
+            "runtime_hash": runtime.get("hash"),
+            "key_tokens": len(token_ids),
+            "cache_len": cache_len,
+            "last_input_tokens": int(holder.get("last_input_tokens") or 0),
+            "last_generated_tokens": generated,
+            "last_exact_generated_ids": bool(holder.get("last_exact_generated_ids")),
+            "token_ids_hash": token_hash,
+            "token_ids_tail_hash": tail_hash,
+            "token_ids_dtype": "int32",
+            "layers": layer_meta,
+            "layer_count": len(layer_meta),
+            "bytes": total_bytes,
+            "privacy": {
+                "raw_prompt_text": False,
+                "stores_token_ids": True,
+                "stores_kv_tensors": True,
+                "note": "Token ids and KV tensors can still reveal prompt content; keep this directory local.",
+            },
+        }
+        _write_json_atomic(os.path.join(tmp_dir, "session.json"), metadata)
+        os.makedirs(os.path.dirname(rank_dir), exist_ok=True)
+        if os.path.isdir(rank_dir):
+            shutil.rmtree(rank_dir)
+        os.replace(tmp_dir, rank_dir)
+        total_bytes = _dir_size_bytes(rank_dir)
+        metadata["bytes"] = total_bytes
+        _write_json_atomic(os.path.join(rank_dir, "session.json"), metadata)
+        try:
+            _prompt_cache_ssd_write_manifest_unlocked()
+        except Exception as e:
+            logger.debug("prompt-cache SSD manifest write failed: %s", e)
+        _prompt_cache_ssd_state.update({
+            "last_save_at": now,
+            "last_error": None,
+            "last_saved_session": metadata["session_key_label"],
+            "saved_sessions": int(_prompt_cache_ssd_state.get("saved_sessions") or 0) + 1,
+            "last_saved_tokens": len(token_ids),
+            "last_saved_bytes": total_bytes,
+        })
+        _prompt_cache_ssd_invalidate_scan_cache_unlocked()
+        entry = _prompt_cache_session_map.get(session_key)
+        if entry is not None:
+            entry["ssd_rehydratable"] = True
+            entry["ssd_saved_at"] = now
+            entry["ssd_cache_bytes"] = total_bytes
+            entry["ssd_key_tokens"] = len(token_ids)
+            entry["ssd_session_hash"] = session_hash[:16]
+            _write_prompt_cache_session_manifest_unlocked()
+        logger.info(
+            "prompt-cache SSD saved %s rank%s (%d tokens, %.2f GiB)",
+            session_key,
+            rank,
+            len(token_ids),
+            total_bytes / 1024**3,
+        )
+        _prompt_cache_ssd_prune_unlocked(reason="after_save")
+        return True
+    except Exception as e:
+        _prompt_cache_ssd_state["last_error"] = str(e)
+        logger.warning("prompt-cache SSD save failed: %s", e)
+        try:
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir)
+        except Exception:
+            pass
+        return False
+
+
+def _flatten_arrays_from_structure(structure, out=None):
+    if out is None:
+        out = {}
+    if not isinstance(structure, dict):
+        return out
+    if structure.get("type") == "array":
+        out[structure["name"]] = structure
+    for item in structure.get("items") or []:
+        _flatten_arrays_from_structure(item, out)
+    return out
+
+
+def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
+                                              session_id, session_source,
+                                              allow_partial_restore=True):
+    if not PROMPT_CACHE_SSD_ENABLED:
+        return None, None, None, "disabled"
+    if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
+        return None, None, None, "restore_disabled"
+    if not session_id:
+        return None, None, None, "no_session_id"
+    token_ids = list(token_ids or [])
+    if not token_ids:
+        return None, None, None, "no_token_ids"
+
+    rank, world = _prompt_cache_ssd_current_rank_world()
+    session_key = _prompt_cache_session_key(session_id, session_source)
+    session_hash = _prompt_cache_ssd_session_hash(session_key)
+    rank_dir = _prompt_cache_ssd_rank_dir(session_hash, rank)
+    meta_path = os.path.join(rank_dir, "session.json")
+    if not os.path.exists(meta_path):
+        return None, None, None, "artifact_missing"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if int(meta.get("schema") or 0) != PROMPT_CACHE_SSD_SCHEMA_VERSION:
+            return None, None, None, "schema_mismatch"
+        if not meta.get("complete"):
+            return None, None, None, "incomplete_artifact"
+        artifact_rank = meta.get("rank")
+        if artifact_rank is None:
+            artifact_rank = -1
+        if int(artifact_rank) != rank:
+            return None, None, None, (
+                f"rank_mismatch:current={rank}:artifact={artifact_rank}:"
+                f"path={os.path.basename(rank_dir)}"
+            )
+        if int(meta.get("rank_count") or 0) != world:
+            return None, None, None, (
+                f"rank_count_mismatch:current={world}:artifact={meta.get('rank_count')}"
+            )
+        key_tokens = int(meta.get("key_tokens") or 0)
+        cache_len = int(meta.get("cache_len") or 0)
+        if key_tokens <= 0 or cache_len != key_tokens:
+            return None, None, None, "unsafe_key_cache_len"
+        tokens_payload = mx.load(os.path.join(rank_dir, "tokens.safetensors"))
+        stored_ids_array = tokens_payload.get("token_ids")
+        if stored_ids_array is None:
+            return None, None, None, "token_ids_missing"
+        stored_ids = [int(v) for v in stored_ids_array.tolist()]
+        if len(stored_ids) != key_tokens:
+            return None, None, None, "token_ids_length_mismatch"
+        if _token_ids_sha256(stored_ids) != meta.get("token_ids_hash"):
+            return None, None, None, "stored_token_hash_mismatch"
+        restore_tokens = key_tokens
+        partial_restore = False
+        if len(token_ids) < key_tokens:
+            reuse = _common_prefix_len(stored_ids, token_ids)
+            partial_restore = True
+            restore_tokens = reuse
+        else:
+            prefix_hash = _token_ids_sha256(token_ids[:key_tokens])
+            if prefix_hash != meta.get("token_ids_hash"):
+                reuse = _common_prefix_len(stored_ids, token_ids)
+                partial_restore = True
+                restore_tokens = reuse
+        if partial_restore:
+            if not allow_partial_restore:
+                return None, None, None, (
+                    f"partial_restore_disabled:prefix={restore_tokens}:"
+                    f"stored={key_tokens}"
+                )
+            partial_min = max(
+                PROMPT_CACHE_MIN_REUSE,
+                min(PROMPT_CACHE_SSD_MIN_TOKENS, key_tokens),
+            )
+            partial_ratio = (restore_tokens / key_tokens) if key_tokens else 0.0
+            if restore_tokens < partial_min or partial_ratio < 0.95:
+                return None, None, None, (
+                    f"token_hash_mismatch:prefix={restore_tokens}:"
+                    f"stored={key_tokens}:ratio={partial_ratio:.4f}"
+                )
+
+        from mlx_vlm.models import cache as _cache_mod
+
+        # Do not reuse or mutate the holder's current object for restore
+        # staging. Commit only after both ranks validate and agree.
+        new_cache = _cache_mod.make_prompt_cache(
+            model.language_model, max_kv_size=MAX_KV_SIZE
+        )
+        runtime = _prompt_cache_ssd_runtime_fingerprint(model, processor, new_cache)
+        if runtime.get("hash") != meta.get("runtime_hash"):
+            return None, None, None, "runtime_hash_mismatch"
+        layers = meta.get("layers") or []
+        if len(layers) != len(new_cache):
+            return None, None, None, "layer_count_mismatch"
+        for layer_meta, layer_cache in zip(layers, new_cache):
+            expected_class = layer_cache.__class__.__module__ + "." + layer_cache.__class__.__name__
+            if layer_meta.get("class") != expected_class:
+                return None, None, None, "cache_class_mismatch"
+            arrays = mx.load(os.path.join(rank_dir, layer_meta.get("file")))
+            layer_cache.state = _restore_cache_state(layer_meta.get("structure"), arrays)
+        if restore_tokens < key_tokens:
+            trim_tokens = key_tokens - restore_tokens
+            if not _trim_prompt_cache_in_place(new_cache, trim_tokens):
+                return None, None, None, "partial_restore_trim_failed"
+        arrays_to_eval = []
+        for layer_cache in new_cache:
+            arrays_to_eval.extend(_cache_state_arrays(layer_cache.state))
+        if arrays_to_eval:
+            mx.eval(*arrays_to_eval)
+        if restore_tokens < key_tokens:
+            stored_ids = stored_ids[:restore_tokens]
+            meta["_partial_restore"] = True
+            meta["_stored_key_tokens"] = key_tokens
+        meta["_restore_tokens"] = restore_tokens
+        meta["last_access_at"] = round(time.time(), 3)
+        try:
+            _write_json_atomic(meta_path, meta)
+        except Exception:
+            pass
+        return new_cache, stored_ids, meta, None
+    except Exception as e:
+        return None, None, None, f"restore_error:{e}"
+
+
+def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
+                                           session_id=None, session_source=None,
+                                           allow_partial_restore=True):
+    if not PROMPT_CACHE_SSD_ENABLED:
+        return None
+    if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = "restore_disabled"
+        return None
+    cache, stored_ids, meta, miss_reason = _prompt_cache_ssd_load_candidate_unlocked(
+        model, processor, token_ids, session_id, session_source,
+        allow_partial_restore=allow_partial_restore,
+    )
+    rank, world = _prompt_cache_ssd_current_rank_world()
+    local_ok = 1 if cache is not None and stored_ids and meta else 0
+    local_cache_len = int((meta or {}).get("_restore_tokens") or 0) if local_ok else 0
+    local_key_tokens = local_cache_len
+    try:
+        ok_total = mx.distributed.all_sum(mx.array(local_ok, dtype=mx.int32))
+        len_total = mx.distributed.all_sum(mx.array(local_cache_len, dtype=mx.int64))
+        key_total = mx.distributed.all_sum(mx.array(local_key_tokens, dtype=mx.int64))
+        mx.eval(ok_total, len_total, key_total)
+        all_ok = int(ok_total.item()) == world
+        same_len = int(len_total.item()) == local_cache_len * world
+        same_key = int(key_total.item()) == local_key_tokens * world
+    except Exception as e:
+        all_ok = False
+        same_len = False
+        same_key = False
+        miss_reason = f"restore_sync_failed:{e}"
+    if not (all_ok and same_len and same_key and local_ok):
+        reason = miss_reason or "rank_restore_mismatch"
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = reason
+        _prompt_cache_ssd_state["last_error"] = None
+        if cache is not None:
+            del cache
+            gc.collect()
+        return None
+
+    session_key = _prompt_cache_session_key(session_id, session_source)
+    current_key = _prompt_cache_current_session_key_unlocked()
+    if current_key != session_key:
+        _prompt_cache_stash_current_unlocked(reason=f"ssd_restore:{session_key}")
+    _prompt_cache_holder["cache"] = cache
+    _prompt_cache_holder["token_ids"] = stored_ids
+    _prompt_cache_holder["prompt"] = None
+    _prompt_cache_holder["cache_len"] = local_cache_len
+    _prompt_cache_holder["last_input_tokens"] = min(
+        int(meta.get("last_input_tokens") or local_key_tokens),
+        local_key_tokens,
+    )
+    _prompt_cache_holder["last_generated_tokens"] = 0
+    _prompt_cache_holder["last_exact_generated_ids"] = False
+    _prompt_cache_holder["session_id"] = session_id
+    _prompt_cache_holder["session_source"] = session_source
+    _prompt_cache_holder["created_at"] = meta.get("saved_at") or round(time.time(), 3)
+    _prompt_cache_holder["last_access_at"] = round(time.time(), 3)
+    _prompt_cache_ssd_state.update({
+        "last_restore_at": _prompt_cache_holder["last_access_at"],
+        "last_restore_miss_reason": None,
+        "last_restored_session": meta.get("session_key_label") or session_key,
+        "restored_sessions": int(_prompt_cache_ssd_state.get("restored_sessions") or 0) + 1,
+        "last_restored_tokens": local_cache_len,
+    })
+    _set_prompt_cache_event(
+        "ssd_restore",
+        prompt_tokens=len(token_ids or []),
+        reuse_tokens=local_key_tokens,
+        suffix_tokens=max(0, len(token_ids or []) - local_key_tokens),
+        cache_len=local_cache_len,
+        session_id=session_id,
+        session_source=session_source,
+        ssd_session_hash=(meta.get("session_hash") or "")[:16],
+        ssd_rank=rank,
+        **_prompt_cache_match_fields(len(token_ids or []), local_key_tokens),
+    )
+    logger.info(
+        "prompt-cache SSD restored %s rank%s (%d/%d tokens)",
+        session_key,
+        rank,
+        local_key_tokens,
+        len(token_ids or []),
+    )
+    return {
+        "restored_ssd": True,
+        "ssd_session_hash": (meta.get("session_hash") or "")[:16],
+        "ssd_saved_at": meta.get("saved_at"),
+        "restored_cache_len": local_cache_len,
+        "ssd_partial_restore": bool(meta.get("_partial_restore")),
+        "ssd_stored_key_tokens": int(meta.get("_stored_key_tokens") or local_key_tokens),
+    }
+
+
+def _prompt_cache_ssd_restore_eligible_unlocked(token_ids, session_id):
+    if not PROMPT_CACHE_SSD_ENABLED or not PROMPT_CACHE_SSD_RESTORE_ENABLED:
+        return False
+    if not session_id:
+        return False
+    if len(token_ids or []) < PROMPT_CACHE_SSD_MIN_TOKENS:
+        return False
+    return True
+
+
+def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
+                                             session_id=None, session_source=None,
+                                             reason="miss",
+                                             allow_partial_restore=True):
+    """Try durable restore only when RAM/live reuse has already missed.
+
+    This helper intentionally does not inspect local artifact existence before
+    calling the distributed restore path. All ranks must make the same decision;
+    the restore path itself synchronizes success/failure safely.
+    """
+    if not _prompt_cache_ssd_restore_eligible_unlocked(token_ids, session_id):
+        return None
+    _prompt_cache_ssd_state["last_restore_attempt_reason"] = reason
+    return _prompt_cache_ssd_try_restore_unlocked(
+        model,
+        processor,
+        token_ids,
+        session_id=session_id,
+        session_source=session_source,
+        allow_partial_restore=allow_partial_restore,
+    )
+
+
+def _prompt_cache_make_ssd_checkpoint_unlocked(prompt=None, reason="manual_save"):
+    """Trim unsafe generated tails only for explicit durable-save operations."""
+    if not PROMPT_CACHE_SSD_ENABLED:
+        return False
+    holder = _prompt_cache_holder
+    cache_obj = holder.get("cache")
+    key_ids = list(holder.get("token_ids") or [])
+    generated_count = int(holder.get("last_generated_tokens") or 0)
+    cache_len = int(holder.get("cache_len") or 0)
+    if (
+        cache_obj is None
+        or generated_count <= 0
+        or holder.get("last_exact_generated_ids")
+        or not key_ids
+        or cache_len <= len(key_ids)
+    ):
+        return False
+    trim_tokens = cache_len - len(key_ids)
+    if trim_tokens != generated_count:
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = (
+            "save_skipped:checkpoint_len_mismatch"
+        )
+        return False
+    if not _trim_prompt_cache_in_place(cache_obj, trim_tokens):
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = (
+            "save_skipped:prompt_prefix_trim_failed"
+        )
+        return False
+    with mx.stream(mx.default_device()):
+        mx.eval([c.state for c in cache_obj])
+    holder["cache_len"] = len(key_ids)
+    holder["last_generated_tokens"] = 0
+    holder["last_exact_generated_ids"] = False
+    holder["prompt"] = prompt if isinstance(prompt, str) else None
+    _set_prompt_cache_event(
+        "updated_prompt_prefix_checkpoint",
+        phase="update",
+        reason=reason,
+        prompt_tokens=int(holder.get("last_input_tokens") or len(key_ids)),
+        trimmed_generated_tokens=trim_tokens,
+        key_tokens=len(key_ids),
+        cache_len=len(key_ids),
+        session_id=holder.get("session_id"),
+        session_source=holder.get("session_source"),
+        exact_generated_ids=False,
+        generated_reuse_allowed=False,
+        durable_checkpoint="prompt_prefix",
+        **_prompt_cache_match_fields(len(key_ids), len(key_ids)),
+    )
+    return True
+
+
+def _prompt_cache_ssd_status_unlocked(force_scan=False):
+    rank, world = _prompt_cache_ssd_current_rank_world()
+    base_path = os.path.expanduser(PROMPT_CACHE_SSD_DIR)
+    rank0_path = os.path.expanduser(PROMPT_CACHE_SSD_DIR_RANK0 or PROMPT_CACHE_SSD_DIR)
+    rank1_path = os.path.expanduser(PROMPT_CACHE_SSD_DIR_RANK1 or PROMPT_CACHE_SSD_DIR)
+    path = _prompt_cache_ssd_root(rank)
+    stat_path = path
+    while stat_path and not os.path.exists(stat_path):
+        parent = os.path.dirname(stat_path)
+        if parent == stat_path:
+            break
+        stat_path = parent
+    if not stat_path:
+        stat_path = os.path.expanduser("~")
+    free_bytes = None
+    scan = {"entries": [], "entry_count": None, "total_bytes": None}
+    try:
+        scan = _prompt_cache_ssd_scan_cached_unlocked(force=force_scan)
+        stat = os.statvfs(stat_path)
+        free_bytes = int(stat.f_bavail * stat.f_frsize)
+    except Exception as e:
+        _prompt_cache_ssd_state["last_error"] = str(e)
+    return {
+        "enabled": PROMPT_CACHE_SSD_ENABLED,
+        "restore_enabled": PROMPT_CACHE_SSD_RESTORE_ENABLED,
+        "auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
+        "mode": (
+            "restore+autosave"
+            if (
+                PROMPT_CACHE_SSD_ENABLED
+                and PROMPT_CACHE_SSD_RESTORE_ENABLED
+                and PROMPT_CACHE_SSD_AUTO_SAVE
+            )
+            else (
+                "restore"
+                if PROMPT_CACHE_SSD_ENABLED and PROMPT_CACHE_SSD_RESTORE_ENABLED
+                else (
+                    "autosave"
+                    if PROMPT_CACHE_SSD_ENABLED and PROMPT_CACHE_SSD_AUTO_SAVE
+                    else ("manual-save" if PROMPT_CACHE_SSD_ENABLED else "off")
+                )
+            )
+        ),
+        "path": path,
+        "base_path": base_path,
+        "rank": rank,
+        "rank_count": world,
+        "rank0_path": rank0_path,
+        "rank1_path": rank1_path,
+        "path_mode": (
+            "rank-specific"
+            if PROMPT_CACHE_SSD_DIR_RANK0 or PROMPT_CACHE_SSD_DIR_RANK1
+            else "shared-default"
+        ),
+        "exists": os.path.isdir(path),
+        "entry_count": scan.get("entry_count"),
+        "total_bytes": scan.get("total_bytes"),
+        "entries": (scan.get("entries") or [])[:PROMPT_CACHE_SSD_RECENT_ENTRIES],
+        "ttl_seconds": PROMPT_CACHE_SSD_TTL_SECONDS,
+        "max_bytes": PROMPT_CACHE_SSD_MAX_BYTES,
+        "min_tokens": PROMPT_CACHE_SSD_MIN_TOKENS,
+        "status_scan_interval_seconds": PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS,
+        "save_reasoning": PROMPT_CACHE_SSD_SAVE_REASONING,
+        "privacy": PROMPT_CACHE_SSD_PRIVACY,
+        "free_bytes": free_bytes,
+        **_prompt_cache_ssd_state,
+    }
+
+
+def _clear_prompt_cache_session_manifest_unlocked():
+    path = _session_manifest_path()
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+        now = round(time.time(), 3)
+        _prompt_cache_session_manifest_state.update({
+            "loaded_entries": 0,
+            "entry_count": 0,
+            "last_cleared_at": now,
+            "last_written_at": None,
+            "last_error": None,
+        })
+        return True
+    except Exception as e:
+        _prompt_cache_session_manifest_state["last_error"] = str(e)
+        logger.warning("prompt-cache session manifest clear failed: %s", e)
+        return False
+
+
+def _record_prompt_cache_session_event(action, phase, fields):
+    if PROMPT_CACHE_SESSION_MAP_MAX <= 0:
+        return
+    try:
+        session_id = (
+            fields.get("session_id")
+            or fields.get("request_session_id")
+            or fields.get("protected_session_id")
+            or _prompt_cache_holder.get("session_id")
+        )
+        session_source = (
+            fields.get("session_source")
+            or fields.get("request_session_source")
+            or fields.get("protected_session_source")
+            or _prompt_cache_holder.get("session_source")
+        )
+        key = _prompt_cache_session_key(session_id, session_source)
+        now = float(fields.get("at") or time.time())
+        entry = _prompt_cache_session_map.get(key) or {
+            "session_id": session_id,
+            "session_source": session_source,
+            "first_seen_at": round(now, 3),
+            "requests": 0,
+            "updates": 0,
+            "bypasses_preserved": 0,
+        }
+        for field in ("prompt_tokens", "reuse_tokens", "suffix_tokens", "missed_tokens"):
+            if fields.get(field) is not None:
+                entry[f"last_{field}"] = int(fields.get(field) or 0)
+        for field in ("cache_len", "key_tokens", "protected_cache_tokens"):
+            if fields.get(field) is not None:
+                entry[field] = int(fields.get(field) or 0)
+        if fields.get("reuse_ratio") is not None:
+            entry["last_reuse_ratio"] = fields.get("reuse_ratio")
+        if fields.get("miss_reason"):
+            entry["last_miss_reason"] = fields.get("miss_reason")
+        if action in {
+            "cold",
+            "reuse",
+            "low_reuse",
+            "bypass_preserve_large_cache",
+            "bypass_preserve_session_cache",
+        }:
+            entry["requests"] = int(entry.get("requests") or 0) + 1
+        if phase == "update":
+            entry["updates"] = int(entry.get("updates") or 0) + 1
+        if action in {"bypass_preserve_large_cache", "bypass_preserve_session_cache"}:
+            entry["bypasses_preserved"] = int(entry.get("bypasses_preserved") or 0) + 1
+        entry["last_action"] = action
+        entry["last_phase"] = phase
+        entry["last_at"] = round(now, 3)
+        if session_id:
+            entry["session_id"] = session_id
+        if session_source:
+            entry["session_source"] = session_source
+        _prompt_cache_session_map[key] = entry
+        _prompt_cache_session_map.move_to_end(key)
+        while len(_prompt_cache_session_map) > PROMPT_CACHE_SESSION_MAP_MAX:
+            _prompt_cache_session_map.popitem(last=False)
+        _write_prompt_cache_session_manifest_unlocked()
+    except Exception as e:
+        logger.debug("prompt-cache session-map update failed: %s", e)
+
+
+def _prompt_cache_session_map_status_unlocked():
+    current_key = _prompt_cache_current_session_key_unlocked()
+    loaded = _prompt_cache_holder.get("cache") is not None
+    resident_slot_keys = set(_prompt_cache_resident_slots.keys())
+    entries = []
+    for key, entry in reversed(_prompt_cache_session_map.items()):
+        row = dict(entry)
+        row["key"] = key
+        row["resident"] = bool(loaded and key == current_key)
+        row["resident_slot"] = bool(key in resident_slot_keys)
+        row["ssd_rehydratable"] = bool(row.get("ssd_rehydratable"))
+        # The distributed cache map currently has one safe resident KV slot.
+        # Extra in-memory slots are restorable without reprocessing, but the
+        # SSD tier can also make a metadata row rehydratable after restart.
+        row["metadata_only"] = not (row["resident"] or row["resident_slot"])
+        row["rehydratable"] = bool(row["resident_slot"] or row["ssd_rehydratable"])
+        if row["resident"]:
+            row["cache_len"] = int(_prompt_cache_holder.get("cache_len") or row.get("cache_len") or 0)
+            row["key_tokens"] = len(_prompt_cache_holder.get("token_ids") or [])
+        elif row["resident_slot"]:
+            slot = _prompt_cache_resident_slots.get(key) or {}
+            row["cache_len"] = int(slot.get("cache_len") or row.get("cache_len") or 0)
+            row["key_tokens"] = len(slot.get("token_ids") or [])
+        elif row["ssd_rehydratable"]:
+            row["cache_len"] = int(row.get("cache_len") or row.get("ssd_key_tokens") or 0)
+            row["key_tokens"] = int(row.get("key_tokens") or row.get("ssd_key_tokens") or 0)
+        entries.append(row)
+    for key, slot in reversed(_prompt_cache_resident_slots.items()):
+        if any(row.get("key") == key for row in entries):
+            continue
+        entries.append({
+            "key": key,
+            "resident": False,
+            "resident_slot": True,
+            "metadata_only": False,
+            "rehydratable": True,
+            "session_id": slot.get("session_id"),
+            "session_source": slot.get("session_source"),
+            "cache_len": int(slot.get("cache_len") or 0),
+            "key_tokens": len(slot.get("token_ids") or []),
+            "last_at": slot.get("last_access_at"),
+            "last_action": "resident_slot",
+        })
+    return {
+        "max_entries": PROMPT_CACHE_SESSION_MAP_MAX,
+        "resident_slots_max": PROMPT_CACHE_RESIDENT_SLOTS,
+        "resident_slots": [
+            {
+                "key": key,
+                "session_id": slot.get("session_id"),
+                "session_source": slot.get("session_source"),
+                "cache_len": int(slot.get("cache_len") or 0),
+                "key_tokens": len(slot.get("token_ids") or []),
+                "stashed_at": slot.get("stashed_at"),
+                "stash_reason": slot.get("stash_reason"),
+            }
+            for key, slot in reversed(_prompt_cache_resident_slots.items())
+        ],
+        "resident_total_tokens": _prompt_cache_resident_total_tokens_unlocked(),
+        "resident_total_max_tokens": PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS,
+        "resident_key": current_key if loaded else None,
+        "entries": entries,
+    }
+
+
+def _set_prompt_cache_event(action, *, phase="prepare", **fields):
+    event = {"action": action, "at": round(time.time(), 3)}
+    event.update(fields)
+    _prompt_cache_holder["last_event"] = event
+    _prompt_cache_holder["last_access_at"] = event["at"]
+    if phase == "update":
+        _prompt_cache_holder["last_update_event"] = event
+    else:
+        _prompt_cache_holder["last_prepare_event"] = event
+    _record_prompt_cache_session_event(action, phase, event)
+
+
+def _clear_prompt_cache_key_state_unlocked(holder):
+    holder["token_ids"] = []
+    holder["cache_len"] = 0
+    holder["last_input_tokens"] = 0
+    holder["last_generated_tokens"] = 0
+    holder["last_exact_generated_ids"] = False
+    holder["last_suffix_ids"] = None
+    holder["prompt"] = None
+    holder["session_id"] = None
+    holder["session_source"] = None
+
+
+def _drop_prompt_cache_unlocked(reason="reset", clear_manifest=False,
+                                clear_resident=True, **fields):
+    """Drop the cached KV state. Caller must hold _prompt_cache_lock.
+
+    clear_resident=False scopes the drop to the live cache only: per-request
+    resets (stop/disconnect/error on ONE stream) must not destroy the stashed
+    resident slots of every other session on the server (2026-07-06 audit).
+    """
+    _prompt_cache_holder["cache"] = None
+    _clear_prompt_cache_key_state_unlocked(_prompt_cache_holder)
+    if clear_resident:
+        _prompt_cache_resident_slots.clear()
+    _prompt_cache_holder["created_at"] = None
+    _prompt_cache_holder["last_keepwarm_event"] = None
+    _prompt_cache_holder["last_keepwarm_at"] = None
+    _prompt_cache_holder["keepwarm_count"] = 0
+    _prompt_cache_holder["in_use"] = False
+    _prompt_cache_holder["in_use_started_at"] = None
+    if clear_manifest:
+        _prompt_cache_session_map.clear()
+    else:
+        for entry in _prompt_cache_session_map.values():
+            entry["metadata_only"] = True
+            entry["rehydratable"] = bool(entry.get("ssd_rehydratable"))
+            entry["loaded_from_manifest"] = bool(entry.get("loaded_from_manifest"))
+    _set_prompt_cache_event(reason, prompt_tokens=0, reuse_tokens=0, **fields)
+    if clear_manifest:
+        _clear_prompt_cache_session_manifest_unlocked()
+
+
+def _mark_prompt_cache_in_use(in_use):
+    if not PROMPT_CACHE_ENABLED:
+        return
+    with _prompt_cache_lock:
+        _prompt_cache_holder["in_use"] = bool(in_use)
+        if in_use:
+            now = round(time.time(), 3)
+            _prompt_cache_holder["last_access_at"] = now
+            _prompt_cache_holder["in_use_started_at"] = now
+        else:
+            _prompt_cache_holder["in_use_started_at"] = None
+    if in_use and PROMPT_CACHE_KEEPWARM_ENABLED:
+        # Barrier: wait out any keepwarm Metal submission that passed its idle
+        # check before we flipped in_use, so generation never starts while a
+        # keepwarm matmul is in flight on this rank.
+        with _keepwarm_submit_lock:
+            pass
+
+
+def _recover_stale_prompt_cache_in_use(reason="idle recovery", max_age=90.0):
+    """Clear an abandoned in_use flag only from known-idle server paths."""
+    if not PROMPT_CACHE_ENABLED:
+        return False
+    now = time.time()
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        if not holder.get("in_use"):
+            return False
+        started = float(holder.get("in_use_started_at") or 0.0)
+        age = now - started if started > 0 else max_age + 1.0
+        if age < max_age:
+            return False
+        holder["in_use"] = False
+        holder["in_use_started_at"] = None
+        holder["last_keepwarm_event"] = {
+            "ok": False,
+            "action": "stale_in_use_recovered",
+            "at": round(now, 3),
+            "age_seconds": round(age, 3),
+            "reason": reason,
+        }
+        logger.warning(
+            "prompt-cache: recovered stale in_use flag after %.1fs (%s)",
+            age,
+            reason,
+        )
+        return True
+
+
+def _expire_idle_prompt_cache():
+    """Release an idle prompt cache after the configured TTL."""
+    if not PROMPT_CACHE_ENABLED or PROMPT_CACHE_TTL_SECONDS <= 0:
+        return False
+    expired = False
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        if holder.get("cache") is None or holder.get("in_use"):
+            return False
+        last_access = float(holder.get("last_access_at") or 0.0)
+        if last_access <= 0:
+            return False
+        idle = time.time() - last_access
+        if idle >= PROMPT_CACHE_TTL_SECONDS:
+            _drop_prompt_cache_unlocked(
+                "ttl_expired",
+                idle_seconds=round(idle, 3),
+                ttl_seconds=PROMPT_CACHE_TTL_SECONDS,
+            )
+            expired = True
+    if expired:
+        mx.clear_cache()
+        gc.collect()
+        logger.info("prompt-cache ttl expired; cache released")
+    return expired
+
+
+def _enforce_prompt_cache_size_limit():
+    if not PROMPT_CACHE_ENABLED or PROMPT_CACHE_MAX_TOKENS <= 0:
+        return False
+    dropped = False
+    with _prompt_cache_lock:
+        cache_len = int(_prompt_cache_holder.get("cache_len") or 0)
+        if _prompt_cache_holder.get("cache") is not None and cache_len > PROMPT_CACHE_MAX_TOKENS:
+            _drop_prompt_cache_unlocked(
+                "max_tokens_exceeded",
+                cache_len=cache_len,
+                max_tokens=PROMPT_CACHE_MAX_TOKENS,
+            )
+            dropped = True
+    if dropped:
+        mx.clear_cache()
+        gc.collect()
+        logger.info("prompt-cache max token limit exceeded; cache released")
+    return dropped
+
+
+def _start_prompt_cache_janitor():
+    if not PROMPT_CACHE_ENABLED or PROMPT_CACHE_TTL_SECONDS <= 0:
+        return
+
+    def _run():
+        interval = max(5.0, min(60.0, PROMPT_CACHE_TTL_SECONDS / 4))
+        while True:
+            time.sleep(interval)
+            try:
+                _expire_idle_prompt_cache()
+            except Exception as e:
+                logger.debug("prompt-cache janitor failed: %s", e)
+
+    t = threading.Thread(target=_run, name="prompt-cache-janitor", daemon=True)
+    t.start()
+    logger.info("prompt-cache janitor armed (ttl=%ss)", PROMPT_CACHE_TTL_SECONDS)
+
+
+def _common_prefix_len(a, b):
+    """Length of the longest common prefix of two token-id lists."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def _prompt_cache_match_fields(prompt_tokens, reuse_tokens, *, previous_key_tokens=None):
+    prompt_tokens = int(prompt_tokens or 0)
+    reuse_tokens = int(reuse_tokens or 0)
+    missed_tokens = max(0, prompt_tokens - reuse_tokens)
+    fields = {
+        "reuse_ratio": round(reuse_tokens / prompt_tokens, 4) if prompt_tokens else 0.0,
+        "missed_tokens": missed_tokens,
+    }
+    if previous_key_tokens is not None:
+        fields["previous_key_tokens"] = int(previous_key_tokens or 0)
+    return fields
+
+
+def _decode_prompt_cache_token_window(processor, token_ids, center, radius=18):
+    """Decode a tiny token window around a cache mismatch for diagnostics."""
+    try:
+        if token_ids is None:
+            return None
+        center = int(center)
+        token_ids = list(token_ids)
+        start = max(0, center - int(radius))
+        end = min(len(token_ids), center + int(radius) + 1)
+        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        return {
+            "start": start,
+            "end": end,
+            "token_ids": [int(t) for t in token_ids[start:end]],
+            "text": tok.decode(token_ids[start:end]),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _add_prompt_cache_mismatch_windows(reuse_diag, processor, previous_ids, prompt_ids):
+    if not isinstance(reuse_diag, dict):
+        return reuse_diag
+    mi = reuse_diag.get("mismatch_index")
+    if not isinstance(mi, int):
+        return reuse_diag
+    reuse_diag = dict(reuse_diag)
+    reuse_diag["previous_mismatch_window"] = _decode_prompt_cache_token_window(
+        processor, previous_ids, mi
+    )
+    reuse_diag["prompt_mismatch_window"] = _decode_prompt_cache_token_window(
+        processor, prompt_ids, mi
+    )
+    return reuse_diag
+
+
+def _prompt_cache_reuse_diagnostics(
+    holder, prompt_tokens, reuse_tokens, candidate_token_ids=None
+):
+    """Classify where a prompt-cache match diverged.
+
+    This is especially useful for OpenAI-compatible UIs that do not send
+    previous assistant reasoning back. Overall reuse can look healthy while the
+    cache still trims at the prior assistant boundary and has to prefill a long
+    response again.
+    """
+    previous_key_tokens = len(holder.get("token_ids") or [])
+    previous_input_tokens = int(holder.get("last_input_tokens") or 0)
+    previous_generated_tokens = int(holder.get("last_generated_tokens") or 0)
+    reuse_tokens = int(reuse_tokens or 0)
+    prompt_tokens = int(prompt_tokens or 0)
+    reused_generated_tokens = max(0, reuse_tokens - previous_input_tokens)
+    generated_reuse_ratio = (
+        round(reused_generated_tokens / previous_generated_tokens, 4)
+        if previous_generated_tokens > 0 else None
+    )
+    if previous_key_tokens <= 0:
+        reason = "cold"
+    elif reuse_tokens >= previous_key_tokens:
+        reason = "exact_prior_transcript"
+    elif previous_input_tokens > 0 and reuse_tokens < previous_input_tokens:
+        reason = "history_prefix_mismatch"
+    elif previous_generated_tokens > 0 and reuse_tokens == previous_input_tokens:
+        reason = "previous_assistant_start_mismatch"
+    elif previous_generated_tokens > 0 and reuse_tokens < previous_key_tokens:
+        reason = "previous_assistant_partial_mismatch"
+    else:
+        reason = "new_suffix_only"
+    mismatch = {}
+    if 0 <= reuse_tokens < min(previous_key_tokens, prompt_tokens):
+        previous_ids = holder.get("token_ids") or []
+        prompt_ids = candidate_token_ids or []
+        mismatch["mismatch_index"] = reuse_tokens
+        mismatch["mismatch_region"] = (
+            "generated_tail"
+            if previous_input_tokens > 0 and reuse_tokens >= previous_input_tokens
+            else "prompt_prefix"
+        )
+        mismatch["generated_tail_offset"] = (
+            reuse_tokens - previous_input_tokens
+            if previous_input_tokens > 0 and reuse_tokens >= previous_input_tokens
+            else None
+        )
+        try:
+            mismatch["previous_token_at_mismatch"] = int(previous_ids[reuse_tokens])
+        except Exception:
+            mismatch["previous_token_at_mismatch"] = None
+        try:
+            mismatch["prompt_token_at_mismatch"] = int(prompt_ids[reuse_tokens])
+        except Exception:
+            mismatch["prompt_token_at_mismatch"] = None
+    return {
+        "miss_reason": reason,
+        "previous_input_tokens": previous_input_tokens,
+        "previous_generated_tokens": previous_generated_tokens,
+        "previous_key_tokens": previous_key_tokens,
+        "reused_generated_tokens": reused_generated_tokens,
+        "generated_reuse_ratio": generated_reuse_ratio,
+        "would_reprocess_tokens": max(0, prompt_tokens - reuse_tokens),
+        "previous_exact_generated_ids": bool(holder.get("last_exact_generated_ids")),
+        **mismatch,
+    }
+
+
+def _normalize_cache_session(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text[:128]
+
+
+def _is_auto_cache_session_source(session_source):
+    return str(session_source or "").startswith("auto.")
+
+
+def _auto_cache_reuse_requires_rebuild(
+    holder, token_ids, reuse_tokens, session_source, current_session_id=None
+):
+    """Return a reason when auto-session cache reuse could cross chat boundaries.
+
+    Auto sessions are a convenience for OpenAI-compatible clients that do not
+    send a real chat id. They are necessarily heuristic. To prevent independent
+    chats with similar openers from sharing KV state, only force a rebuild when
+    the derived auto-session id changes. Same-id auto sessions are allowed to use
+    the normal prefix/backtrack path because OpenWebUI can shift the serialized
+    history while still sending the same continuing chat.
+    """
+    if not _is_auto_cache_session_source(session_source):
+        return None
+    previous_session_id = holder.get("session_id")
+    if previous_session_id and current_session_id and previous_session_id == current_session_id:
+        return None
+    previous_input_tokens = int(holder.get("last_input_tokens") or 0)
+    if previous_input_tokens <= 0:
+        return None
+    prompt_tokens = len(token_ids or [])
+    reuse_tokens = int(reuse_tokens or 0)
+    if prompt_tokens > previous_input_tokens and reuse_tokens < previous_input_tokens:
+        return "auto_session_history_prefix_mismatch"
+    if prompt_tokens <= previous_input_tokens and reuse_tokens < prompt_tokens:
+        return "auto_session_prompt_prefix_mismatch"
+    return None
+
+
+def _auto_cache_session_from_request(request):
+    """Derive a privacy-safe session key when the client omits one.
+
+    OpenWebUI and many agent clients send full conversation history but not a
+    stable chat id. Hashing a few conversation-shape anchors lets cache
+    protection distinguish independent chats without exposing prompt text.
+    """
+    if not isinstance(request, dict):
+        return None, None
+    messages = request.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None, None
+    anchors = []
+    image_parts = 0
+    image_anchors = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content", "")
+        text_parts = []
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in ("text", "input_text"):
+                    text_parts.append(str(part.get("text") or part.get("content") or ""))
+                elif _extract_image_source(part):
+                    image_parts += 1
+                    image_anchors.append(_short_hash(_extract_image_source(part)))
+        elif isinstance(content, str):
+            text_parts.append(content)
+        text = "\n".join(t for t in text_parts if t)
+        if role == "system" and text:
+            anchors.append(("system", _short_hash(text)))
+        elif role == "user" and text:
+            anchors.append(("user", _short_hash(text)))
+    user_anchors = [h for role, h in anchors if role == "user"]
+    if not user_anchors:
+        return None, None
+    tools = request.get("tools")
+    # 2026-07-06 cache audit: hashing the full tool JSON made the auto id flip
+    # whenever a client mutated schemas/descriptions between turns (gateways
+    # prune tool lists per turn, opencode injects cwd into descriptions).
+    # Sorted names keep "different agent = different session" while surviving
+    # cosmetic churn; token-level prefix checks still guard actual reuse.
+    tool_names = []
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                fn = tool.get("function") if isinstance(tool.get("function"), dict) else {}
+                name = str(fn.get("name") or tool.get("name") or "")
+                if name:
+                    tool_names.append(name)
+    tools_hash = _short_hash(",".join(sorted(tool_names))) if tool_names else "-"
+    requested_model = _normalize_cache_session(request.get("model")) or "-"
+    material = "|".join([
+        f"model={requested_model}",
+        # OpenWebUI can mutate its system prompt between turns with transient
+        # tool/status/context text. Keep the auto session tied to stable chat
+        # anchors so normal follow-ups reuse KV instead of stashing each turn.
+        "system=-",
+        f"first_user={user_anchors[0]}",
+        f"tools_hash={tools_hash}",
+        f"images={image_parts}",
+        f"image_hashes={','.join(image_anchors[:8])}",
+    ])
+    return f"auto:{_short_hash(material)}", "auto.conversation_fingerprint"
+
+
+def _request_cache_session(request):
+    """Return a privacy-safe cache session id from OpenAI-compatible fields."""
+    metadata = request.get("metadata") if isinstance(request, dict) else None
+    if isinstance(metadata, dict):
+        for key in (
+            "session_id",
+            "conversation_id",
+            "chat_id",
+            "thread_id",
+            "agent_session_id",
+            "cache_session_id",
+        ):
+            sid = _normalize_cache_session(metadata.get(key))
+            if sid:
+                return sid, f"metadata.{key}"
+    for key in ("session_id", "conversation_id", "chat_id", "thread_id"):
+        sid = _normalize_cache_session(request.get(key)) if isinstance(request, dict) else None
+        if sid:
+            return sid, key
+    return _auto_cache_session_from_request(request)
+
+
+def _tokenize_prompt(processor, prompt):
+    """Tokenize the rendered prompt to token ids (the cache key)."""
+    try:
+        with _tokenizer_runtime_lock:
+            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            ids = tok.encode(prompt, add_special_tokens=False)
+        return list(ids)
+    except Exception as e:
+        logger.debug(f"prompt-cache tokenize failed: {e}")
+        return None
+
+
+def _get_or_build_prompt_cache(model):
+    """Return the reusable prompt cache, building it fresh if needed."""
+    with _prompt_cache_lock:
+        return _get_or_build_prompt_cache_unlocked(model)
+
+
+def _get_or_build_prompt_cache_unlocked(model):
+    holder = _prompt_cache_holder
+    if holder["cache"] is None:
+        from mlx_vlm.models import cache as _cache_mod
+
+        holder["cache"] = _cache_mod.make_prompt_cache(
+            model.language_model, max_kv_size=holder["max_kv_size"]
+        )
+        _clear_prompt_cache_key_state_unlocked(holder)
+        holder["created_at"] = round(time.time(), 3)
+    return holder["cache"]
+
+
+def _cache_token_count(cache):
+    """Best-effort count of tokens currently held in the prompt cache."""
+    if not cache:
+        return 0
+    try:
+        # KVCache-like objects expose an offset/keys shape; use the first layer.
+        c0 = cache[0]
+        for attr in ("offset", "_offset", "idx"):
+            v = getattr(c0, attr, None)
+            if isinstance(v, int):
+                return v
+        kc = getattr(c0, "kv_cache", None)
+        if kc is not None:
+            keys = getattr(kc, "keys", None)
+            if keys is not None:
+                return int(keys.shape[2])
+            for attr in ("offset", "_offset", "idx"):
+                v = getattr(kc, attr, None)
+                if isinstance(v, int):
+                    return v
+    except Exception:
+        pass
+    return 0
+
+
+def _trim_prompt_cache_in_place(cache, n):
+    """Trim n tokens from every layer cache; return True only if all agree."""
+    if not cache or n <= 0:
+        return True
+    trimmed = []
+    for c in cache:
+        if c is None:
+            continue
+        if hasattr(c, "is_trimmable") and not c.is_trimmable():
+            return False
+    for c in cache:
+        if c is None:
+            continue
+        if not hasattr(c, "trim"):
+            return False
+        trimmed.append(int(c.trim(n)))
+    return bool(trimmed) and all(t == n for t in trimmed)
+
+
+def _prompt_cache_status():
+    with _prompt_cache_lock:
+        now = time.time()
+        last_access = _prompt_cache_holder.get("last_access_at")
+        idle = round(now - float(last_access), 3) if last_access else None
+        expires = None
+        if (
+            PROMPT_CACHE_TTL_SECONDS > 0
+            and idle is not None
+            and _prompt_cache_holder.get("cache") is not None
+            and not _prompt_cache_holder.get("in_use")
+        ):
+            expires = max(0.0, round(PROMPT_CACHE_TTL_SECONDS - idle, 3))
+        return {
+            "enabled": PROMPT_CACHE_ENABLED,
+            "thinking_enabled": PROMPT_CACHE_THINKING_ENABLED,
+            "thinking_mode": PROMPT_CACHE_THINKING_MODE,
+            "min_reuse": PROMPT_CACHE_MIN_REUSE,
+            "ttl_seconds": PROMPT_CACHE_TTL_SECONDS,
+            "max_tokens": PROMPT_CACHE_MAX_TOKENS,
+            "generated_reuse_max_tokens": PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS,
+            "protect_large": PROMPT_CACHE_PROTECT_LARGE_ENABLED,
+            "protect_min_tokens": PROMPT_CACHE_PROTECT_MIN_TOKENS,
+            "protect_bypass_max_tokens": PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS,
+            "session_protect": PROMPT_CACHE_SESSION_PROTECT_ENABLED,
+            "session_protect_min_tokens": PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS,
+            "session_protect_bypass_max_tokens": PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS,
+            "session_id": _prompt_cache_holder.get("session_id"),
+            "session_source": _prompt_cache_holder.get("session_source"),
+            "key_tokens": len(_prompt_cache_holder.get("token_ids") or []),
+            "cache_len": int(_prompt_cache_holder.get("cache_len") or 0),
+            "last_input_tokens": int(_prompt_cache_holder.get("last_input_tokens") or 0),
+            "last_generated_tokens": int(_prompt_cache_holder.get("last_generated_tokens") or 0),
+            "last_exact_generated_ids": bool(_prompt_cache_holder.get("last_exact_generated_ids")),
+            "loaded": _prompt_cache_holder.get("cache") is not None,
+            "in_use": bool(_prompt_cache_holder.get("in_use")),
+            "in_use_started_at": _prompt_cache_holder.get("in_use_started_at"),
+            "in_use_age_seconds": (
+                round(now - float(_prompt_cache_holder.get("in_use_started_at")), 3)
+                if _prompt_cache_holder.get("in_use_started_at")
+                else None
+            ),
+            "idle_seconds": idle,
+            "expires_in_seconds": expires,
+            "last_event": _prompt_cache_holder.get("last_event"),
+            "last_prepare_event": _prompt_cache_holder.get("last_prepare_event"),
+            "last_update_event": _prompt_cache_holder.get("last_update_event"),
+            "last_keepwarm_event": _prompt_cache_holder.get("last_keepwarm_event"),
+            "keepwarm": {
+                "enabled": PROMPT_CACHE_KEEPWARM_ENABLED,
+                "mode": PROMPT_CACHE_KEEPWARM_MODE,
+                "interval_seconds": PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS,
+                "idle_after_seconds": PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS,
+                "matrix_size": PROMPT_CACHE_KEEPWARM_MATRIX_SIZE,
+                "large_cache_tokens": PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS,
+                "large_interval_seconds": PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS,
+                "slow_backoff_seconds": PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS,
+                "request_start_enabled": PROMPT_CACHE_REQUEST_START_KEEPWARM_ENABLED,
+                "request_start_idle_seconds": PROMPT_CACHE_REQUEST_START_KEEPWARM_IDLE_SECONDS,
+                "request_start_matrix_size": PROMPT_CACHE_REQUEST_START_KEEPWARM_MATRIX_SIZE,
+                "request_start_repeats": PROMPT_CACHE_REQUEST_START_KEEPWARM_REPEATS,
+                "post_response_enabled": PROMPT_CACHE_POST_RESPONSE_KEEPWARM_ENABLED,
+                "post_response_delay_seconds": PROMPT_CACHE_POST_RESPONSE_KEEPWARM_DELAY_SECONDS,
+                "post_response_matrix_size": PROMPT_CACHE_POST_RESPONSE_KEEPWARM_MATRIX_SIZE,
+                "post_response_repeats": PROMPT_CACHE_POST_RESPONSE_KEEPWARM_REPEATS,
+                "count": int(_prompt_cache_holder.get("keepwarm_count") or 0),
+                "last_at": _prompt_cache_holder.get("last_keepwarm_at"),
+            },
+            "session_map": _prompt_cache_session_map_status_unlocked(),
+            "session_manifest": _prompt_cache_session_manifest_status_unlocked(),
+            "ssd": _prompt_cache_ssd_status_unlocked(),
+        }
+
+
+def _prompt_cache_last_prepare_action():
+    with _prompt_cache_lock:
+        event = _prompt_cache_holder.get("last_prepare_event") or {}
+        return event.get("action")
+
+
+def _prompt_cache_last_suffix_ids():
+    with _prompt_cache_lock:
+        suffix_ids = _prompt_cache_holder.get("last_suffix_ids")
+        return list(suffix_ids) if suffix_ids else None
+
+
+def _prompt_cache_current_prompt_snapshot():
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        prompt = holder.get("prompt")
+        token_ids = list(holder.get("token_ids") or [])
+        if not isinstance(prompt, str) or not prompt or not token_ids:
+            return None
+        # If the key includes generated ids, the saved prompt no longer maps
+        # one-to-one to token_ids. Skip idle prewarm in that case rather than
+        # rebuilding a mismatched cache.
+        if int(holder.get("last_input_tokens") or 0) != len(token_ids):
+            return None
+        return {
+            "prompt": prompt,
+            "token_ids": token_ids,
+            "session_id": holder.get("session_id"),
+            "session_source": holder.get("session_source"),
+            "cache_len": int(holder.get("cache_len") or 0),
+        }
+
+
+def _prompt_cache_request_start_keepwarm_candidate(min_idle_seconds=None):
+    if not PROMPT_CACHE_ENABLED:
+        return None
+    now = time.time()
+    min_idle = (
+        PROMPT_CACHE_REQUEST_START_KEEPWARM_IDLE_SECONDS
+        if min_idle_seconds is None else float(min_idle_seconds or 0.0)
+    )
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        if holder.get("cache") is None or holder.get("in_use"):
+            return None
+        cache_len = int(holder.get("cache_len") or 0)
+        if cache_len <= 0:
+            return None
+        last_access = float(holder.get("last_access_at") or 0.0)
+        idle = now - last_access if last_access > 0 else 0.0
+        if idle < min_idle:
+            return None
+        return {
+            "cache_len": cache_len,
+            "idle_seconds": round(idle, 3),
+            "session_id": holder.get("session_id"),
+            "session_source": holder.get("session_source"),
+        }
+
+
+def _prompt_cache_prepare_preserves_existing_cache(action=None):
+    if action is None:
+        action = _prompt_cache_last_prepare_action()
+    return action in {
+        "bypass_preserve_large_cache",
+        "bypass_preserve_session_cache",
+    }
+
+
+# Serializes keepwarm Metal submissions against generation start. The idle
+# check in _touch_prompt_cache_keepwarm runs under _prompt_cache_lock, but the
+# warmup matmul itself runs outside it; without this lock a generation could
+# begin between the check and the submission and interleave GPU work with the
+# first distributed ops of the request.
+_keepwarm_submit_lock = threading.Lock()
+
+
+def _touch_prompt_cache_keepwarm(warmup_cb=None):
+    if not PROMPT_CACHE_ENABLED or not PROMPT_CACHE_KEEPWARM_ENABLED:
+        return False
+    started = time.time()
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        cache = holder.get("cache")
+        if cache is None or holder.get("in_use"):
+            return False
+        cache_len = int(holder.get("cache_len") or 0)
+        if cache_len <= 0:
+            return False
+        last_access = float(holder.get("last_access_at") or 0.0)
+        idle = time.time() - last_access if last_access > 0 else 0.0
+        if idle < PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS:
+            return False
+        last_keepwarm = float(holder.get("last_keepwarm_at") or 0.0)
+        if (
+            PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS > 0
+            and cache_len >= PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS
+            and PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS > 0
+            and last_keepwarm > 0
+            and time.time() - last_keepwarm < PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS
+        ):
+            return False
+        last_event = holder.get("last_keepwarm_event") or {}
+        last_elapsed_ms = float(last_event.get("elapsed_ms") or 0.0)
+        if (
+            PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS > 0
+            and last_keepwarm > 0
+            and last_elapsed_ms >= 1000.0
+            and time.time() - last_keepwarm < PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS
+        ):
+            return False
+    try:
+        # Do not evaluate the KV cache object itself here. Those arrays can be
+        # tied to the generation thread's MLX stream, and touching them from
+        # the keepwarm thread raises "no Stream(...) in current thread". Use
+        # the same bounded matmul warmup as the admin endpoint so the Metal
+        # path used by prefill/decode stays warm during OpenWebUI think time.
+        with _keepwarm_submit_lock:
+            # Re-check under the submit lock: a generation may have started
+            # between the idle check above and this submission.
+            with _prompt_cache_lock:
+                if _prompt_cache_holder.get("in_use"):
+                    return False
+            if warmup_cb is not None:
+                event = warmup_cb(
+                    size=PROMPT_CACHE_KEEPWARM_MATRIX_SIZE,
+                    repeats=1,
+                    reason="prompt-cache keepwarm",
+                )
+                if not event or event.get("skipped"):
+                    return False
+            else:
+                event = _metal_warmup_touch(
+                    size=PROMPT_CACHE_KEEPWARM_MATRIX_SIZE,
+                    repeats=1,
+                    reason="prompt-cache keepwarm",
+                )
+        if not event.get("ok"):
+            raise RuntimeError(event.get("error") or "metal warmup failed")
+    except Exception as e:
+        with _prompt_cache_lock:
+            holder = _prompt_cache_holder
+            holder["last_keepwarm_event"] = {
+                "action": "error",
+                "at": round(time.time(), 3),
+                "error": str(e),
+                "cache_len": cache_len,
+            }
+        logger.debug("prompt-cache keepwarm failed: %s", e)
+        return False
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        if holder.get("cache") is None or holder.get("in_use"):
+            return False
+        try:
+            cache_len = int(holder.get("cache_len") or cache_len)
+            last_access = float(holder.get("last_access_at") or last_access)
+            idle = time.time() - last_access if last_access > 0 else idle
+        except Exception:
+            pass
+        holder["keepwarm_count"] = int(holder.get("keepwarm_count") or 0) + 1
+        event = {
+            "action": "metal_touch",
+            "at": round(time.time(), 3),
+            "cache_len": cache_len,
+            "idle_seconds": round(idle, 3),
+            "elapsed_ms": round((time.time() - started) * 1000, 3),
+            "count": holder["keepwarm_count"],
+        }
+        holder["last_keepwarm_event"] = event
+        holder["last_keepwarm_at"] = event["at"]
+    return True
+
+
+def _start_prompt_cache_keepwarm(warmup_cb=None):
+    if (
+        not PROMPT_CACHE_ENABLED
+        or not PROMPT_CACHE_KEEPWARM_ENABLED
+        or PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS <= 0
+    ):
+        return
+
+    def _run():
+        interval = max(0.25, PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS)
+        while True:
+            time.sleep(interval)
+            try:
+                _touch_prompt_cache_keepwarm(warmup_cb=warmup_cb)
+            except Exception as e:
+                logger.debug("prompt-cache keepwarm loop failed: %s", e)
+
+    t = threading.Thread(target=_run, name="prompt-cache-keepwarm", daemon=True)
+    t.start()
+    logger.info(
+        "prompt-cache keepwarm armed (interval=%.2fs idle_after=%.2fs)",
+        PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS,
+        PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS,
+    )
+
+
+def _metal_warmup_touch(size=128, repeats=2, reason="manual"):
+    """Run a bounded independent GPU touch without altering prompt-cache state."""
+    global _metal_warmup_last_event
+    started = time.time()
+    size = max(16, min(1024, int(size or 128)))
+    repeats = max(1, min(16, int(repeats or 2)))
+    try:
+        with mx.stream(mx.default_device()):
+            acc = None
+            for i in range(repeats):
+                a = mx.ones((size, size), dtype=mx.float16) * (i + 1)
+                b = mx.ones((size, size), dtype=mx.float16)
+                value = mx.sum(a @ b)
+                acc = value if acc is None else acc + value
+            mx.eval(acc)
+        event = {
+            "ok": True,
+            "action": "metal_warmup",
+            "reason": str(reason or "manual")[:128],
+            "at": round(time.time(), 3),
+            "matrix_size": size,
+            "repeats": repeats,
+            "elapsed_ms": round((time.time() - started) * 1000, 3),
+        }
+    except Exception as e:
+        event = {
+            "ok": False,
+            "action": "metal_warmup_error",
+            "reason": str(reason or "manual")[:128],
+            "at": round(time.time(), 3),
+            "matrix_size": size,
+            "repeats": repeats,
+            "elapsed_ms": round((time.time() - started) * 1000, 3),
+            "error": str(e),
+        }
+        logger.debug("metal warmup failed: %s", e)
+    with _metal_warmup_lock:
+        _metal_warmup_last_event = event
+    return event
+
+
+def _metal_warmup_status():
+    with _metal_warmup_lock:
+        return dict(_metal_warmup_last_event) if _metal_warmup_last_event else None
+
+
+
+def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
+                           cached_suffix_ids):
+    """Rank-coherence gate for the prefill plan (2026-07-07).
+
+    Both ranks compute cache reuse independently and are ASSUMED to agree.
+    After retries/stops their holder states can drift, and a mismatched plan
+    sends different-shaped pipeline messages (rank1 suffix=64 vs rank0 full
+    7974 re-prefill) -> IBV_WC_LOC_LEN_ERR (status=1 wr_id=0x20001, five
+    captures) -> frozen step. One all_sum exchanges the planned prefix
+    length; ANY mismatch makes BOTH ranks drop to an identical full prefill
+    (fresh cache) — correctness over the rare re-prefill.
+    Runs in the sequential prepare phase: no model collectives in flight.
+    """
+    try:
+        my_len = int(cached_prompt_cache[0].offset) if cached_prompt_cache else 0
+    except Exception:
+        my_len = 0
+    try:
+        group = mx.distributed.init()
+        if group.size() <= 1:
+            return prompt_to_send, cached_prompt_cache, cached_suffix_ids
+        total = mx.distributed.all_sum(mx.array(my_len, dtype=mx.int32))
+        mx.eval(total)
+        other_len = int(total.item()) - my_len
+    except Exception as e:
+        logger.warning("prefix-plan consensus unavailable (%s); keeping local plan", e)
+        return prompt_to_send, cached_prompt_cache, cached_suffix_ids
+    if other_len == my_len:
+        return prompt_to_send, cached_prompt_cache, cached_suffix_ids
+    logger.warning(
+        "rank %s: PREFIX PLAN DIVERGENCE (mine=%d peer=%d) — both ranks "
+        "rebuilding with a full identical prefill", rank, my_len, other_len,
+    )
+    _reset_prompt_cache("prefix plan divergence", clear_resident=False)
+    return prompt, None, None
+
+
+def _prepare_cached_prompt(model, processor, prompt, token_ids,
+                           session_id=None, session_source=None,
+                           thinking_mode="adaptive"):
+    """Compute (suffix_prompt, prompt_cache) for prefix-aware generation.
+
+    Returns (prompt_to_send, prompt_cache_or_None). If a long prefix is reused,
+    the cache is trimmed to that prefix and only the suffix prompt is sent. If
+    reuse is short/none, a fresh cache is built and the full prompt is sent.
+    Both ranks call this with IDENTICAL token_ids (broadcast by rank 0), so
+    their resulting cache state matches and the distributed generation stays
+    in lockstep.
+
+    Cache-state tracking: after a generation, the KV cache holds INPUT + the
+    generated tokens. We store the INPUT token_ids as the key (the part shared
+    with the next turn's prompt) and use the cache's OWN offset to know its
+    true length when trimming. This keeps the prefix math correct even though
+    generated tokens extend the cache beyond the stored key.
+    """
+    if not PROMPT_CACHE_ENABLED or token_ids is None:
+        return prompt, None
+
+    _expire_idle_prompt_cache()
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        restored_slot = None
+        restored_ssd = None
+        # Thinking prompts include control tokens and hidden/visible routing
+        # boundaries. Durable partial restores are safe for the no-thinking path
+        # but can resume thinking decode from an unsafe boundary, so require an
+        # exact durable match and fall back to normal prefill otherwise.
+        allow_partial_ssd_restore = not _enable_thinking_for_generation(thinking_mode)
+        if (
+            session_id
+            and holder.get("cache") is not None
+            and _prompt_cache_current_session_key_unlocked()
+            != _prompt_cache_session_key(session_id, session_source)
+        ):
+            restored_slot = _prompt_cache_restore_resident_unlocked(
+                session_id=session_id,
+                session_source=session_source,
+            )
+        cached_ids = holder["token_ids"]
+        cache = holder["cache"]
+
+        if cache is None or not cached_ids:
+            restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
+                model,
+                processor,
+                token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                reason="cold_or_empty_ram",
+                allow_partial_restore=allow_partial_ssd_restore,
+            )
+            if restored_ssd:
+                cached_ids = holder["token_ids"]
+                cache = holder["cache"]
+            else:
+                # First request, or cache was reset: full prompt, fresh cache.
+                holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                _clear_prompt_cache_key_state_unlocked(holder)
+                holder["session_id"] = session_id
+                holder["session_source"] = session_source
+                holder["last_suffix_ids"] = list(token_ids)
+                _set_prompt_cache_event(
+                    "cold",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    suffix_tokens=len(token_ids),
+                    session_id=session_id,
+                    session_source=session_source,
+                    restored_resident_slot=bool(restored_slot),
+                    **(restored_slot or {}),
+                    restored_ssd_cache=False,
+                    **_prompt_cache_match_fields(len(token_ids), 0),
+                )
+                return prompt, holder["cache"]
+
+        # Common prefix between the stored INPUT ids and the new prompt ids.
+        L = _common_prefix_len(cached_ids, token_ids)
+        reuse = L
+        reuse_diag = _prompt_cache_reuse_diagnostics(
+            holder, len(token_ids), reuse, token_ids
+        )
+        reuse_diag = _add_prompt_cache_mismatch_windows(
+            reuse_diag, processor, cached_ids, token_ids
+        )
+
+        protected_cache_tokens = int(holder.get("cache_len") or len(cached_ids) or 0)
+        cached_session_id = holder.get("session_id")
+        cached_session_source = holder.get("session_source")
+        auto_rebuild_reason = _auto_cache_reuse_requires_rebuild(
+            holder,
+            token_ids,
+            reuse,
+            session_source or cached_session_source,
+            current_session_id=session_id,
+        )
+        if not auto_rebuild_reason and (
+            _enable_thinking_for_generation(thinking_mode)
+            and PROMPT_CACHE_THINKING_MODE == "visible"
+            and _is_auto_cache_session_source(session_source or cached_session_source)
+            and cached_session_id
+            and session_id
+            and cached_session_id != session_id
+            and reuse_diag.get("miss_reason") == "history_prefix_mismatch"
+        ):
+            auto_rebuild_reason = "visible_thinking_history_prefix_mismatch"
+        if auto_rebuild_reason:
+            # 2026-07-06 cache audit: isolation rebuilds used to nuke the live
+            # KV un-stashed. Auto-session ids flip on client tool-list churn
+            # and on interleaved tool-less probes, so each flip cost the active
+            # agent its entire cache (the dominant zero-reuse leak). Isolation
+            # only requires that the OTHER chat's KV is not reused for THIS
+            # request — a cacheless full prefill satisfies that without
+            # destroying anything. Preserve first, destroy last:
+            #   1. short prompt vs protected cache -> cacheless bypass
+            #   2. otherwise stash to a resident slot, try SSD restore
+            #   3. only then rebuild fresh
+            if (
+                protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+                and len(token_ids) <= PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS
+            ):
+                _set_prompt_cache_event(
+                    "bypass_preserve_auto_isolation",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    suffix_tokens=len(token_ids),
+                    protected_cache_tokens=protected_cache_tokens,
+                    protected_session_id=cached_session_id,
+                    protected_session_source=cached_session_source,
+                    request_session_id=session_id,
+                    request_session_source=session_source,
+                    isolation_reason=auto_rebuild_reason,
+                    **_prompt_cache_match_fields(len(token_ids), 0),
+                    **reuse_diag,
+                )
+                holder["last_suffix_ids"] = None
+                logger.info(
+                    "prompt-cache: bypassing %s-session isolation prompt (%d tokens, "
+                    "reason=%s) to preserve %s-session %d-token cache",
+                    session_id,
+                    len(token_ids),
+                    auto_rebuild_reason,
+                    cached_session_id,
+                    protected_cache_tokens,
+                )
+                return prompt, None
+            stashed = False
+            if (
+                PROMPT_CACHE_RESIDENT_SLOTS > 1
+                and protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+            ):
+                stashed = _prompt_cache_stash_current_unlocked(
+                    reason=f"auto_isolation:{session_id or '__default__'}"
+                )
+                restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
+                    model,
+                    processor,
+                    token_ids,
+                    session_id=session_id,
+                    session_source=session_source,
+                    reason="auto_isolation_after_stash",
+                    allow_partial_restore=allow_partial_ssd_restore,
+                )
+                if restored_ssd:
+                    return _prepare_cached_prompt(
+                        model,
+                        processor,
+                        prompt,
+                        token_ids,
+                        session_id=session_id,
+                        session_source=session_source,
+                        thinking_mode=thinking_mode,
+                    )
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "auto_session_isolation_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                previous_reuse_tokens=reuse,
+                previous_session_id=cached_session_id,
+                previous_session_source=cached_session_source,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                protected_cache_tokens=protected_cache_tokens,
+                stashed_previous_session=bool(stashed),
+                isolation_reason=auto_rebuild_reason,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+                **reuse_diag,
+            )
+            logger.info(
+                "prompt-cache: rebuilding auto-session prompt to prevent cross-chat reuse "
+                "(reason=%s, previous=%s/%s, next=%s/%s, reuse=%d/%d, stashed=%s)",
+                auto_rebuild_reason,
+                cached_session_id,
+                cached_session_source,
+                session_id,
+                session_source,
+                reuse,
+                len(token_ids),
+                bool(stashed),
+            )
+            return prompt, holder["cache"]
+        session_mismatch = bool(
+            PROMPT_CACHE_SESSION_PROTECT_ENABLED
+            and session_id
+            and cached_session_id
+            and session_id != cached_session_id
+        )
+        reuse_ratio = (reuse / len(token_ids)) if token_ids else 0.0
+        small_static_prefix_switch = bool(
+            session_mismatch
+            and reuse >= PROMPT_CACHE_MIN_REUSE
+            and len(token_ids) <= PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS
+            and protected_cache_tokens <= max(
+                len(token_ids) + PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS,
+                PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS * 4,
+            )
+            and reuse_ratio >= max(
+                0.90,
+                PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO,
+            )
+        )
+        if (
+            session_mismatch
+            and PROMPT_CACHE_RESIDENT_SLOTS > 1
+            and protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+            and not small_static_prefix_switch
+        ):
+            stashed = _prompt_cache_stash_current_unlocked(
+                reason=f"session_switch:{session_id or '__default__'}"
+            )
+            restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
+                model,
+                processor,
+                token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                reason="session_switch_after_stash",
+                allow_partial_restore=allow_partial_ssd_restore,
+            )
+            if restored_ssd:
+                return _prepare_cached_prompt(
+                    model,
+                    processor,
+                    prompt,
+                    token_ids,
+                    session_id=session_id,
+                    session_source=session_source,
+                    thinking_mode=thinking_mode,
+                )
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "session_switch_stash_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                previous_reuse_tokens=reuse,
+                previous_session_id=cached_session_id,
+                previous_session_source=cached_session_source,
+                stashed_previous_session=bool(stashed),
+                protected_cache_tokens=protected_cache_tokens,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                session_id=session_id,
+                session_source=session_source,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+                **reuse_diag,
+            )
+            logger.info(
+                "prompt-cache: stashed %s-session %d-token cache before switch to %s-session (%d tokens)",
+                cached_session_id,
+                protected_cache_tokens,
+                session_id,
+                len(token_ids),
+            )
+            return prompt, holder["cache"]
+
+        if (
+            session_mismatch
+            and protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+            and len(token_ids) <= PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS
+            and not small_static_prefix_switch
+        ):
+            _set_prompt_cache_event(
+                "bypass_preserve_session_cache",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                suffix_tokens=len(token_ids),
+                protected_cache_tokens=protected_cache_tokens,
+                protected_session_id=cached_session_id,
+                protected_session_source=cached_session_source,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                session_protect_min_tokens=PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS,
+                session_bypass_max_tokens=PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS,
+                protected_cache_reuse_ratio=round(
+                    reuse / protected_cache_tokens, 4
+                ) if protected_cache_tokens else 0.0,
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            holder["last_suffix_ids"] = None
+            logger.info(
+                "prompt-cache: bypassing %s-session short prompt (%d tokens) to preserve %s-session %d-token cache",
+                session_id,
+                len(token_ids),
+                cached_session_id,
+                protected_cache_tokens,
+            )
+            return prompt, None
+        if (
+            PROMPT_CACHE_PROTECT_LARGE_ENABLED
+            and protected_cache_tokens >= PROMPT_CACHE_PROTECT_MIN_TOKENS
+            and len(token_ids) <= PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS
+            and reuse < PROMPT_CACHE_PROTECT_MIN_TOKENS
+        ):
+            _set_prompt_cache_event(
+                "bypass_preserve_large_cache",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                suffix_tokens=len(token_ids),
+                protected_cache_tokens=protected_cache_tokens,
+                session_id=cached_session_id,
+                session_source=cached_session_source,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                protect_min_tokens=PROMPT_CACHE_PROTECT_MIN_TOKENS,
+                bypass_max_tokens=PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS,
+                protected_cache_reuse_ratio=round(
+                    reuse / protected_cache_tokens, 4
+                ) if protected_cache_tokens else 0.0,
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            holder["last_suffix_ids"] = None
+            logger.info(
+                "prompt-cache: bypassing short prompt (%d tokens, reuse=%d/%d protected) to preserve %d-token cache",
+                len(token_ids),
+                reuse,
+                PROMPT_CACHE_PROTECT_MIN_TOKENS,
+                protected_cache_tokens,
+            )
+            return prompt, None
+
+        if (
+            session_mismatch
+            and protected_cache_tokens < PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+            and PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS > 0
+            and len(token_ids) <= PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS
+            and reuse >= PROMPT_CACHE_MIN_REUSE
+            and reuse_ratio <= PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO
+        ):
+            # Different short chats often share only MiniMax's static template
+            # prefix. Reusing that tiny suffix path can be slower than a fresh
+            # small prefill on the distributed runtime, while offering no real
+            # multi-turn cache value. Rebuild fresh so the new short session can
+            # become hot without disturbing protected long resident slots.
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "static_prefix_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                suffix_tokens=len(token_ids),
+                previous_session_id=cached_session_id,
+                previous_session_source=cached_session_source,
+                protected_cache_tokens=protected_cache_tokens,
+                static_prefix_rebuild_max_tokens=PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS,
+                static_prefix_rebuild_max_reuse_ratio=(
+                    PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO
+                ),
+                session_id=session_id,
+                session_source=session_source,
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            logger.info(
+                "prompt-cache: rebuilding small cross-session static-prefix hit "
+                "(reuse=%d/%d ratio=%.3f, previous=%s, next=%s)",
+                reuse,
+                len(token_ids),
+                reuse_ratio,
+                cached_session_id,
+                session_id,
+            )
+            return prompt, holder["cache"]
+
+        if reuse < PROMPT_CACHE_MIN_REUSE:
+            restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
+                model,
+                processor,
+                token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                reason="low_reuse_before_rebuild",
+                allow_partial_restore=allow_partial_ssd_restore,
+            )
+            if restored_ssd:
+                return _prepare_cached_prompt(
+                    model,
+                    processor,
+                    prompt,
+                    token_ids,
+                    session_id=session_id,
+                    session_source=session_source,
+                    thinking_mode=thinking_mode,
+                )
+            # Not enough overlap to bother: reset and process full prompt.
+            _prompt_cache_stash_current_unlocked(reason=f"replace:{session_id or '__default__'}")
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "low_reuse",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                suffix_tokens=len(token_ids),
+                session_id=session_id,
+                session_source=session_source,
+                restored_resident_slot=bool(restored_slot),
+                **(restored_slot or {}),
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            logger.info("prompt-cache: low reuse (%d/%d); full prefill", reuse, len(token_ids))
+            return prompt, holder["cache"]
+
+        # Trim the cache back to the shared prefix. Track the KV length
+        # explicitly instead of querying layer internals; every rank updates
+        # this counter with the same prompt length + generated-token count.
+        actual_len = int(holder.get("cache_len") or 0)
+        if actual_len < reuse:
+            logger.warning(
+                "prompt-cache length mismatch (cache_len=%d < reuse=%d); rebuilding fresh",
+                actual_len, reuse,
+            )
+            _prompt_cache_stash_current_unlocked(reason=f"length_mismatch:{session_id or '__default__'}")
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "length_mismatch_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                cache_len=actual_len,
+                restored_resident_slot=bool(restored_slot),
+                **(restored_slot or {}),
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            return prompt, holder["cache"]
+        trim_n = actual_len - reuse
+        if trim_n > 0 and not _trim_prompt_cache_in_place(cache, trim_n):
+            logger.warning("prompt-cache trim failed; rebuilding fresh")
+            _prompt_cache_stash_current_unlocked(reason=f"trim_failed:{session_id or '__default__'}")
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "trim_failed_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                cache_was=actual_len,
+                session_id=session_id,
+                session_source=session_source,
+                restored_resident_slot=bool(restored_slot),
+                **(restored_slot or {}),
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            return prompt, holder["cache"]
+        holder["cache_len"] = reuse
+
+        # Reuse: send only the suffix tokens as the prompt.
+        suffix_ids = token_ids[L:]
+        min_suffix_tokens = _effective_prompt_cache_min_suffix_tokens(
+            thinking_mode,
+            session_source or cached_session_source,
+            session_id=session_id,
+            cached_session_id=cached_session_id,
+            miss_reason=reuse_diag.get("miss_reason"),
+        )
+        bucket_tokens = _runtime_prompt_cache_reuse_bucket_tokens()
+        reuse_diag["effective_min_suffix_tokens"] = min_suffix_tokens
+        reuse_diag["configured_min_suffix_tokens"] = (
+            _runtime_prompt_cache_min_suffix_tokens()
+        )
+        if not suffix_ids and reuse > 0:
+            # Generation needs at least one input token. Back the cache up one
+            # token and send that final token through the normal prefill path.
+            if not _trim_prompt_cache_in_place(cache, 1):
+                logger.warning("prompt-cache exact-hit backtrack failed; full prefill")
+                _prompt_cache_stash_current_unlocked(reason=f"exact_hit_backtrack_failed:{session_id or '__default__'}")
+                holder["cache"] = None
+                holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                _clear_prompt_cache_key_state_unlocked(holder)
+                holder["session_id"] = session_id
+                holder["session_source"] = session_source
+                holder["last_suffix_ids"] = list(token_ids)
+                _set_prompt_cache_event(
+                    "exact_hit_backtrack_failed",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=reuse,
+                    session_id=session_id,
+                    session_source=session_source,
+                    restored_resident_slot=bool(restored_slot),
+                    **(restored_slot or {}),
+                    **_prompt_cache_match_fields(len(token_ids), reuse),
+                    **reuse_diag,
+                )
+                return prompt, holder["cache"]
+            reuse -= 1
+            holder["cache_len"] = reuse
+            suffix_ids = token_ids[reuse:]
+            reuse_diag = _prompt_cache_reuse_diagnostics(
+                holder, len(token_ids), reuse, token_ids
+            )
+            reuse_diag = _add_prompt_cache_mismatch_windows(
+                reuse_diag, processor, holder.get("token_ids") or [], token_ids
+            )
+        if (
+            suffix_ids
+            and bucket_tokens > 0
+            and reuse > PROMPT_CACHE_MIN_REUSE
+        ):
+            bucketed_reuse = (reuse // bucket_tokens) * bucket_tokens
+            if bucketed_reuse < PROMPT_CACHE_MIN_REUSE:
+                bucketed_reuse = reuse
+            if bucketed_reuse < reuse:
+                backtrack = reuse - bucketed_reuse
+                if not _trim_prompt_cache_in_place(cache, backtrack):
+                    logger.warning("prompt-cache reuse-bucket backtrack failed; full prefill")
+                    _prompt_cache_stash_current_unlocked(reason=f"reuse_bucket_backtrack_failed:{session_id or '__default__'}")
+                    holder["cache"] = None
+                    holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                    _clear_prompt_cache_key_state_unlocked(holder)
+                    holder["session_id"] = session_id
+                    holder["session_source"] = session_source
+                    holder["last_suffix_ids"] = list(token_ids)
+                    _set_prompt_cache_event(
+                        "reuse_bucket_backtrack_failed",
+                        prompt_tokens=len(token_ids),
+                        reuse_tokens=reuse,
+                        session_id=session_id,
+                        session_source=session_source,
+                        restored_resident_slot=bool(restored_slot),
+                        **(restored_slot or {}),
+                        **_prompt_cache_match_fields(len(token_ids), reuse),
+                        **reuse_diag,
+                    )
+                    return prompt, holder["cache"]
+                original_reuse = reuse
+                reuse = bucketed_reuse
+                holder["cache_len"] = reuse
+                suffix_ids = token_ids[reuse:]
+                reuse_diag = _prompt_cache_reuse_diagnostics(
+                    holder, len(token_ids), reuse, token_ids
+                )
+                reuse_diag = _add_prompt_cache_mismatch_windows(
+                    reuse_diag, processor, holder.get("token_ids") or [], token_ids
+                )
+                reuse_diag["reuse_bucket_tokens"] = bucket_tokens
+                reuse_diag["reuse_bucket_original_reuse_tokens"] = original_reuse
+                reuse_diag["reuse_bucket_backtrack_tokens"] = backtrack
+        if (
+            suffix_ids
+            and min_suffix_tokens > 0
+            and len(suffix_ids) < min_suffix_tokens
+            and reuse > PROMPT_CACHE_MIN_REUSE
+        ):
+            # Very small suffix prefills (often 10-20 tokens in OpenWebUI
+            # follow-ups) can underutilize the distributed MLX path and take
+            # several seconds before the first decode token. Backtrack a small
+            # amount so the prefill runs as a healthier batch while still
+            # reusing the overwhelming majority of the prompt.
+            backtrack = min(
+                reuse,
+                max(0, min_suffix_tokens - len(suffix_ids)),
+            )
+            if backtrack > 0:
+                if not _trim_prompt_cache_in_place(cache, backtrack):
+                    logger.warning("prompt-cache min-suffix backtrack failed; full prefill")
+                    _prompt_cache_stash_current_unlocked(reason=f"min_suffix_backtrack_failed:{session_id or '__default__'}")
+                    holder["cache"] = None
+                    holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                    _clear_prompt_cache_key_state_unlocked(holder)
+                    holder["session_id"] = session_id
+                    holder["session_source"] = session_source
+                    holder["last_suffix_ids"] = list(token_ids)
+                    _set_prompt_cache_event(
+                        "min_suffix_backtrack_failed",
+                        prompt_tokens=len(token_ids),
+                        reuse_tokens=reuse,
+                        session_id=session_id,
+                        session_source=session_source,
+                        restored_resident_slot=bool(restored_slot),
+                        **(restored_slot or {}),
+                        **_prompt_cache_match_fields(len(token_ids), reuse),
+                        **reuse_diag,
+                    )
+                    return prompt, holder["cache"]
+                original_reuse = reuse
+                reuse -= backtrack
+                holder["cache_len"] = reuse
+                suffix_ids = token_ids[reuse:]
+                reuse_diag = _prompt_cache_reuse_diagnostics(
+                    holder, len(token_ids), reuse, token_ids
+                )
+                reuse_diag = _add_prompt_cache_mismatch_windows(
+                    reuse_diag, processor, holder.get("token_ids") or [], token_ids
+                )
+                reuse_diag["min_suffix_original_reuse_tokens"] = original_reuse
+                reuse_diag["min_suffix_backtrack_tokens"] = backtrack
+                reuse_diag["min_suffix_target_tokens"] = min_suffix_tokens
+        if (
+            _enable_thinking_for_generation(thinking_mode)
+            and PROMPT_CACHE_THINKING_MODE == "visible"
+            and _is_auto_cache_session_source(session_source or cached_session_source)
+            and cached_session_id
+            and session_id
+            and cached_session_id != session_id
+            and reuse_diag.get("miss_reason") == "history_prefix_mismatch"
+        ):
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "visible_thinking_partial_reuse_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                previous_reuse_tokens=reuse,
+                previous_session_id=cached_session_id,
+                previous_session_source=cached_session_source,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                protected_cache_tokens=protected_cache_tokens,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+                **reuse_diag,
+            )
+            logger.info(
+                "prompt-cache: rebuilding visible-thinking auto-session after "
+                "partial history-prefix reuse became unsafe "
+                "(previous=%s/%s, next=%s/%s, reuse=%d/%d)",
+                cached_session_id,
+                cached_session_source,
+                session_id,
+                session_source,
+                reuse,
+                len(token_ids),
+            )
+            return prompt, holder["cache"]
+        if (
+            _enable_thinking_for_generation(thinking_mode)
+            and PROMPT_CACHE_THINKING_MODE == "visible"
+            and PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_TOKENS > 0
+            and PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_SUFFIX_TOKENS > 0
+            and len(token_ids) <= PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_TOKENS
+            and 0 < len(suffix_ids) <= PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_SUFFIX_TOKENS
+            and protected_cache_tokens < PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
+        ):
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "small_visible_thinking_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                previous_reuse_tokens=reuse,
+                previous_suffix_tokens=len(suffix_ids),
+                previous_session_id=cached_session_id,
+                previous_session_source=cached_session_source,
+                request_session_id=session_id,
+                request_session_source=session_source,
+                small_rebuild_max_tokens=PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_TOKENS,
+                small_rebuild_max_suffix_tokens=PROMPT_CACHE_SMALL_THINKING_REBUILD_MAX_SUFFIX_TOKENS,
+                protected_cache_tokens=protected_cache_tokens,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+                **reuse_diag,
+            )
+            logger.info(
+                "prompt-cache: rebuilding small visible-thinking prompt "
+                "(prompt=%d, suffix=%d, previous_reuse=%d) because tiny "
+                "cached suffixes are slower after idle",
+                len(token_ids),
+                len(suffix_ids),
+                reuse,
+            )
+            return prompt, holder["cache"]
+        try:
+            tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+            suffix_prompt = tok.decode(suffix_ids)
+            holder["last_suffix_ids"] = list(suffix_ids)
+            logger.info(
+                "prompt-cache: reusing %d/%d tokens (suffix=%d tokens, cache_was=%d)",
+                reuse, len(token_ids), len(suffix_ids), actual_len,
+            )
+            _set_prompt_cache_event(
+                "reuse",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                suffix_tokens=len(suffix_ids),
+                cache_was=actual_len,
+                session_id=session_id or cached_session_id,
+                session_source=session_source or cached_session_source,
+                restored_resident_slot=bool(restored_slot),
+                **(restored_slot or {}),
+                restored_ssd_cache=bool(restored_ssd),
+                **(restored_ssd or {}),
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            return suffix_prompt, cache
+        except Exception as e:
+            logger.warning(f"prompt-cache suffix decode failed: {e}; full prefill")
+            _prompt_cache_stash_current_unlocked(reason=f"suffix_decode_failed:{session_id or '__default__'}")
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "suffix_decode_failed_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=reuse,
+                error=str(e),
+                session_id=session_id,
+                session_source=session_source,
+                restored_resident_slot=bool(restored_slot),
+                **(restored_slot or {}),
+                **_prompt_cache_match_fields(len(token_ids), reuse),
+                **reuse_diag,
+            )
+            return prompt, holder["cache"]
+
+
+def _prompt_cache_mode_for_request(thinking_mode, token_ids):
+    if not PROMPT_CACHE_ENABLED or token_ids is None:
+        return "off"
+    if not _enable_thinking_for_generation(thinking_mode):
+        return "full"
+    return PROMPT_CACHE_THINKING_MODE
+
+
+def _prompt_cache_allowed_for_request(thinking_mode, token_ids):
+    mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
+    if mode == "off":
+        if PROMPT_CACHE_ENABLED and token_ids is not None:
+            with _prompt_cache_lock:
+                _set_prompt_cache_event(
+                    "thinking_cache_bypass",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    reason=f"MLX_M3_PROMPT_CACHE_THINKING_MODE={PROMPT_CACHE_THINKING_MODE}",
+                    **_prompt_cache_match_fields(len(token_ids), 0),
+                )
+        return False
+    return True
+
+
+def _should_tokenize_prompt_for_cache(thinking_mode):
+    if not PROMPT_CACHE_ENABLED:
+        return False
+    if _enable_thinking_for_generation(thinking_mode):
+        return PROMPT_CACHE_THINKING_MODE != "off"
+    return True
+
+
+def _thinking_generation_hit_limit(thinking_mode, generated_tokens, max_tokens):
+    if not _enable_thinking_for_generation(thinking_mode):
+        return False
+    try:
+        limit = int(max_tokens or 0)
+    except Exception:
+        limit = 0
+    if limit <= 0:
+        return False
+    return int(generated_tokens or 0) >= limit
+
+
+def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
+                                          generated_tokens=0,
+                                          include_generated_ids=True,
+                                          session_id=None,
+                                          session_source=None,
+                                          prompt=None,
+                                          model=None,
+                                          processor=None,
+                                          save_reason="generation"):
+    """Record the full token sequence now held in the cache.
+
+    `stream_generate` mutates the prompt cache in place as it decodes. Earlier
+    versions only stored the input prompt as the cache key while tracking
+    cache_len as input+generated. That made the next OpenAI chat turn trim away
+    the assistant response and re-prefill it. Store exact generated token ids
+    when available so follow-up turns can reuse through the previous assistant
+    message if the client sends it back unchanged.
+    """
+    if not PROMPT_CACHE_ENABLED or token_ids is None:
+        return
+    generated_ids = []
+    if generated_token_ids:
+        for tok in generated_token_ids:
+            try:
+                generated_ids.append(int(tok.item() if hasattr(tok, "item") else tok))
+            except Exception:
+                continue
+    elif generated_tokens:
+        # Last-resort accounting if an older generator did not expose token ids.
+        generated_ids = [None] * int(max(0, generated_tokens))
+    with _prompt_cache_lock:
+        key_ids = list(token_ids)
+        generated_count = len(generated_ids) if generated_ids else int(max(0, generated_tokens))
+        generated_key_limit = (
+            generated_count
+            if PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS <= 0
+            else min(generated_count, PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS)
+        )
+        generated_key_ids = []
+        generated_reuse_allowed = (
+            include_generated_ids
+            and generated_ids
+            and all(tok is not None for tok in generated_ids)
+            and generated_key_limit > 0
+        )
+        if generated_reuse_allowed:
+            generated_key_ids = generated_ids[:generated_key_limit]
+            key_ids.extend(generated_key_ids)
+        exact_generated_ids = bool(
+            generated_reuse_allowed and len(generated_key_ids) == generated_count
+        )
+        effective_session_id = session_id
+        effective_session_source = session_source
+        if effective_session_id is None:
+            effective_session_id = _prompt_cache_holder.get("session_id")
+            effective_session_source = _prompt_cache_holder.get("session_source")
+        _prompt_cache_holder["token_ids"] = key_ids
+        _prompt_cache_holder["prompt"] = (
+            prompt
+            if isinstance(prompt, str) and len(key_ids) == len(token_ids)
+            else None
+        )
+        _prompt_cache_holder["cache_len"] = int(len(token_ids) + generated_count)
+        _prompt_cache_holder["last_input_tokens"] = int(len(token_ids))
+        _prompt_cache_holder["last_generated_tokens"] = int(generated_count)
+        _prompt_cache_holder["last_exact_generated_ids"] = exact_generated_ids
+        _prompt_cache_holder["session_id"] = effective_session_id
+        _prompt_cache_holder["session_source"] = effective_session_source
+        _set_prompt_cache_event(
+            "updated",
+            phase="update",
+            prompt_tokens=len(token_ids),
+            generated_tokens=generated_count,
+            key_tokens=len(key_ids),
+            cache_len=_prompt_cache_holder["cache_len"],
+            session_id=effective_session_id,
+            session_source=effective_session_source,
+            exact_generated_ids=exact_generated_ids,
+            generated_reuse_allowed=bool(generated_reuse_allowed),
+            generated_key_tokens=len(generated_key_ids),
+            generated_key_truncated=bool(
+                generated_reuse_allowed and len(generated_key_ids) < generated_count
+            ),
+            generated_reuse_max_tokens=PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS,
+            **_prompt_cache_match_fields(len(key_ids), len(token_ids)),
+        )
+        if (
+            model is not None
+            and processor is not None
+            and PROMPT_CACHE_SSD_AUTO_SAVE
+        ):
+            _prompt_cache_make_ssd_checkpoint_unlocked(
+                prompt=prompt,
+                reason=save_reason,
+            )
+            _prompt_cache_ssd_save_current_unlocked(
+                model,
+                processor,
+                reason=save_reason,
+            )
+    _enforce_prompt_cache_size_limit()
+
+
+def _reset_prompt_cache(reason="reset", *, clear_manifest=False,
+                        clear_resident=True):
+    """Drop the cached KV (e.g. on error or model change)."""
+    with _prompt_cache_lock:
+        _drop_prompt_cache_unlocked(reason, clear_manifest=clear_manifest,
+                                    clear_resident=clear_resident)
+    logger.info(f"prompt-cache {reason}")
+
+
+def _reset_prompt_cache_and_clear_memory(reason="reset", *, clear_manifest=False,
+                                         clear_resident=True):
+    """Drop cached prompt KV and release idle MLX buffers."""
+    _reset_prompt_cache(reason, clear_manifest=clear_manifest,
+                        clear_resident=clear_resident)
+    _clear_mlx_memory(f"prompt-cache {reason}")
+
+
+def _reset_prompt_cache_on_all_ranks(rank, reason="reset", *, clear_memory=False,
+                                     clear_manifest=False, clear_resident=True):
+    """Reset the distributed RAM prompt cache after a post-decode rank-0 verdict."""
+    if rank == 0:
+        try:
+            _bcast({
+                "op": "reset_prompt_cache",
+                "reason": reason,
+                "clear_memory": bool(clear_memory),
+                "clear_manifest": bool(clear_manifest),
+                "clear_resident": bool(clear_resident),
+            }, rank)
+        except Exception as e:
+            logger.warning("prompt-cache reset broadcast failed (%s): %s", reason, e)
+    if clear_memory:
+        _reset_prompt_cache_and_clear_memory(reason, clear_manifest=clear_manifest,
+                                             clear_resident=clear_resident)
+    else:
+        _reset_prompt_cache(reason, clear_manifest=clear_manifest,
+                            clear_resident=clear_resident)
+
+
+def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
+                          reason="prewarm", session_id=None,
+                          session_source=None,
+                          reset_on_failure=True):
+    """Replace the shared prompt cache with a prefetched prompt prefix.
+
+    MLX-VLM does not expose a public "prefill only" helper for this path, so
+    we run a one-token generation against a fresh cache and trim the sampled
+    token back off. Both distributed ranks do the same work via a mirror op.
+    """
+    if not PROMPT_CACHE_ENABLED or token_ids is None:
+        return False
+    token_ids = list(token_ids)
+    if not token_ids:
+        return False
+    existing_reuse = 0
+    existing_suffix = len(token_ids)
+    with _prompt_cache_lock:
+        existing_ids = list(_prompt_cache_holder.get("token_ids") or [])
+    if existing_ids:
+        existing_reuse = _common_prefix_len(existing_ids, token_ids)
+        existing_suffix = max(0, len(token_ids) - existing_reuse)
+    if (
+        VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS > 0
+        and len(token_ids) > VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS
+        and (
+            existing_reuse < PROMPT_CACHE_MIN_REUSE
+            or existing_suffix > VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS
+        )
+    ):
+        _set_prompt_cache_event(
+            "prewarm_skipped_too_large",
+            reason=reason,
+            prompt_tokens=len(token_ids),
+            reuse_tokens=existing_reuse,
+            suffix_tokens=existing_suffix,
+            max_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS,
+            max_suffix_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS,
+        )
+        return False
+
+    from mlx_vlm.generate import stream_generate
+
+    _refresh_generation_stream()
+    _mark_prompt_cache_in_use(True)
+    generated = 0
+    cache = None
+    prompt_to_send = prompt
+    try:
+        prompt_to_send, cache = _prepare_cached_prompt(
+            model, processor, prompt, token_ids,
+            session_id=session_id,
+            session_source=session_source,
+        )
+        prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
+        if (
+            cache is None
+            and _prompt_cache_prepare_preserves_existing_cache(
+                prepare_event.get("action")
+            )
+        ):
+            logger.info(
+                "prompt-cache visible prewarm skipped to preserve %s-token cache",
+                prepare_event.get("protected_cache_tokens"),
+            )
+            return False
+        _set_prompt_cache_event(
+            "prewarm_start",
+            reason=reason,
+            prompt_tokens=len(token_ids),
+            reuse_tokens=int(prepare_event.get("reuse_tokens") or 0),
+            suffix_tokens=int(prepare_event.get("suffix_tokens") or len(token_ids)),
+            reuse_action=prepare_event.get("action"),
+            cache_was=prepare_event.get("cache_was"),
+            session_id=session_id,
+            session_source=session_source,
+        )
+
+        gen_kwargs = dict(
+            model=model,
+            processor=processor,
+            prompt=prompt_to_send,
+            max_tokens=1,
+            enable_thinking=False,
+            prefill_step_size=_runtime_prefill_step_size(len(token_ids)),
+            max_kv_size=MAX_KV_SIZE,
+            prompt_cache=cache,
+            temperature=0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+        )
+        gen_kwargs.update(_kv_quant_kwargs())
+        # BATCH PATH (2026-07-07): this prewarm was the LAST caller of the
+        # stream generator on the pipeline — the pre-building geometry that
+        # deadlocks ranks when one side closes early (the exact disease the
+        # batch-cancel path was built to remove from requests). Every freeze
+        # photograph since 21:50 sits adjacent to a prewarm; the recurring
+        # wire error (status=1 wr_id=0x20001) matches an abandoned pre-built
+        # step's unmatched send/recv. Same cure as requests: _generation_iter.
+        _pw_rank, _pw_world = _prompt_cache_ssd_current_rank_world()
+        with _tokenizer_runtime_lock:
+            for response in _generation_iter(_pw_rank, gen_kwargs):
+                generation_tokens = int(
+                    getattr(response, "generation_tokens", 0) or 0
+                )
+                generated = max(generated, generation_tokens)
+
+        if generated > 0 and not _trim_prompt_cache_in_place(cache, generated):
+            logger.warning("prompt-cache visible prewarm trim failed; dropping cache")
+            if reset_on_failure:
+                _reset_prompt_cache("prewarm trim failed")
+            return False
+        mx.eval([c.state for c in cache])
+        with _prompt_cache_lock:
+            _prompt_cache_holder["token_ids"] = token_ids
+            _prompt_cache_holder["prompt"] = prompt
+            _prompt_cache_holder["cache_len"] = len(token_ids)
+            _prompt_cache_holder["last_input_tokens"] = len(token_ids)
+            _prompt_cache_holder["last_generated_tokens"] = 0
+            _prompt_cache_holder["last_exact_generated_ids"] = False
+            _prompt_cache_holder["session_id"] = session_id
+            _prompt_cache_holder["session_source"] = session_source
+            _set_prompt_cache_event(
+                "prewarm_visible_transcript",
+                phase="update",
+                reason=reason,
+                prompt_tokens=len(token_ids),
+                prefill_tokens=len(_tokenize_prompt(processor, prompt_to_send) or []),
+                generated_tokens=0,
+                key_tokens=len(token_ids),
+                cache_len=len(token_ids),
+                session_id=session_id,
+                session_source=session_source,
+                trimmed_generated_tokens=generated,
+                **_prompt_cache_match_fields(len(token_ids), len(token_ids)),
+            )
+            if PROMPT_CACHE_SSD_AUTO_SAVE:
+                _prompt_cache_ssd_save_current_unlocked(
+                    model,
+                    processor,
+                    reason=f"visible_transcript_prewarm:{reason}",
+                )
+        logger.info(
+            "prompt-cache visible prewarm complete (%d tokens, trimmed=%d)",
+            len(token_ids), generated,
+        )
+        return True
+    except Exception as e:
+        logger.warning("prompt-cache visible prewarm failed: %s", e)
+        if _prompt_cache_prepare_preserves_existing_cache():
+            logger.info("prompt-cache: preserved large cache after bypassed prewarm failure")
+            return False
+        if reset_on_failure:
+            _reset_prompt_cache("prewarm failed")
+        return False
+    finally:
+        _mark_prompt_cache_in_use(False)
+
+
+def _render_visible_transcript_prompt(model, processor, processed_messages,
+                                      assistant_content, *, num_images=0,
+                                      thinking_mode=None, tools=None,
+                                      assistant_reasoning=None):
+    if not isinstance(assistant_content, str) or not assistant_content.strip():
+        return None
+    if num_images:
+        return None
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    mode = thinking_mode if thinking_mode in VALID_THINKING_MODES else DEFAULT_THINKING_MODE
+    thinking_enabled = _enable_thinking_for_generation(mode)
+    visible_messages = [dict(m) for m in processed_messages]
+    assistant_message = {
+        "role": "assistant",
+        "content": _sanitize_inbound_message_content("assistant", assistant_content),
+    }
+    if isinstance(assistant_reasoning, str) and assistant_reasoning.strip():
+        assistant_message["reasoning_content"] = assistant_reasoning
+        assistant_message["content"] = _assistant_content_for_template(
+            assistant_message,
+            assistant_message["content"],
+        )
+    elif thinking_enabled and PROMPT_CACHE_THINKING_MODE == "visible":
+        assistant_message["reasoning_content"] = " "
+    visible_messages.append(assistant_message)
+    tk = _thinking_template_kwargs(
+        model.config,
+        enable_thinking=(mode == "enabled"),
+        thinking_mode=mode,
+    )
+    if tools:
+        tk["tools"] = tools
+    return apply_chat_template(
+        processor,
+        model.config,
+        visible_messages,
+        add_generation_prompt=False,
+        num_images=0,
+        **tk,
+    )
+
+
+def _maybe_prewarm_visible_transcript(model, processor, rank, processed_messages,
+                                      raw_output, *, thinking_mode, generated_tokens,
+                                      num_images=0, tools=None,
+                                      visible_output=None,
+                                      session_id=None,
+                                      session_source=None,
+                                      preserve_reasoning=False):
+    thinking_enabled = _enable_thinking_for_generation(thinking_mode)
+    min_generated = _runtime_visible_transcript_prewarm_min_generated()
+    if (
+        not VISIBLE_TRANSCRIPT_PREWARM_ENABLED
+        or not PROMPT_CACHE_ENABLED
+        or rank != 0
+        or tools
+        or num_images
+        or int(generated_tokens or 0) < min_generated
+    ):
+        return False
+    if (
+        VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS > 0
+        and int(generated_tokens or 0) > VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS
+    ):
+        _set_prompt_cache_event(
+            "prewarm_skipped_generated_too_large",
+            reason="visible_transcript_after_response",
+            generated_tokens=int(generated_tokens or 0),
+            max_generated_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS,
+            thinking_mode=thinking_mode,
+            session_id=session_id,
+            session_source=session_source,
+        )
+        return False
+    if thinking_enabled and PROMPT_CACHE_THINKING_MODE != "visible":
+        return False
+    content = visible_output if isinstance(visible_output, str) else None
+    reasoning = None
+    if content is None:
+        reasoning, content = split_thinking_text(
+            raw_output or "",
+            assume_in_thinking=thinking_enabled,
+        )
+        if thinking_enabled and not reasoning:
+            return False
+    elif thinking_enabled:
+        reasoning, _ = split_thinking_text(
+            raw_output or "",
+            assume_in_thinking=True,
+        )
+    if not content:
+        return False
+    try:
+        prompt = _render_visible_transcript_prompt(
+            model, processor, processed_messages, content,
+            num_images=num_images,
+            thinking_mode=thinking_mode,
+            assistant_reasoning=(
+                reasoning
+                if thinking_enabled and preserve_reasoning
+                else None
+            ),
+        )
+        token_ids = _tokenize_prompt(processor, prompt) if prompt else None
+        if not prompt or not token_ids:
+            return False
+        _bcast({
+            "op": "prewarm_prompt_cache",
+            "prompt": prompt,
+            "token_ids": token_ids,
+            "reason": "visible_transcript_after_response",
+            "visible_source": "stream_delta" if visible_output is not None else "raw_split",
+            "thinking_mode": thinking_mode,
+            "session_id": session_id,
+            "session_source": session_source,
+        }, rank)
+        return _prewarm_prompt_cache(
+            model,
+            processor,
+            prompt,
+            token_ids,
+            reason=(
+                "visible_transcript_after_response:"
+                + ("stream_delta" if visible_output is not None else "raw_split")
+                + f":{thinking_mode}"
+            ),
+            session_id=session_id,
+            session_source=session_source,
+        )
+    except Exception as e:
+        logger.warning("visible transcript prewarm setup failed: %s", e)
+        return False
+
+
+def _install_omlx_minimax_overlay():
+    """Prefer the vendored oMLX MiniMax-M3 model subtree when enabled."""
+    if not OMLX_MINIMAX_OVERLAY:
+        return False
+
+    overlay_models = (
+        os.path.dirname(os.path.abspath(__file__))
+        + "/MSA Support/mlx_vlm/models"
+    )
+    if not os.path.isdir(overlay_models):
+        logger.warning(
+            "MiniMax MSA support requested but missing: %s", overlay_models
+        )
+        return False
+
+    try:
+        import importlib
+        import mlx_vlm.models as vlm_models
+
+        package_path = getattr(vlm_models, "__path__", None)
+        if package_path is None:
+            logger.warning("MiniMax MSA support: mlx_vlm.models has no __path__")
+            return False
+        if overlay_models in package_path:
+            package_path.remove(overlay_models)
+        package_path.insert(0, overlay_models)
+
+        for name in list(sys.modules):
+            if name.startswith("mlx_vlm.models.minimax_m3_vl"):
+                del sys.modules[name]
+
+        lang = importlib.import_module("mlx_vlm.models.minimax_m3_vl.language")
+        has_msa = hasattr(
+            getattr(lang, "MiniMaxAttention", object), "_msa_prefill_attention"
+        )
+        logger.info(
+            "MiniMax MSA support installed from %s (msa_prefill=%s, language=%s)",
+            overlay_models, has_msa, getattr(lang, "__file__", "?"),
+        )
+        return bool(has_msa)
+    except Exception as e:
+        logger.warning("MiniMax MSA support failed: %s", e)
+        return False
+
+
+def _stop_requested():
+    """True if an in-flight stop was requested locally."""
+    return _STOP_FLAG.is_set()
+
+
+class GenerationCancelled(Exception):
+    """Expected control-flow exception for synchronized in-flight cancellation."""
+
+
+def _stop_requested_synced_reason(rank, token_index):
+    """REMOVED 2026-07-06 (dead-code audit). This function issued a per-token
+    distributed all_sum on stream=mx.cpu, concurrent with the model's own
+    collectives on the same QP/CQ — a cross-stream ibverbs race that silently
+    lost completions: the root cause of every historical 10k-decode wedge.
+    Inert tombstone: always reports "no stop". Safe replacement: the
+    nonce-coordinated stop file (see _request_inflight_stop / the decode
+    file-stop checks in both generation loops)."""
+    return False, None
+
+
+def _stop_requested_synced(rank, token_index):
+    requested, _reason = _stop_requested_synced_reason(rank, token_index)
+    return requested
+
+
+def _check_prefill_stop(rank, processed_tokens, total_tokens):
+    """Abort prefill at a synchronized chunk boundary when stop was requested."""
+    step = max(1, _runtime_prefill_step_size(total_tokens))
+    chunk_index = max(1, int((int(processed_tokens or 0) + step - 1) // step))
+    stop_payload = _read_prefill_stop_file()
+    if stop_payload is not None:
+        _set_stop_request("user")
+        stop_at = stop_payload.get("stop_at_tokens")
+        try:
+            stop_at = int(stop_at) if stop_at is not None else None
+        except Exception:
+            stop_at = None
+        if stop_at is None or int(processed_tokens or 0) >= stop_at:
+            raise GenerationCancelled(
+                f"stop requested during prefill at {int(processed_tokens or 0)}/"
+                f"{int(total_tokens or 0)} tokens"
+            )
+    if PREFILL_STOP_CHECK_EVERY <= 0:
+        return
+    if (
+        chunk_index % PREFILL_STOP_CHECK_EVERY != 0
+        and int(processed_tokens or 0) < int(total_tokens or 0)
+    ):
+        return
+    if _stop_requested_synced(rank, chunk_index * STOP_CHECK_EVERY):
+        raise GenerationCancelled(
+            f"stop requested during prefill at {int(processed_tokens or 0)}/"
+            f"{int(total_tokens or 0)} tokens"
+        )
+
+
+
+def _configure_metal_memory_limits():
+    """Match official MLX servers: set wired limit before model load.
+
+    MLX-LM's server sets the wired limit to Apple's recommended working-set
+    size at startup. MiniMax-M3 tensor sharding can need a higher explicit
+    limit on smaller-memory worker machines, so the launch script can override it.
+    """
+    global _METAL_LIMITS
+    if not getattr(mx, "metal", None) or not mx.metal.is_available():
+        _METAL_LIMITS = {"available": False}
+        return
+
+    info = mx.device_info()
+    recommended = int(info.get("max_recommended_working_set_size", 0) or 0)
+    max_working_set = int(info.get("max_working_set_size", 0) or 0)
+    limits = {
+        "available": True,
+        "recommended_gb": _bytes_to_gb(recommended) if recommended else None,
+        "max_working_set_gb": _bytes_to_gb(max_working_set) if max_working_set else None,
+        "wired_limit_gb": None,
+        "memory_limit_gb": None,
+        "cache_limit_gb": None,
+    }
+
+    wired_limit = _gb_to_bytes(WIRED_LIMIT_GB) if WIRED_LIMIT_GB > 0 else recommended
+    if max_working_set and wired_limit > max_working_set:
+        logger.warning(
+            "requested MLX_M3_WIRED_LIMIT_GB=%s exceeds device max %.2f GB; clamping",
+            WIRED_LIMIT_GB,
+            _bytes_to_gb(max_working_set),
+        )
+        wired_limit = max_working_set
+    if wired_limit:
+        try:
+            old = mx.set_wired_limit(wired_limit)
+        except ValueError:
+            if recommended and wired_limit != recommended:
+                logger.warning(
+                    "wired limit %.2f GB rejected; falling back to recommended %.2f GB",
+                    _bytes_to_gb(wired_limit),
+                    _bytes_to_gb(recommended),
+                )
+                wired_limit = recommended
+                old = mx.set_wired_limit(wired_limit)
+            else:
+                raise
+        limits["wired_limit_gb"] = _bytes_to_gb(wired_limit)
+        limits["old_wired_limit_gb"] = _bytes_to_gb(old)
+
+    if MEMORY_LIMIT_GB > 0:
+        memory_limit = _gb_to_bytes(MEMORY_LIMIT_GB)
+        old = mx.set_memory_limit(memory_limit)
+        limits["memory_limit_gb"] = _bytes_to_gb(memory_limit)
+        limits["old_memory_limit_gb"] = _bytes_to_gb(old)
+
+    if CACHE_LIMIT_GB >= 0:
+        cache_limit = _gb_to_bytes(CACHE_LIMIT_GB)
+        old = mx.set_cache_limit(cache_limit)
+        limits["cache_limit_gb"] = _bytes_to_gb(cache_limit)
+        limits["old_cache_limit_gb"] = _bytes_to_gb(old)
+
+    _METAL_LIMITS = limits
+    logger.info("Metal memory limits: %s", limits)
+
+
+def _watchdog_tick(progress=True):
+    tick = _WATCHDOG_TICK
+    if tick is not None:
+        try:
+            tick(progress=progress)
+        except Exception:
+            pass
+
+
+def _clear_mlx_memory(reason):
+    """Best-effort MLX/Metal cleanup before ordinary process exits."""
+    try:
+        logger.info(f"clearing MLX/Metal cache ({reason})")
+        mx.clear_cache()
+        if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
+            mx.metal.clear_cache()
+        gc.collect()
+        logger.info(f"MLX/Metal cache cleared ({reason})")
+    except Exception as e:
+        logger.warning(f"MLX/Metal cache clear failed during {reason}: {e}")
+
+
+def _install_shutdown_handlers():
+    def _handle_signal(signum, _frame):
+        global _SHUTTING_DOWN
+        if _SHUTTING_DOWN:
+            os._exit(128 + signum)
+        _SHUTTING_DOWN = True
+        name = signal.Signals(signum).name
+        logger.warning(f"received {name}; releasing MLX/Metal memory before exit")
+        _clear_mlx_memory(name)
+        raise SystemExit(128 + signum)
+
+    for sig_name in ("SIGTERM", "SIGINT", "SIGHUP", "SIGQUIT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _handle_signal)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Per-request generation stream refresh
+# ---------------------------------------------------------------------------
+def _refresh_generation_stream():
+    """Create a FRESH MLX stream for the generation pipeline, replacing the
+    module-level generation_stream in all mlx_vlm generate submodules.
+
+    ROOT CAUSE of the 4th-request crash: the module-level generation_stream
+    (created once at import via mx.new_thread_local_stream) accumulates Metal
+    command buffers across requests. After ~3 requests the GPU queue depth
+    exceeds the driver timeout -> SIGABRT -> orphaned wired memory -> reboot.
+    A fresh stream per request means each generation starts with an empty
+    queue -> no accumulation -> no crash.
+
+    NOTE: in mlx_vlm 0.6.3 the submodules are imported directly (NOT via
+    `from mlx_vlm.generate import common` — that resolves to the generate
+    FUNCTION, not the package, and raises ImportError). This bug was silently
+    breaking every streaming request before.
+    """
+    if not REFRESH_GENERATION_STREAM:
+        return
+    _fresh = mx.new_thread_local_stream(mx.default_device())
+    import importlib
+    for mod_name in (
+        "mlx_vlm.generate.common",
+        "mlx_vlm.generate.dispatch",
+        "mlx_vlm.generate.ar",
+    ):
+        try:
+            mod = importlib.import_module(mod_name)
+            if hasattr(mod, "generation_stream"):
+                mod.generation_stream = _fresh
+        except Exception as e:
+            logger.debug(f"could not refresh generation_stream in {mod_name}: {e}")
+
+
+def _install_decode_eval_patch():
+    """Force periodic decode materialization in mlx_vlm's AR generator.
+
+    The stock MLX-VLM decode loop uses async_eval/decode-ahead and only clears
+    cache every 256 generated tokens. That is good for single-process models,
+    but our MiniMax-M3 pipeline adds distributed send/recv/all_gather plus
+    MiniMax sparse-index cache mutation on every token. Letting that lazy graph
+    run too far ahead has been reproducibly wedging around 66-68 tokens.
+
+    Evaluating the yielded token/logprobs at a configurable cadence gives the
+    distributed graph a hard drain point. Early decode can use a looser cadence
+    for throughput, then long generations can switch to a tighter cadence before
+    the lazy graph grows enough to wedge the distributed pipeline.
+    """
+    if DECODE_EVAL_EVERY <= 0:
+        logger.info("decode eval patch disabled")
+        return
+    import importlib
+    ar_mod = importlib.import_module("mlx_vlm.generate.ar")
+    dispatch_mod = importlib.import_module("mlx_vlm.generate.dispatch")
+
+    orig = ar_mod.generate_step
+    if getattr(orig, "_m3_decode_eval_patched", False):
+        return
+
+    def _patched_generate_step(*args, **kwargs):
+        for idx, item in enumerate(orig(*args, **kwargs), start=1):
+            forced = int(getattr(_DECODE_EVAL_CONTEXT, "force_every", 0) or 0)
+            if forced > 0:
+                cadence = forced
+            else:
+                cadence = DECODE_EVAL_EVERY
+                if (
+                    DECODE_EVAL_AFTER_TOKENS > 0
+                    and idx >= DECODE_EVAL_AFTER_TOKENS
+                    and DECODE_EVAL_AFTER_EVERY > 0
+                ):
+                    cadence = DECODE_EVAL_AFTER_EVERY
+            if cadence > 0 and idx % cadence == 0:
+                try:
+                    token, logprobs = item
+                    mx.eval(token, logprobs)
+                    _watchdog_tick(progress=False)
+                except Exception:
+                    pass
+            yield item
+
+    _patched_generate_step._m3_decode_eval_patched = True
+    ar_mod.generate_step = _patched_generate_step
+    dispatch_mod.generate_step = _patched_generate_step
+    logger.info(
+        "installed decode eval patch (every %s token(s), after %s -> every %s)",
+        DECODE_EVAL_EVERY,
+        DECODE_EVAL_AFTER_TOKENS,
+        DECODE_EVAL_AFTER_EVERY,
+    )
+
+
+@contextmanager
+def _decode_eval_context(force_every=0):
+    previous = int(getattr(_DECODE_EVAL_CONTEXT, "force_every", 0) or 0)
+    _DECODE_EVAL_CONTEXT.force_every = int(force_every or 0)
+    try:
+        yield
+    finally:
+        _DECODE_EVAL_CONTEXT.force_every = previous
+
+
+def _decode_eval_force_for_thinking(thinking_mode):
+    if _enable_thinking_for_generation(thinking_mode):
+        with _runtime_tuning_lock:
+            return int(_runtime_tuning.get("thinking_decode_eval_every") or 0)
+    return 0
+
+
+def _decode_eval_force_for_request(thinking_mode, token_ids):
+    force = _decode_eval_force_for_thinking(thinking_mode)
+    token_count = len(token_ids) if token_ids is not None else 0
+    with _runtime_tuning_lock:
+        long_context_tokens = int(
+            _runtime_tuning.get("long_context_decode_eval_tokens") or 0
+        )
+        long_context_every = int(
+            _runtime_tuning.get("long_context_decode_eval_every") or 0
+        )
+        adaptive_enabled = bool(
+            int(_runtime_tuning.get("adaptive_long_context_decode_eval") or 0)
+        )
+        mid_context_tokens = int(
+            _runtime_tuning.get("mid_context_decode_eval_tokens") or 0
+        )
+        mid_context_every = int(
+            _runtime_tuning.get("mid_context_decode_eval_every") or 0
+        )
+        high_context_tokens = int(
+            _runtime_tuning.get("high_context_decode_eval_tokens") or 0
+        )
+        high_context_every = int(
+            _runtime_tuning.get("high_context_decode_eval_every") or 0
+        )
+    if adaptive_enabled:
+        tier_every = 0
+        if (
+            high_context_tokens > 0
+            and high_context_every > 0
+            and token_count >= high_context_tokens
+        ):
+            tier_every = high_context_every
+        elif (
+            mid_context_tokens > 0
+            and mid_context_every > 0
+            and token_count >= mid_context_tokens
+        ):
+            tier_every = mid_context_every
+        elif (
+            long_context_tokens > 0
+            and long_context_every > 0
+            and token_count >= long_context_tokens
+        ):
+            tier_every = long_context_every
+        if tier_every > 0:
+            if force > 0:
+                return min(force, tier_every)
+            return tier_every
+        return force
+    if (
+        long_context_tokens > 0
+        and long_context_every > 0
+        and token_count >= long_context_tokens
+    ):
+        if force > 0:
+            return min(force, long_context_every)
+        return long_context_every
+    return force
+
+
+# ---------------------------------------------------------------------------
+# Reasoning/content splitting (ported from mlx_vlm/server/app.py)
+# ---------------------------------------------------------------------------
+# These marker pairs are exactly what the official mlx_vlm server uses.
+# <mm:think>...</mm:think> is MiniMax-M3's native thinking format.
+_DEFAULT_MARKER_PAIRS = [
+    ("<|channel>analysis", "<channel|>"),
+    ("<|channel>thought", "<channel|>"),
+    ("<|channel>thinking", "<channel|>"),
+    ("<think>", "</think>"),
+    ("<mm:think>", "</mm:think>"),
+]
+
+
+def _strip_thinking_control_markers(text):
+    if not text:
+        return text
+    for start_marker, end_marker in _DEFAULT_MARKER_PAIRS:
+        text = text.replace(start_marker, "")
+        text = text.replace(end_marker, "")
+    text = re.sub(r"<\|(?:channel|message|end|start)[^>]*>", "", text)
+    return text
+
+
+def _find_earliest_marker(text, markers):
+    marker_pos, found_marker = -1, ""
+    for marker in markers:
+        pos = text.find(marker)
+        if pos >= 0 and (marker_pos < 0 or pos < marker_pos):
+            marker_pos, found_marker = pos, marker
+    return marker_pos, found_marker
+
+
+def _partial_marker_suffix(text, markers):
+    suffix = ""
+    for marker in markers:
+        max_len = min(len(marker) - 1, len(text))
+        for length in range(1, max_len + 1):
+            candidate = text[-length:]
+            if marker.startswith(candidate) and len(candidate) > len(suffix):
+                suffix = candidate
+    return suffix
+
+
+def split_stream_thinking_delta(accumulated, delta, in_thinking,
+                                *, at_response_start=False,
+                                thinking_start_token=None,
+                                thinking_end_token=None):
+    """Split a streamed token into reasoning/content deltas.
+
+    Direct port of mlx_vlm/server/app.py::_split_stream_thinking_delta so our
+    reasoning routing matches the official server exactly. Returns:
+      (in_thinking, accumulated, at_response_start, delta_reasoning, delta_content)
+    """
+    delta_reasoning = None
+    delta_content = None
+    marker_pairs = list(_DEFAULT_MARKER_PAIRS)
+    if thinking_start_token and thinking_end_token:
+        marker_pairs.insert(0, (thinking_start_token, thinking_end_token))
+    start_markers = tuple(dict.fromkeys(s for s, _ in marker_pairs))
+    end_markers = tuple(dict.fromkeys(e for _, e in marker_pairs))
+
+    if at_response_start and not in_thinking:
+        leading_text = accumulated.lstrip()
+        if not leading_text:
+            return in_thinking, accumulated, at_response_start, None, None
+        for end_marker in end_markers:
+            if leading_text.startswith(end_marker):
+                accumulated = leading_text[len(end_marker):]
+                at_response_start = False
+                return (in_thinking, "", at_response_start, None,
+                        accumulated or None)
+            if end_marker.startswith(leading_text):
+                return in_thinking, accumulated, at_response_start, None, None
+        at_response_start = False
+        delta = accumulated
+
+    if in_thinking:
+        marker_pos, start_marker = _find_earliest_marker(accumulated, start_markers)
+        if marker_pos >= 0:
+            accumulated = (accumulated[:marker_pos]
+                           + accumulated[marker_pos + len(start_marker):].lstrip("\n"))
+        marker_pos, end_marker = _find_earliest_marker(accumulated, end_markers)
+        if marker_pos >= 0:
+            reasoning = accumulated[:marker_pos]
+            content = accumulated[marker_pos + len(end_marker):]
+            content = _strip_thinking_control_markers(content)
+            return (False, "", False, reasoning or None, content or None)
+        pending_suffix = _partial_marker_suffix(accumulated, end_markers)
+        if pending_suffix:
+            reasoning = accumulated[:-len(pending_suffix)]
+            return (in_thinking, pending_suffix, False, reasoning or None, None)
+        return in_thinking, "", False, accumulated or None, None
+
+    marker_pos, start_marker = _find_earliest_marker(accumulated, start_markers)
+    if not in_thinking and marker_pos >= 0:
+        in_thinking = True
+        prefix = accumulated[:marker_pos]
+        accumulated = accumulated[marker_pos + len(start_marker):].lstrip("\n")
+        delta_content = prefix or None
+    elif not in_thinking and (
+        "<think" in accumulated
+        or "<mm:think" in accumulated
+        or _partial_marker_suffix(accumulated, start_markers)
+    ):
+        pass  # hold until the start marker is complete
+    else:
+        delta_content = _strip_thinking_control_markers(delta)
+        accumulated = ""
+
+    return in_thinking, accumulated, at_response_start, delta_reasoning, delta_content
+
+
+def split_thinking_text(text, *, assume_in_thinking=False,
+                        thinking_start_token=None, thinking_end_token=None):
+    """Non-streaming split of a complete response into (reasoning, content)."""
+    marker_pairs = list(_DEFAULT_MARKER_PAIRS)
+    if thinking_start_token and thinking_end_token:
+        marker_pairs.insert(0, (thinking_start_token, thinking_end_token))
+    end_markers = tuple(dict.fromkeys(e for _, e in marker_pairs))
+    start_markers = tuple(dict.fromkeys(s for s, _ in marker_pairs))
+
+    in_thinking = assume_in_thinking
+    # Strip any leading start marker if we begin inside a think block
+    if in_thinking:
+        for sm in start_markers:
+            if text.lstrip().startswith(sm):
+                text = text.lstrip()[len(sm):]
+                break
+
+    # Find the end marker that closes the thinking block
+    pos, end_marker = _find_earliest_marker(text, end_markers)
+    if in_thinking and pos >= 0:
+        reasoning = text[:pos]
+        content = text[pos + len(end_marker):]
+        content = _strip_thinking_control_markers(content)
+        return (reasoning.strip() or None, content.strip() or None)
+
+    if in_thinking:
+        return (text.strip() or None, None)
+
+    # Adaptive MiniMax may choose to emit a full thinking block even though the
+    # prompt did not open one. Strip that block from content and return it as
+    # reasoning instead of leaking raw <mm:think> tags into OpenAI content.
+    start_pos, start_marker = _find_earliest_marker(text, start_markers)
+    if start_pos >= 0:
+        prefix = text[:start_pos]
+        rest = text[start_pos + len(start_marker):].lstrip("\n")
+        end_pos, end_marker = _find_earliest_marker(rest, end_markers)
+        if end_pos >= 0:
+            reasoning = rest[:end_pos]
+            suffix = rest[end_pos + len(end_marker):]
+            content = (prefix + suffix).strip()
+            content = _strip_thinking_control_markers(content)
+            return (reasoning.strip() or None, content or None)
+        return (rest.strip() or None, prefix.strip() or None)
+
+    # Disabled thinking can produce a leading close marker. Treat it as control
+    # text, not user-visible content.
+    leading = text.lstrip()
+    for end_marker in end_markers:
+        if leading.startswith(end_marker):
+            content = _strip_thinking_control_markers(leading[len(end_marker):])
+            return (None, content.strip() or None)
+
+    return (None, _strip_thinking_control_markers(text).strip() or None)
+
+
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+def _request_generation_params(request, tools=None):
+    params = {k: request[k] for k in GEN_PARAM_KEYS if k in request and request[k] is not None}
+    if "thinking_budget" in params and not ALLOW_THINKING_BUDGET:
+        logger.warning(
+            "ignoring request thinking_budget=%r: MiniMax-M3 distributed budgeted "
+            "thinking is disabled by MLX_M3_ALLOW_THINKING_BUDGET=0 after stall tests",
+            params.get("thinking_budget"),
+        )
+        params.pop("thinking_budget", None)
+    has_tools = bool(tools)
+    defaults = {
+        "temperature": TOOL_DEFAULT_TEMPERATURE if has_tools else DEFAULT_TEMPERATURE,
+        "top_p": TOOL_DEFAULT_TOP_P if has_tools else DEFAULT_TOP_P,
+        "top_k": TOOL_DEFAULT_TOP_K if has_tools else DEFAULT_TOP_K,
+        "min_p": TOOL_DEFAULT_MIN_P if has_tools else DEFAULT_MIN_P,
+    }
+    for key, value in defaults.items():
+        params.setdefault(key, value)
+    if has_tools and TOOL_DEFAULT_REPETITION_PENALTY > 0:
+        params.setdefault("repetition_penalty", TOOL_DEFAULT_REPETITION_PENALTY)
+    if DEFAULT_REPETITION_PENALTY > 0:
+        params.setdefault("repetition_penalty", DEFAULT_REPETITION_PENALTY)
+    if DEFAULT_PRESENCE_PENALTY != 0:
+        params.setdefault("presence_penalty", DEFAULT_PRESENCE_PENALTY)
+    if DEFAULT_FREQUENCY_PENALTY != 0:
+        params.setdefault("frequency_penalty", DEFAULT_FREQUENCY_PENALTY)
+    default_seed = TOOL_DEFAULT_SEED if has_tools else DEFAULT_SEED
+    if "seed" not in params and default_seed >= 0:
+        params["seed"] = default_seed
+    return params
+
+
+def _generation_defaults_status():
+    runtime_tuning = _runtime_tuning_status()
+    return {
+        "temperature": DEFAULT_TEMPERATURE,
+        "top_p": DEFAULT_TOP_P,
+        "top_k": DEFAULT_TOP_K,
+        "min_p": DEFAULT_MIN_P,
+        "tool_temperature": TOOL_DEFAULT_TEMPERATURE,
+        "tool_top_p": TOOL_DEFAULT_TOP_P,
+        "tool_top_k": TOOL_DEFAULT_TOP_K,
+        "tool_min_p": TOOL_DEFAULT_MIN_P,
+        "tool_seed": TOOL_DEFAULT_SEED,
+        "tool_thinking_mode": TOOL_THINKING_MODE,
+        "tool_compat_overlay": TOOL_COMPAT_OVERLAY,
+        "repetition_penalty": DEFAULT_REPETITION_PENALTY,
+        "presence_penalty": DEFAULT_PRESENCE_PENALTY,
+        "frequency_penalty": DEFAULT_FREQUENCY_PENALTY,
+        "default_max_tokens": DEFAULT_MAX_TOKENS,
+        "nonstream_default_max_tokens": NONSTREAM_DEFAULT_MAX_TOKENS,
+        "openwebui_default_max_tokens": OPENWEBUI_DEFAULT_MAX_TOKENS,
+        "max_tokens_ceiling": MAX_TOKENS_CEILING,
+        "max_kv_size": MAX_KV_SIZE,
+        "prefill_step_size": PREFILL_STEP_SIZE,
+        "effective_prefill_step_size": runtime_tuning.get("prefill_step_size"),
+        "adaptive_prefill_step_tokens": ADAPTIVE_PREFILL_STEP_TOKENS,
+        "adaptive_prefill_step_size": ADAPTIVE_PREFILL_STEP_SIZE,
+        "mlx_max_ops_per_buffer": MLX_MAX_OPS_PER_BUFFER,
+        "mlx_max_mb_per_buffer": MLX_MAX_MB_PER_BUFFER,
+        "decode_eval_every": DECODE_EVAL_EVERY,
+        "decode_eval_after_tokens": DECODE_EVAL_AFTER_TOKENS,
+        "decode_eval_after_every": DECODE_EVAL_AFTER_EVERY,
+        "thinking_decode_eval_every": THINKING_DECODE_EVAL_EVERY,
+        "thinking_raw_silent_limit": THINKING_RAW_SILENT_LIMIT,
+        "long_context_decode_eval_tokens": LONG_CONTEXT_DECODE_EVAL_TOKENS,
+        "long_context_decode_eval_every": LONG_CONTEXT_DECODE_EVAL_EVERY,
+        "adaptive_long_context_decode_eval": ADAPTIVE_LONG_CONTEXT_DECODE_EVAL,
+        "mid_context_decode_eval_tokens": MID_CONTEXT_DECODE_EVAL_TOKENS,
+        "mid_context_decode_eval_every": MID_CONTEXT_DECODE_EVAL_EVERY,
+        "high_context_decode_eval_tokens": HIGH_CONTEXT_DECODE_EVAL_TOKENS,
+        "high_context_decode_eval_every": HIGH_CONTEXT_DECODE_EVAL_EVERY,
+        "effective_thinking_decode_eval_every": runtime_tuning.get("thinking_decode_eval_every"),
+        "effective_long_context_decode_eval_tokens": runtime_tuning.get("long_context_decode_eval_tokens"),
+        "effective_long_context_decode_eval_every": runtime_tuning.get("long_context_decode_eval_every"),
+        "runtime_tuning": runtime_tuning,
+        "unsafe_runtime_tuning_allowed": ALLOW_UNSAFE_RUNTIME_TUNING,
+        "thinking_budget_allowed": ALLOW_THINKING_BUDGET,
+        "default_thinking_budget": DEFAULT_THINKING_BUDGET,
+        "min_thinking_budget": MIN_THINKING_BUDGET,
+        "prompt_cache_thinking_enabled": PROMPT_CACHE_THINKING_ENABLED,
+        "prompt_cache_thinking_mode": PROMPT_CACHE_THINKING_MODE,
+        "prompt_cache_direct_suffix_ids": PROMPT_CACHE_DIRECT_SUFFIX_IDS,
+        "prompt_cache_min_suffix_tokens": PROMPT_CACHE_MIN_SUFFIX_TOKENS,
+        "effective_prompt_cache_min_suffix_tokens": runtime_tuning.get(
+            "prompt_cache_min_suffix_tokens"
+        ),
+        "prompt_cache_fast_min_suffix_tokens": PROMPT_CACHE_FAST_MIN_SUFFIX_TOKENS,
+        "prompt_cache_fast_thinking_min_suffix_tokens": (
+            PROMPT_CACHE_FAST_THINKING_MIN_SUFFIX_TOKENS
+        ),
+        "prompt_cache_reuse_bucket_tokens": PROMPT_CACHE_REUSE_BUCKET_TOKENS,
+        "effective_prompt_cache_reuse_bucket_tokens": runtime_tuning.get(
+            "prompt_cache_reuse_bucket_tokens"
+        ),
+        "clear_cache_after_request": CLEAR_CACHE_AFTER_REQUEST,
+        "clear_cache_after_error": CLEAR_CACHE_AFTER_ERROR,
+        "visible_transcript_prewarm_blocking": VISIBLE_TRANSCRIPT_PREWARM_BLOCKING,
+        "refresh_generation_stream": REFRESH_GENERATION_STREAM,
+        "kv_quant_enabled": KV_QUANT_ENABLED,
+        "kv_bits": KV_BITS,
+        "kv_group_size": KV_GROUP_SIZE,
+        "kv_quant_scheme": KV_QUANT_SCHEME,
+        "quantized_kv_start": QUANTIZED_KV_START,
+        "direct_decode_kernel": USE_DIRECT_DECODE_KERNEL,
+        "direct_decode_eval_mode": DIRECT_DECODE_EVAL_MODE,
+        "compact_decode_sort_topk": bool(
+            runtime_tuning.get("compact_decode_sort_topk")
+        ),
+        "decode_topk_reuse_tokens": runtime_tuning.get("decode_topk_reuse_tokens"),
+        "sparse_topk_blocks_override": SPARSE_TOPK_BLOCKS_OVERRIDE,
+        "effective_sparse_topk_blocks": runtime_tuning.get("sparse_topk_blocks"),
+        "unsafe_inflight_stop": UNSAFE_INFLIGHT_STOP,
+        "stop_on_client_disconnect": STOP_ON_CLIENT_DISCONNECT,
+        "stop_check_every": STOP_CHECK_EVERY,
+        "prefill_stop_check_every": PREFILL_STOP_CHECK_EVERY,
+        "msa_k1_impl": os.environ.get("MLX_M3_MSA_K1_IMPL", "auto"),
+        "msa_prefill_blockwise_topk_min_kv_len": int(
+            os.environ.get("MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN", "32768")
+            or "32768"
+        ),
+        "msa_prefill_blockwise_topk_block_chunk": int(
+            os.environ.get("MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK", "2") or "2"
+        ),
+        "visible_transcript_prewarm": VISIBLE_TRANSCRIPT_PREWARM_ENABLED,
+        "visible_transcript_prewarm_min_generated": VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED,
+        "effective_visible_transcript_prewarm_min_generated": (
+            runtime_tuning.get("visible_transcript_prewarm_min_generated")
+            if runtime_tuning.get("visible_transcript_prewarm_min_generated") is not None
+            else VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED
+        ),
+        "visible_transcript_prewarm_max_tokens": VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS,
+        "visible_transcript_prewarm_max_suffix_tokens": VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS,
+        "visible_transcript_prewarm_max_generated_tokens": VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS,
+        "reasoning_recall": REASONING_RECALL_ENABLED,
+        "reasoning_recall_max_sessions": REASONING_RECALL_MAX_SESSIONS,
+        "reasoning_recall_max_items": REASONING_RECALL_MAX_ITEMS,
+        "reasoning_recall_max_chars": REASONING_RECALL_MAX_CHARS,
+        "prompt_cache_session_protect": PROMPT_CACHE_SESSION_PROTECT_ENABLED,
+        "prompt_cache_session_protect_min_tokens": PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS,
+        "prompt_cache_session_protect_bypass_max_tokens": PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS,
+        "prompt_cache_static_prefix_rebuild_max_tokens": PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_TOKENS,
+        "prompt_cache_static_prefix_rebuild_max_reuse_ratio": PROMPT_CACHE_STATIC_PREFIX_REBUILD_MAX_REUSE_RATIO,
+        "prompt_cache_session_manifest": PROMPT_CACHE_SESSION_MANIFEST_ENABLED,
+        "prompt_cache_session_manifest_max": PROMPT_CACHE_SESSION_MANIFEST_MAX,
+        "prompt_cache_resident_slots": PROMPT_CACHE_RESIDENT_SLOTS,
+        "prompt_cache_resident_max_total_tokens": PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS,
+        "prompt_cache_ssd": PROMPT_CACHE_SSD_ENABLED,
+        "prompt_cache_ssd_restore": PROMPT_CACHE_SSD_RESTORE_ENABLED,
+        "prompt_cache_ssd_auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
+        "prompt_cache_ssd_dir": os.path.expanduser(PROMPT_CACHE_SSD_DIR),
+        "prompt_cache_ssd_dir_rank0": os.path.expanduser(
+            PROMPT_CACHE_SSD_DIR_RANK0 or PROMPT_CACHE_SSD_DIR
+        ),
+        "prompt_cache_ssd_dir_rank1": os.path.expanduser(
+            PROMPT_CACHE_SSD_DIR_RANK1 or PROMPT_CACHE_SSD_DIR
+        ),
+        "prompt_cache_ssd_ttl_seconds": PROMPT_CACHE_SSD_TTL_SECONDS,
+        "prompt_cache_ssd_max_bytes": PROMPT_CACHE_SSD_MAX_BYTES,
+        "prompt_cache_ssd_min_tokens": PROMPT_CACHE_SSD_MIN_TOKENS,
+    }
+
+
+def _kernel_stats_status():
+    try:
+        from mlx_vlm.models.minimax_m3_vl.msa import get_kernel_stats
+
+        return get_kernel_stats()
+    except Exception as e:
+        return {"available": False, "error": str(e)}
+
+
+def _model_key(model_id):
+    return str(model_id or "").strip().lower()
+
+
+def _short_hash(value):
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        value = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _reasoning_recall_content_key(content):
+    if not isinstance(content, str):
+        return None
+    visible = _sanitize_inbound_message_content("assistant", content)
+    if not isinstance(visible, str) or not visible.strip():
+        return None
+    return _short_hash(visible.strip())
+
+
+def _reasoning_recall_tool_calls_key(tool_calls):
+    if not tool_calls:
+        return None
+    normalized = []
+    for tool_call in _normalize_tool_calls(tool_calls):
+        if not isinstance(tool_call, dict):
+            continue
+        function = tool_call.get("function")
+        if not isinstance(function, dict):
+            continue
+        name = str(function.get("name") or "").strip()
+        arguments = function.get("arguments", {})
+        if not name:
+            continue
+        normalized.append({
+            "id": str(tool_call.get("id") or ""),
+            "type": str(tool_call.get("type") or "function"),
+            "name": name,
+            "arguments": arguments if isinstance(arguments, dict) else {},
+        })
+    if not normalized:
+        return None
+    return "tool:" + _short_hash(normalized)
+
+
+def _reasoning_recall_key(visible_content=None, tool_calls=None):
+    tool_key = _reasoning_recall_tool_calls_key(tool_calls)
+    if tool_key:
+        return tool_key
+    content_key = _reasoning_recall_content_key(visible_content)
+    return ("content:" + content_key) if content_key else None
+
+
+def _recall_assistant_reasoning(session_id, visible_content, *, tool_calls=None,
+                                session_source=None):
+    if (
+        not REASONING_RECALL_ENABLED
+        or not session_id
+        or _is_auto_cache_session_source(session_source)
+    ):
+        return None
+    key = _reasoning_recall_key(visible_content, tool_calls)
+    if not key:
+        return None
+    session_key = _prompt_cache_session_key(session_id)
+    with _reasoning_recall_lock:
+        entries = _reasoning_recall_sessions.get(session_key)
+        if not entries:
+            return None
+        entry = entries.get(key)
+        if not entry:
+            return None
+        entries.move_to_end(key)
+        _reasoning_recall_sessions.move_to_end(session_key)
+        reasoning = entry.get("reasoning")
+    return reasoning if isinstance(reasoning, str) and reasoning.strip() else None
+
+
+def _remember_assistant_reasoning(session_id, visible_content, raw_output, *,
+                                  thinking_mode=None, session_source=None,
+                                  tool_calls=None):
+    if (
+        not REASONING_RECALL_ENABLED
+        or not session_id
+        or _is_auto_cache_session_source(session_source)
+    ):
+        return False
+    if not _enable_thinking_for_generation(thinking_mode):
+        return False
+    key = _reasoning_recall_key(visible_content, tool_calls)
+    if not key:
+        return False
+    try:
+        reasoning, content = split_thinking_text(
+            raw_output or "",
+            assume_in_thinking=True,
+        )
+    except Exception:
+        reasoning, content = None, None
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return False
+    reasoning = _strip_thinking_control_markers(reasoning).strip()
+    if not reasoning:
+        return False
+    if REASONING_RECALL_MAX_CHARS > 0 and len(reasoning) > REASONING_RECALL_MAX_CHARS:
+        logger.info(
+            "reasoning-recall: skipped %s-char reasoning for session %s",
+            len(reasoning),
+            session_id,
+        )
+        return False
+    session_key = _prompt_cache_session_key(session_id)
+    with _reasoning_recall_lock:
+        entries = _reasoning_recall_sessions.get(session_key)
+        if entries is None:
+            entries = OrderedDict()
+            _reasoning_recall_sessions[session_key] = entries
+        entries[key] = {
+            "reasoning": reasoning,
+            "key_kind": "tool_calls" if _reasoning_recall_tool_calls_key(tool_calls) else "content",
+            "visible_chars": len(visible_content or ""),
+            "tool_calls": len(tool_calls or []),
+            "reasoning_chars": len(reasoning),
+            "at": round(time.time(), 3),
+        }
+        entries.move_to_end(key)
+        while REASONING_RECALL_MAX_ITEMS > 0 and len(entries) > REASONING_RECALL_MAX_ITEMS:
+            entries.popitem(last=False)
+        _reasoning_recall_sessions.move_to_end(session_key)
+        while (
+            REASONING_RECALL_MAX_SESSIONS > 0
+            and len(_reasoning_recall_sessions) > REASONING_RECALL_MAX_SESSIONS
+        ):
+            _reasoning_recall_sessions.popitem(last=False)
+    return True
+
+
+def _message_shape(message):
+    message = message if isinstance(message, dict) else {}
+    role = str(message.get("role", "user"))
+    content = message.get("content", "")
+    text_parts = []
+    image_parts = 0
+    content_kind = type(content).__name__
+    if isinstance(content, list):
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") in ("text", "input_text"):
+                text_parts.append(part.get("text", "") or part.get("content", ""))
+            elif _extract_image_source(part):
+                image_parts += 1
+    elif isinstance(content, str):
+        text_parts.append(content)
+    elif content is not None:
+        text_parts.append(str(content))
+    text = "\n".join(t for t in text_parts if t)
+    extra_keys = sorted(
+        k for k in message.keys()
+        if k not in {"role", "content", "reasoning", "reasoning_content", "thinking"}
+    )
+    reasoning = (
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+        or ""
+    )
+    return {
+        "role": role,
+        "content_kind": content_kind,
+        "text_len": len(text),
+        "text_hash": _short_hash(text),
+        "image_parts": image_parts,
+        "reasoning_len": len(reasoning) if isinstance(reasoning, str) else 0,
+        "reasoning_hash": _short_hash(reasoning) if isinstance(reasoning, str) and reasoning else None,
+        "extra_keys": extra_keys,
+    }
+
+
+def _request_shape_summary(request, processed_messages, prompt, token_ids, *,
+                           thinking_mode, response_model, max_tokens, stream,
+                           image_count, tools, max_tokens_source=None,
+                           gen_params=None):
+    raw_messages = request.get("messages") or []
+    processed_shape = []
+    for message in processed_messages:
+        content = message.get("content", "")
+        processed_shape.append({
+            "role": message.get("role"),
+            "content_len": len(content) if isinstance(content, str) else 0,
+            "content_hash": _short_hash(content) if isinstance(content, str) else None,
+            "has_tool_calls": bool(message.get("tool_calls")),
+            "extra_keys": sorted(k for k in message.keys() if k not in {"role", "content"}),
+        })
+    tool_names = sorted(_tool_names_from_schema(tools or []))
+    return {
+        "requested_model": request.get("model"),
+        "response_model": response_model,
+        "top_level_keys": sorted(request.keys()),
+        "cache_session_id": _request_cache_session(request)[0],
+        "cache_session_source": _request_cache_session(request)[1],
+        "thinking_mode": thinking_mode,
+        "stream": bool(stream),
+        "requested_max_tokens": request.get("max_tokens", request.get("max_completion_tokens")),
+        "effective_max_tokens": int(max_tokens),
+        "max_tokens_source": max_tokens_source,
+        "message_count": len(raw_messages),
+        "raw_messages": [_message_shape(m) for m in raw_messages],
+        "processed_messages": processed_shape,
+        "image_count": int(image_count),
+        "tools_count": len(tools or []),
+        "tool_names": tool_names[:160],
+        "tool_names_truncated": len(tool_names) > 160,
+        "tool_name_hashes": [_short_hash(name) for name in tool_names[:160]],
+        "email_like_tools": [
+            name for name in tool_names
+            if any(part in name.lower() for part in ("email", "mail", "gmail", "smtp"))
+        ][:32],
+        "functions_count": len(request.get("functions") or []),
+        "tool_source": request.get("_tool_source", "tools" if tools else "none"),
+        "tool_loop_steering": request.get("_tool_loop_steering"),
+        "tool_choice": request.get("tool_choice", request.get("function_call")),
+        "tool_default_sampling": bool(tools),
+        "effective_sampling": {
+            k: gen_params.get(k)
+            for k in ("temperature", "top_p", "top_k", "min_p", "seed")
+            if isinstance(gen_params, dict) and k in gen_params
+        },
+        "prompt_chars": len(prompt or ""),
+        "prompt_hash": _short_hash(prompt or ""),
+        "full_prompt_tokens": len(token_ids) if token_ids is not None else None,
+    }
+
+
+def _request_looks_like_openwebui(request, processed_messages=None):
+    """Detect OpenWebUI's dynamic environment prompt without needing headers."""
+    # OpenWebUI's OpenAI-compatible pipeline often includes stream_options and
+    # our gateway-side _tool_source marker even when the optional date/system
+    # prompt is disabled. Treat that shape as OpenWebUI so no-max-token chat
+    # requests use MLX_M3_OPENWEBUI_DEFAULT_MAX_TOKENS instead of the much larger
+    # agent-friendly text default.
+    if "stream_options" in request and "_tool_source" in request:
+        return True
+    texts = []
+    for message in (processed_messages or request.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") not in {"system", "developer"}:
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            texts.append(content)
+    text = "\n".join(texts)
+    markers = (
+        "Use this date/time context",
+        "Full current datetime",
+        "Current timezone",
+        "running locally",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _response_model_id(requested_model):
+    key = _model_key(requested_model)
+    if key in WEB_MODEL_ALIASES:
+        return VISIBLE_WEB_MODEL_ID
+    mode = MODEL_MODE_ALIASES.get(key)
+    if mode == "disabled":
+        return VISIBLE_NO_THINK_MODEL_ID
+    return VISIBLE_THINK_MODEL_ID
+
+
+def _kv_quant_kwargs():
+    if not KV_QUANT_ENABLED:
+        return {}
+    return {
+        "kv_bits": KV_BITS,
+        "kv_group_size": KV_GROUP_SIZE,
+        "kv_quant_scheme": KV_QUANT_SCHEME,
+        "quantized_kv_start": QUANTIZED_KV_START,
+    }
+
+
+def _apply_default_thinking_budget(gen_params, thinking_mode, max_tokens):
+    if (
+        thinking_mode != "enabled"
+        or not ALLOW_THINKING_BUDGET
+        or DEFAULT_THINKING_BUDGET <= 0
+        or "thinking_budget" in gen_params
+    ):
+        return
+    answer_room = max(1, max_tokens - 8)
+    dynamic_budget = max(MIN_THINKING_BUDGET, max_tokens // 2)
+    gen_params["thinking_budget"] = min(
+        DEFAULT_THINKING_BUDGET,
+        dynamic_budget,
+        answer_room,
+    )
+
+
+def _resolve_thinking_mode(request):
+    if "thinking_mode" in request and request["thinking_mode"] is not None:
+        mode = request["thinking_mode"]
+    elif "enable_thinking" in request:
+        mode = "enabled" if request.get("enable_thinking") else "disabled"
+    elif request.get("reasoning_effort") is not None:
+        effort = str(request.get("reasoning_effort")).strip().lower()
+        if effort in ("none", "off", "disabled", "disable", "false", "0"):
+            mode = "disabled"
+        else:
+            mode = "enabled"
+    elif _model_key(request.get("model")) in MODEL_MODE_ALIASES:
+        mode = MODEL_MODE_ALIASES[_model_key(request.get("model"))]
+    else:
+        mode = DEFAULT_THINKING_MODE
+
+    if isinstance(mode, bool):
+        return "enabled" if mode else "disabled"
+    mode = str(mode).strip().lower()
+    if mode not in VALID_THINKING_MODES:
+        logger.warning("invalid thinking_mode=%r; using %s", mode, DEFAULT_THINKING_MODE)
+        return DEFAULT_THINKING_MODE
+    return mode
+
+
+def _enable_thinking_for_generation(thinking_mode):
+    return thinking_mode == "enabled"
+
+
+def _normalize_tool_calls(tool_calls):
+    normalized = []
+    for tc in tool_calls or []:
+        tc = dict(tc) if isinstance(tc, dict) else tc
+        if isinstance(tc, dict) and "function" in tc:
+            fn = dict(tc["function"])
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    fn["arguments"] = json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    fn["arguments"] = {}
+            tc["function"] = fn
+        normalized.append(tc)
+    return normalized
+
+
+def _tools_from_request(request):
+    """Return OpenAI tool schemas, accepting legacy `functions` clients too."""
+    if _tool_choice_disables_tools(request):
+        # OpenAI semantics: tool_choice "none" means the model must not call
+        # tools this turn, so do not advertise them to the template/parser.
+        request["_tool_source"] = "tool_choice_none"
+        return None
+    tools = request.get("tools")
+    if tools and TOOL_HIDE_NAMES:
+        filtered = [
+            tool for tool in tools
+            if _tool_function_name(tool) not in TOOL_HIDE_NAMES
+        ]
+        if filtered and len(filtered) < len(tools):
+            request["_tool_source"] = "tools_hidden_names"
+            return filtered
+    if tools:
+        request["_tool_source"] = "tools"
+        return tools
+    functions = request.get("functions")
+    if isinstance(functions, list) and functions:
+        converted = []
+        for fn in functions:
+            if not isinstance(fn, dict):
+                continue
+            converted.append({"type": "function", "function": dict(fn)})
+        if converted:
+            request["_tool_source"] = "functions"
+            return converted
+    request["_tool_source"] = "none"
+    return None
+
+
+def _tool_choice_disables_tools(request):
+    choice = request.get("tool_choice", request.get("function_call"))
+    if choice is None:
+        return False
+    if isinstance(choice, str):
+        return choice.strip().lower() in {"none", "no", "false", "0"}
+    if isinstance(choice, dict):
+        return str(choice.get("type", "")).strip().lower() == "none"
+    return False
+
+
+def _tool_call_arguments_dict(tool_call):
+    if not isinstance(tool_call, dict):
+        return {}
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else tool_call
+    args = function.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            return json.loads(args) if args.strip() else {}
+        except json.JSONDecodeError:
+            return {"input": args}
+    return args if isinstance(args, dict) else {}
+
+
+def _tool_call_name_for_loop(tool_call):
+    if not isinstance(tool_call, dict):
+        return ""
+    function = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else tool_call
+    return str(function.get("name") or tool_call.get("name") or "").strip()
+
+
+def _tool_call_command_fingerprint(tool_call):
+    args = _tool_call_arguments_dict(tool_call)
+    for key in ("cmd", "command", "input", "script", "code"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"\s+", " ", value.strip())[:500]
+    edit_parts = []
+    for key in (
+        "patch",
+        "diff",
+        "file_path",
+        "path",
+        "old_string",
+        "old_text",
+        "new_string",
+        "new_text",
+        "content",
+    ):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            edit_parts.append(f"{key}={value.strip()}")
+    if edit_parts:
+        return re.sub(r"\s+", " ", "\n".join(edit_parts))[:500]
+    return ""
+
+
+def _tool_loop_steering_diag(messages, tools):
+    if not tools or TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS <= 0:
+        return None
+    last_user_index = -1
+    for index, message in enumerate(messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_index = index
+    if last_user_index < 0:
+        return None
+
+    assistant_tool_turns = 0
+    tool_results = 0
+    visible_assistant_turns = 0
+    tool_fallback_turns = 0
+    command_counts = {}
+    tool_name_counts = {}
+    user_content_counts = {}
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        normalized = re.sub(r"\s+", " ", content.strip())
+        # Agent shims sometimes retry by appending the same long user/tool
+        # instruction as a fresh user turn, so a "since latest user" loop
+        # detector cannot see the earlier failed attempts. Count only chunky
+        # repeated prompts so normal short chat like "continue" is unaffected.
+        if len(normalized) >= 500:
+            key = _short_hash(normalized)
+            user_content_counts[key] = user_content_counts.get(key, 0) + 1
+    for message in (messages or [])[last_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            content = message.get("content")
+            if (
+                isinstance(content, str)
+                and content.strip()
+                and _looks_like_tool_compat_fallback_content(content)
+            ):
+                tool_fallback_turns += 1
+            elif isinstance(content, str) and content.strip():
+                visible_assistant_turns += 1
+            tool_calls = message.get("tool_calls") or []
+            if tool_calls:
+                assistant_tool_turns += 1
+                for tool_call in tool_calls:
+                    tool_name = _tool_call_name_for_loop(tool_call)
+                    if tool_name:
+                        tool_name_counts[tool_name] = tool_name_counts.get(tool_name, 0) + 1
+                    fingerprint = _tool_call_command_fingerprint(tool_call)
+                    if fingerprint:
+                        command_counts[fingerprint] = command_counts.get(fingerprint, 0) + 1
+        elif role == "tool":
+            tool_results += 1
+
+    if visible_assistant_turns:
+        return None
+    repeated_command, repeated_command_count = "", 0
+    if command_counts:
+        repeated_command, repeated_command_count = max(
+            command_counts.items(),
+            key=lambda item: item[1],
+        )
+    repeated_tool, repeated_tool_count = "", 0
+    if tool_name_counts:
+        repeated_tool, repeated_tool_count = max(
+            tool_name_counts.items(),
+            key=lambda item: item[1],
+        )
+    reasons = []
+    if (
+        assistant_tool_turns >= TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS
+        and tool_results >= TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS
+    ):
+        reasons.append("many_tool_only_turns")
+    # Repeated shell/apply_patch calls are normal for coding agents. Treat
+    # exact repeated commands as diagnostics only; hard loop protection below
+    # is reserved for fallback-text loops and whole-prompt replay storms.
+    if (
+        TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS > 0
+        and repeated_command_count >= TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS
+    ):
+        reasons.append("repeated_command")
+    if (
+        TOOL_LOOP_STEER_MAX_REPEATED_TOOL > 0
+        and repeated_tool_count >= TOOL_LOOP_STEER_MAX_REPEATED_TOOL
+    ):
+        reasons.append("repeated_tool")
+    if (
+        TOOL_LOOP_FORCE_FINAL_AFTER > 0
+        and assistant_tool_turns >= TOOL_LOOP_FORCE_FINAL_AFTER
+        and tool_results >= TOOL_LOOP_FORCE_FINAL_AFTER
+        and (
+            "many_tool_only_turns" in reasons
+            or "repeated_command" in reasons
+            or "repeated_tool" in reasons
+        )
+    ):
+        reasons.append("force_final")
+    if (
+        TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS > 0
+        and repeated_command_count >= TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS
+        and assistant_tool_turns >= repeated_command_count
+        and tool_results >= repeated_command_count
+        and "force_final" not in reasons
+    ):
+        reasons.append("force_final")
+    if tool_fallback_turns >= 2:
+        reasons.append("tool_fallback_loop")
+        if "force_final" not in reasons:
+            reasons.append("force_final")
+    repeated_user_prompt_count = max(user_content_counts.values(), default=0)
+    if repeated_user_prompt_count >= 3:
+        reasons.append("repeated_user_tool_prompt")
+        if "force_final" not in reasons:
+            reasons.append("force_final")
+    if not reasons:
+        return None
+    return {
+        "triggered": True,
+        "reasons": reasons,
+        "assistant_tool_turns": assistant_tool_turns,
+        "tool_results": tool_results,
+        "tool_fallback_turns": tool_fallback_turns,
+        "repeated_user_prompt_count": repeated_user_prompt_count,
+        "repeated_tool": repeated_tool,
+        "repeated_tool_count": repeated_tool_count,
+        "repeated_command_count": repeated_command_count,
+        "repeated_command_hash": _short_hash(repeated_command) if repeated_command else None,
+    }
+
+
+def _tool_loop_steering_text(diag):
+    if not diag or not diag.get("triggered"):
+        return ""
+    reasons = set(diag.get("reasons") or [])
+    if "force_final" in reasons:
+        return (
+            "Tool loop breaker: stop calling tools for this single turn because "
+            "the recent transcript already contains "
+            f"{diag.get('assistant_tool_turns', 0)} assistant tool-call turn(s) "
+            f"and {diag.get('tool_results', 0)} tool result(s) without a visible "
+            "assistant answer. Do not request another tool. Provide the final "
+            "answer now using the gathered tool results, and if the task could "
+            "not be completed, state exactly what is missing. Do not mention "
+            "tool availability or server/tooling state; this is only a "
+            "one-turn loop recovery instruction."
+        )
+    repeated_tool = diag.get("repeated_tool") or "the same tool"
+    filtered = diag.get("filtered_tools") or []
+    filtered_text = ""
+    if filtered:
+        filtered_text = (
+            " The exact repeated action has already been attempted; do not "
+            f"repeat {', '.join(filtered)} with the same arguments on this "
+            "turn. Use a different available tool if more work is needed, or "
+            "answer from the gathered results."
+        )
+    return (
+        "Long agent-loop steering: the recent transcript already contains "
+        f"{diag.get('assistant_tool_turns', 0)} assistant tool-call turn(s) "
+        f"and {diag.get('tool_results', 0)} tool result(s) after the latest "
+        "user request, with repeated tool activity. Tools remain available. "
+        f"Do not call {repeated_tool} again unless it is genuinely the next "
+        "new action. Prefer a different concrete tool if more evidence is "
+        "needed, or provide the final answer if the gathered tool output is "
+        "already enough. Do not emit raw tool markup or describe a tool call "
+        "in prose; use the provided tool-call format for any tool."
+        f"{filtered_text}"
+    )
+
+
+def _tool_function_name(tool):
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    return str(function.get("name") or "").strip()
+
+
+def _filter_looping_control_tools(tools, diag):
+    if not tools or not diag or not diag.get("triggered"):
+        return tools, []
+    repeated_tool = str(diag.get("repeated_tool") or "").strip()
+    reasons = set(diag.get("reasons") or [])
+    filter_names = set()
+    if repeated_tool in TOOL_LOOP_FILTER_CONTROL_TOOLS and "repeated_tool" in reasons:
+        filter_names.add(repeated_tool)
+    # Keep normal work tools stable by default. Changing the advertised tool
+    # schema mid-agent-loop can bust prompt-cache reuse and makes some Codex /
+    # ZCoder shims think a tool disappeared. Operators can opt in via
+    # MLX_M3_TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS for special clients.
+    if (
+        repeated_tool in TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS
+        and "repeated_command" in reasons
+    ):
+        filter_names.add(repeated_tool)
+    if not filter_names:
+        return tools, []
+    filtered_tools = [
+        tool for tool in tools
+        if _tool_function_name(tool) not in filter_names
+    ]
+    if len(filtered_tools) == len(tools) or not filtered_tools:
+        return tools, []
+    return filtered_tools, sorted(filter_names)
+
+
+def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loop_diag=None):
+    force_final = bool(
+        tool_loop_diag
+        and "force_final" in set(tool_loop_diag.get("reasons") or [])
+    )
+    if (not tools and not force_final) or not TOOL_SYSTEM_HINT_ENABLED or _tool_choice_disables_tools(request):
+        return processed_messages
+    hint = (TOOL_SYSTEM_HINT_TEXT or "").strip() if tools else ""
+    steer = _tool_loop_steering_text(tool_loop_diag)
+    if not hint:
+        if not steer:
+            return processed_messages
+        hint = steer
+    elif steer:
+        hint = f"{hint}\n\n{steer}"
+    for message in processed_messages:
+        if not isinstance(message, dict) or message.get("role") not in {"system", "developer"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and hint in content:
+            return processed_messages
+    return [{"role": "system", "content": hint}, *processed_messages]
+
+
+def _load_tool_parser(processor):
+    try:
+        from mlx_vlm.tool_parsers import _infer_tool_parser, load_tool_module
+
+        template = getattr(processor, "chat_template", None)
+        if not template and getattr(processor, "tokenizer", None) is not None:
+            template = getattr(processor.tokenizer, "chat_template", None)
+        parser_type = _infer_tool_parser(template)
+        return load_tool_module(parser_type) if parser_type else None
+    except Exception as e:
+        logger.warning(f"tool parser unavailable: {e}")
+        return None
+
+
+def _tool_call_markers(tool_module):
+    start = getattr(tool_module, "tool_call_start", "") if tool_module else ""
+    end = getattr(tool_module, "tool_call_end", "") if tool_module else ""
+    return start, end
+
+
+# Display-style tool call: "[Tool call: name]" then (optionally after the
+# MiniMax namespace marker) a JSON args object. The JSON is what separates
+# real emitted calls from prose that merely mentions the phrase.
+_DISPLAY_TOOL_CALL_RE = re.compile(
+    r"\[Tool call:\s*[A-Za-z_][\w:.-]*\s*\]\s*(?:\]<\]minimax\[>\[\s*)?\{"
+)
+
+
+def _strip_raw_tool_blocks(text, tool_module):
+    """Remove raw MiniMax tool markup so invalid blocks never leak as content."""
+    if not text:
+        return text
+    start, end = _tool_call_markers(tool_module)
+    if not start or start not in text:
+        ns_token = start.removesuffix("<tool_call>") if start else ""
+        if ns_token and ns_token in text and _looks_like_raw_tool_fragment(text, tool_module):
+            return text[:text.find(ns_token)].strip()
+        # 2026-07-06 audit: only treat "[Tool call:" as markup when it is the
+        # actual display format — bracketed name followed by a JSON object.
+        # Bare prose mentioning the phrase ("the log shows [Tool call: x]
+        # fired") was being truncated at the substring.
+        display = _DISPLAY_TOOL_CALL_RE.search(text)
+        if display:
+            return text[:display.start()].strip()
+        return text
+    if end:
+        pattern = re.compile(
+            f"{re.escape(start)}.*?{re.escape(end)}",
+            flags=re.DOTALL,
+        )
+        stripped = re.sub(pattern, " ", text).strip()
+        # If the model started a malformed block and never closed it, drop from
+        # the start marker onward instead of exposing tool syntax to clients.
+        if start in stripped:
+            stripped = stripped[:stripped.find(start)].strip()
+        return stripped
+    return re.sub(f"{re.escape(start)}.*?(?:\n|$)", " ", text, flags=re.DOTALL).strip()
+
+
+def _looks_like_raw_tool_fragment(text, tool_module):
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not text or not ns_token or ns_token not in text:
+        return False
+    fragment = text[text.find(ns_token):]
+    return any(marker in fragment for marker in (
+        "<tool_call",
+        "</tool_call",
+        "<invoke",
+        "invoke name",
+        "</invoke",
+        "[Tool call:",
+    ))
+
+
+def _tool_fragment_looks_degenerate(text, tool_module):
+    """Marker-spam detector for the silent-fragment decode guard.
+
+    A legitimate MiniMax tool block uses a handful of namespace markers no
+    matter how long its payload is; degenerate loops re-emit the marker almost
+    every token. Only the spam shape may trip the guard — counting any
+    in-progress block truncates long payloads (patches, multi-line commands)
+    and manufactures the malformed calls the recovery paths exist to repair.
+    """
+    if not _looks_like_raw_tool_fragment(text, tool_module):
+        return False
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    fragment = text[text.find(ns_token):]
+    open_pos = fragment.rfind("<tool_call>")
+    if open_pos >= 0 and "</tool_call" in fragment[open_pos:]:
+        # Last block is closed; the final parse judges it, not the guard.
+        return False
+    # 32, not 16: a legitimate many-parameter loose call can pass 16 prefixed
+    # segments while still open; true spam re-emits the marker per token and
+    # blows past 32 within the same silent window (2026-07-06 audit).
+    return fragment.count(ns_token) >= 32
+
+
+def _tool_names_from_schema(tools):
+    names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = function.get("name") if isinstance(function, dict) else None
+        if isinstance(name, str) and name:
+            names.add(name)
+    return names
+
+
+def _tool_name_map_from_schema(tools):
+    return {name.lower(): name for name in _tool_names_from_schema(tools)}
+
+
+def _canonical_tool_name(name, name_map):
+    if not isinstance(name, str):
+        return None
+    stripped = name.strip()
+    if not stripped:
+        return None
+    lowered = stripped.lower()
+    if lowered in name_map:
+        return name_map[lowered]
+    compact = re.sub(r"[^a-z0-9]", "", lowered)
+    if compact:
+        for key, value in name_map.items():
+            if re.sub(r"[^a-z0-9]", "", key) == compact:
+                return value
+    aliases = {
+        "terminal": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
+        "command": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
+        "exec": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
+        "cmd": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
+        "invoke_command": ("bash", "shell", "run_command", "execute_command", "exec_command", "terminal"),
+        "exec_command": ("bash", "shell", "run_command", "execute_command", "invoke_command", "terminal"),
+        "read": ("read_file", "readfile", "open_file", "view_file", "read"),
+        "write": ("write_file", "writefile", "edit_file", "write"),
+        "exec_stdin": ("write_stdin", "stdin", "send_stdin", "send_input", "write_input"),
+        "stdin": ("write_stdin", "exec_stdin", "send_stdin", "send_input", "write_input"),
+        "send_stdin": ("write_stdin", "exec_stdin", "stdin", "send_input", "write_input"),
+        "write_stdin": ("exec_stdin", "stdin", "send_stdin", "send_input", "write_input"),
+    }
+    for alias in aliases.get(lowered, ()):
+        if alias in name_map:
+            return name_map[alias]
+        alias_compact = re.sub(r"[^a-z0-9]", "", alias)
+        for key, value in name_map.items():
+            if re.sub(r"[^a-z0-9]", "", key) == alias_compact:
+                return value
+    return stripped
+
+
+def _tool_parameters_for_name(tools, name):
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        if not isinstance(function, dict) or function.get("name") != name:
+            continue
+        params = function.get("parameters")
+        return params if isinstance(params, dict) else {}
+    return {}
+
+
+def _tool_schema_expects_arguments(tools, name):
+    params = _tool_parameters_for_name(tools, name)
+    return bool(params.get("properties") or params.get("required"))
+
+
+def _tool_schema_property_names(tools, name):
+    params = _tool_parameters_for_name(tools, name)
+    props = params.get("properties") if isinstance(params, dict) else None
+    return list(props.keys()) if isinstance(props, dict) else []
+
+
+def _tool_schema_required_names(tools, name):
+    params = _tool_parameters_for_name(tools, name)
+    required = params.get("required") if isinstance(params, dict) else None
+    return [x for x in required if isinstance(x, str)] if isinstance(required, list) else []
+
+
+def _tool_schema_allows_additional_properties(tools, name):
+    """True when the advertised schema explicitly permits unknown argument keys.
+
+    Absent additionalProperties keeps the historical drop behavior: strict
+    agent shims (zod validators) reject unknown keys even though JSON Schema
+    defaults to permissive, so passthrough must be opt-in via the schema.
+    """
+    params = _tool_parameters_for_name(tools, name)
+    extra = params.get("additionalProperties")
+    return bool(extra) if not isinstance(extra, dict) else True
+
+
+def _tool_names_with_property(tools, property_name):
+    matches = []
+    prop = str(property_name or "").lower()
+    if not prop:
+        return matches
+    for name in _tool_names_from_schema(tools):
+        props = {p.lower() for p in _tool_schema_property_names(tools, name)}
+        if prop in props:
+            matches.append(name)
+    return matches
+
+
+def _infer_tool_name_from_body(attrs, body, tools, name_map):
+    """Infer a missing malformed MiniMax <invoke ...> name from schema + args."""
+    haystack = f"{attrs or ''}\n{body or ''}"
+    for match in re.finditer(r'\{\s*"name"\s*:\s*"(?P<name>(?:\\.|[^"])*)"', haystack):
+        candidate = _canonical_tool_name(_loads_json_string_fragment(match.group("name")), name_map)
+        if candidate:
+            return candidate
+    tagless = re.sub(r"<[^>]+>", " ", haystack)
+    loose_shell = any(
+        _looks_like_shell_command(segment)
+        for segment in re.split(r"[\r\n]+", tagless)
+    )
+    if (
+        _looks_like_shell_command(haystack)
+        or loose_shell
+        or re.search(r"<(?:cmd|command|input)\b", haystack, flags=re.IGNORECASE)
+    ):
+        preferred = [
+            "bash", "shell", "terminal", "run_command", "execute_command",
+            "exec_command", "invoke_command", "Bash", "Shell",
+        ]
+        for candidate in preferred:
+            canonical = _canonical_tool_name(candidate, name_map)
+            if canonical in _tool_names_from_schema(tools):
+                return canonical
+        command_tools = []
+        for prop in ("command", "cmd", "input"):
+            command_tools.extend(_tool_names_with_property(tools, prop))
+        command_tools = list(dict.fromkeys(command_tools))
+        if len(command_tools) == 1:
+            return command_tools[0]
+    for prop in ("file_path", "path"):
+        if re.search(rf'"{re.escape(prop)}"\s*:', haystack):
+            path_tools = _tool_names_with_property(tools, prop)
+            if len(path_tools) == 1:
+                return path_tools[0]
+    return None
+
+
+def _openai_tool_call(name, arguments, index):
+    if not isinstance(arguments, str):
+        arguments = json.dumps(arguments if isinstance(arguments, dict) else {},
+                               ensure_ascii=False)
+    return {
+        "type": "function",
+        "index": index,
+        "id": str(uuid.uuid4()),
+        "function": {
+            "name": name,
+            "arguments": arguments,
+        },
+    }
+
+
+def _canonicalize_tool_argument_keys(arguments, tools, name):
+    """Shape arguments to the exact property names the client advertised."""
+    if not isinstance(arguments, dict):
+        return {}
+    props = _tool_schema_property_names(tools, name)
+    required = _tool_schema_required_names(tools, name)
+    if not props:
+        return dict(arguments)
+
+    prop_by_lower = {prop.lower(): prop for prop in props}
+    prop_by_compact = {
+        re.sub(r"[^a-z0-9]", "", prop.lower()): prop for prop in props
+    }
+    aliases = {
+        "cmd": (
+            "cmd", "command", "input", "shell_command", "shellCommand",
+            "command_string", "commandString", "script", "code",
+        ),
+        "command": (
+            "command", "cmd", "input", "shell_command", "shellCommand",
+            "command_string", "commandString", "script", "code",
+        ),
+        "input": (
+            "input", "cmd", "command", "query", "text", "content",
+        ),
+        "query": ("query", "search", "search_query", "searchQuery", "input", "text"),
+        "url": ("url", "uri", "link", "href", "input", "query", "text"),
+        "prompt": (
+            "prompt", "query", "question", "instruction", "instructions",
+            "description", "task", "objective", "goal", "input", "text",
+            "content",
+        ),
+        "question": ("question", "prompt", "query", "input", "text", "content"),
+        "options": ("options", "choices", "items", "values"),
+        "description": (
+            "description", "prompt", "objective", "goal", "task",
+            "instructions", "instruction", "input", "text", "content",
+        ),
+        "subagent_type": (
+            "subagent_type", "subagentType", "agent_type", "agentType",
+            "type", "name", "agent",
+        ),
+        "objective": (
+            "objective", "goal", "task", "request", "prompt", "description",
+            "instructions", "instruction", "input", "text", "content",
+        ),
+        "goal": (
+            "goal", "objective", "task", "request", "prompt", "description",
+            "instructions", "instruction", "input", "text", "content",
+        ),
+        "path": ("path", "file", "file_path", "filePath", "filename", "target"),
+        "file_path": ("file_path", "filePath", "path", "file", "filename", "target"),
+        "old_string": (
+            "old_string", "oldString", "old_text", "oldText", "before",
+            "from", "find", "search", "target",
+        ),
+        "new_string": (
+            "new_string", "newString", "new_text", "newText", "after",
+            "to", "replace", "replacement",
+        ),
+        "old_text": (
+            "old_text", "oldText", "old_string", "oldString", "before",
+            "from", "find", "search", "target",
+        ),
+        "new_text": (
+            "new_text", "newText", "new_string", "newString", "after",
+            "to", "replace", "replacement",
+        ),
+        "content": (
+            "content", "text", "input", "data", "body", "value",
+            "new_string", "newString", "new_text", "newText",
+        ),
+        "message": ("message", "content", "text", "input", "prompt"),
+        "recipient": ("recipient", "to", "target", "agent", "name"),
+        "chars": ("chars", "text", "input", "stdin", "content", "data"),
+        "todos": ("todos", "todo", "items", "tasks", "list"),
+        "plan": ("plan", "steps", "items", "tasks", "todos"),
+        "status": ("status", "state", "result"),
+        "skill": ("skill", "skill_name", "skillName", "name", "tool", "input"),
+        "name": ("name", "tool", "skill", "subagent_type", "agent_type", "type"),
+        "session_id": ("session_id", "sessionId", "session", "id", "process_id", "processId"),
+        "justification": ("justification", "reason", "description", "why"),
+    }
+
+    result = {}
+    leftovers = {}
+    for raw_key, value in arguments.items():
+        key = str(raw_key)
+        lowered = key.lower()
+        compact = re.sub(r"[^a-z0-9]", "", lowered)
+        target = (
+            prop_by_lower.get(lowered)
+            or prop_by_compact.get(compact)
+        )
+        if target:
+            result[target] = value
+        else:
+            leftovers[key] = value
+
+    for prop in props:
+        if prop in result:
+            continue
+        lowered_prop = prop.lower()
+        compact_prop = re.sub(r"[^a-z0-9]", "", lowered_prop)
+        candidates = aliases.get(lowered_prop, ()) + aliases.get(compact_prop, ())
+        for candidate in candidates:
+            # Never alias-fill from a key that is itself an advertised
+            # property: the model targeted that prop deliberately. This used
+            # to copy new_string into content on edit tools that declare
+            # both, inventing an argument (2026-07-06 audit).
+            lowered_candidate = candidate.lower()
+            compact_candidate = re.sub(r"[^a-z0-9]", "", lowered_candidate)
+            if (
+                lowered_candidate in prop_by_lower
+                or compact_candidate in prop_by_compact
+            ):
+                continue
+            if candidate in arguments and arguments[candidate] not in (None, ""):
+                result[prop] = arguments[candidate]
+                break
+            for raw_key, value in arguments.items():
+                raw_compact = re.sub(r"[^a-z0-9]", "", str(raw_key).lower())
+                if raw_compact == compact_candidate and value not in (None, ""):
+                    result[prop] = value
+                    break
+            if prop in result:
+                break
+
+    if (
+        len(required) == 1
+        and required[0] not in result
+        and len(arguments) == 1
+    ):
+        only_key, only_value = next(iter(arguments.items()))
+        only_lower = str(only_key).lower()
+        only_compact = re.sub(r"[^a-z0-9]", "", only_lower)
+        # Do not reinterpret a different advertised property as the required
+        # field. Example: create_goal(token_budget=1000) is missing objective,
+        # not objective="1000".
+        if (
+            only_lower not in prop_by_lower
+            and only_compact not in prop_by_compact
+            and only_value not in (None, "")
+        ):
+            result[required[0]] = only_value
+
+    command_prop = next(
+        (
+            prop_by_lower[prop]
+            for prop in ("cmd", "command", "input")
+            if prop in prop_by_lower and prop_by_lower[prop] in result
+        ),
+        None,
+    )
+    justification_prop = prop_by_lower.get("justification")
+    if (
+        TOOL_SYNTH_JUSTIFICATION
+        and command_prop
+        and justification_prop
+        and justification_prop not in result
+        and result.get(command_prop)
+    ):
+        result[justification_prop] = _summarize_shell_command_for_tool(
+            str(result[command_prop])
+        )
+
+    # Keep optional known fields only. Unknown keys are often what strict
+    # agent shims reject even though the OpenAI API itself is permissive.
+    # Schemas that explicitly allow additionalProperties keep their extra
+    # keys — dropping them loses real data (2026-07-06 audit).
+    shaped = {prop: result[prop] for prop in props if prop in result}
+    if leftovers and _tool_schema_allows_additional_properties(tools, name):
+        for key, value in leftovers.items():
+            shaped.setdefault(key, value)
+    return shaped
+
+
+def _coerce_codex_control_tool_arguments(arguments, tools, name):
+    if not isinstance(arguments, dict):
+        return {}
+    result = dict(arguments)
+    if name != "update_plan" or "plan" not in _tool_schema_property_names(tools, name):
+        return result
+    plan = result.get("plan")
+    default_status = result.get("status")
+    if default_status not in {"pending", "in_progress", "completed"}:
+        default_status = "in_progress"
+
+    def normalize_item(item):
+        if isinstance(item, dict):
+            normalized = dict(item)
+            step = str(normalized.get("step") or normalized.get("text") or normalized.get("task") or "").strip()
+            status = normalized.get("status")
+            if status not in {"pending", "in_progress", "completed"}:
+                status = default_status
+            if not step:
+                return None
+            return {"step": step, "status": status}
+        text = str(item or "").strip()
+        if not text:
+            return None
+        return {"step": text, "status": default_status}
+
+    if isinstance(plan, list):
+        coerced = [normalize_item(item) for item in plan]
+        result["plan"] = [item for item in coerced if item]
+    elif isinstance(plan, dict):
+        item = normalize_item(plan)
+        result["plan"] = [item] if item else []
+    elif plan not in (None, ""):
+        item = normalize_item(plan)
+        result["plan"] = [item] if item else []
+    return result
+
+
+def _summarize_shell_command_for_tool(cmd):
+    text = (cmd or "").strip()
+    if not text:
+        return "Run command"
+    first = text.splitlines()[0].strip()
+    lowered = first.lower()
+    if re.search(r"\b(ls|find|tree)\b", lowered):
+        return "List files"
+    if re.search(r"\b(rg|grep|ag)\b", lowered):
+        return "Search files"
+    if re.search(r"\b(cat|sed|head|tail|nl)\b", lowered):
+        return "Read file"
+    if re.search(r"\b(git status|git diff|git log|git show)\b", lowered):
+        return "Inspect git state"
+    if re.search(r"\b(python|python3|node|npm|pytest|uv|curl)\b", lowered):
+        return "Run project check"
+    return "Run command"
+
+
+def _apply_patch_payload(arguments):
+    if not isinstance(arguments, dict):
+        return ""
+    for key in ("patch", "input", "content", "diff"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _apply_patch_payload_is_valid(arguments):
+    payload = _apply_patch_payload(arguments)
+    if not payload:
+        return False
+    if not payload.startswith("*** Begin Patch"):
+        return False
+    if "*** End Patch" not in payload:
+        return False
+    return any(
+        marker in payload
+        for marker in (
+            "\n*** Add File:",
+            "\n*** Update File:",
+            "\n*** Delete File:",
+        )
+    )
+
+
+def _is_apply_patch_tool_name(name):
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower()) == "applypatch"
+
+
+def _exec_write_from_malformed_patch(arguments, tools):
+    """Recover a file write from a malformed apply_patch payload.
+
+    MiniMax states the Add File intent reliably even when it breaks the patch
+    envelope (missing Begin/End markers or dropped + prefixes), and resampling
+    rarely fixes the format. Rebuild the write as an exec_command from the
+    model's own patch text. Never touch Update/Delete ops; a partial diff
+    cannot be reconstructed safely.
+    """
+    payload = _apply_patch_payload(arguments)
+    if not payload:
+        return None, None
+    if re.search(r"\*{0,3}\s*(?:Update|Delete)\s+File\s*:", payload, re.IGNORECASE):
+        return None, None
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name:
+        return None, None
+    add_re = re.compile(
+        r"^\s*(?:\*{1,3}\s*)?Add\s+File\s*:\s*(?P<path>\S[^\n]*)$",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    matches = list(add_re.finditer(payload))
+    if not matches:
+        # MiniMax also emits an explicit file+content shape:
+        # <invoke name="apply_patch"><file>path</file><patch>full source</patch>
+        # No envelope markers at all means the payload IS the file body.
+        path_arg = next(
+            (
+                str(arguments.get(key)).strip()
+                for key in ("file", "path", "file_path", "filename", "target")
+                if isinstance(arguments.get(key), str) and arguments.get(key).strip()
+            ),
+            None,
+        )
+        if (
+            path_arg
+            and "*** " not in payload
+            and "<old_text>" not in payload
+            and not path_arg.startswith("-")
+            and "*" not in path_arg
+        ):
+            content = payload
+            cmd = (
+                f"mkdir -p {shlex.quote(os.path.dirname(path_arg) or '.')} && "
+                f"printf %s {shlex.quote(content)} > {shlex.quote(path_arg)} && "
+                f"ls -l {shlex.quote(path_arg)}"
+            )
+            args = _canonicalize_tool_argument_keys(
+                {
+                    "cmd": cmd,
+                    "command": cmd,
+                    "input": cmd,
+                    "justification": f"Create {path_arg}",
+                },
+                tools,
+                command_name,
+            )
+            args = _coerce_codex_control_tool_arguments(args, tools, command_name)
+            if args:
+                return command_name, args
+        return None, None
+    writes = []
+    for index, match in enumerate(matches):
+        path = match.group("path").strip().strip("'\"`")
+        if not path or path.startswith("-") or "*" in path:
+            return None, None
+        body_start = match.end()
+        body_end = matches[index + 1].start() if index + 1 < len(matches) else len(payload)
+        content_lines = []
+        for line in payload[body_start:body_end].splitlines():
+            if re.match(r"^\s*\*{1,3}\s*(?:Begin|End)\s+Patch", line, re.IGNORECASE):
+                break
+            content_lines.append(line)
+        while content_lines and not content_lines[0].strip():
+            content_lines.pop(0)
+        while content_lines and not content_lines[-1].strip():
+            content_lines.pop()
+        if not content_lines:
+            return None, None
+        plus_lines = sum(1 for line in content_lines if line.startswith("+"))
+        if plus_lines >= max(1, len(content_lines) // 2):
+            content_lines = [
+                line[1:] if line.startswith("+") else line
+                for line in content_lines
+            ]
+        writes.append((path, "\n".join(content_lines)))
+    commands = []
+    for path, content in writes:
+        commands.append(f"mkdir -p {shlex.quote(os.path.dirname(path) or '.')}")
+        commands.append(f"printf %s {shlex.quote(content)} > {shlex.quote(path)}")
+    commands.append("ls -l " + " ".join(shlex.quote(path) for path, _ in writes))
+    cmd = " && ".join(commands)
+    args = _canonicalize_tool_argument_keys(
+        {
+            "cmd": cmd,
+            "command": cmd,
+            "input": cmd,
+            "justification": "Create " + ", ".join(path for path, _ in writes),
+        },
+        tools,
+        command_name,
+    )
+    args = _coerce_codex_control_tool_arguments(args, tools, command_name)
+    if not args:
+        return None, None
+    return command_name, args
+
+
+def _coerce_file_tool_to_command(raw_name, arguments, tools):
+    """Map common file-read hallucinations to the advertised shell tool.
+
+    Codex-shaped clients often expose only exec_command for filesystem reads.
+    MiniMax sometimes emits a convenience read_file/open_file/view_file tool
+    anyway. Returning that unknown name breaks strict clients, so convert it to
+    a small shell read when an exec-style tool is available.
+    """
+    if not isinstance(raw_name, str) or not isinstance(arguments, dict):
+        return None, None
+    compact_name = re.sub(r"[^a-z0-9]", "", raw_name.lower())
+    if compact_name not in {
+        "read",
+        "readfile",
+        "openfile",
+        "viewfile",
+        "catfile",
+        "showfile",
+        "view",
+    }:
+        return None, None
+    allowed = _tool_names_from_schema(tools)
+    name_map = _tool_name_map_from_schema(tools)
+    command_name = None
+    for candidate in (
+        "exec_command",
+        "invoke_command",
+        "run_command",
+        "execute_command",
+        "bash",
+        "shell",
+        "terminal",
+        "Bash",
+        "Shell",
+    ):
+        canonical = _canonical_tool_name(candidate, name_map)
+        if canonical in allowed:
+            command_name = canonical
+            break
+    if not command_name:
+        return None, None
+
+    path = None
+    for key in (
+        "path",
+        "file_path",
+        "filePath",
+        "filename",
+        "file",
+        "target",
+        "input",
+    ):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            path = value.strip()
+            break
+    if not path:
+        return None, None
+
+    start = arguments.get("start") or arguments.get("line") or arguments.get("from")
+    end = arguments.get("end") or arguments.get("limit") or arguments.get("to")
+    try:
+        start_i = max(1, int(start)) if start not in (None, "") else 1
+    except (TypeError, ValueError):
+        start_i = 1
+    try:
+        end_i = max(start_i, int(end)) if end not in (None, "") else start_i + 219
+    except (TypeError, ValueError):
+        end_i = start_i + 219
+    end_i = min(end_i, start_i + 499)
+
+    quoted = shlex.quote(path)
+    cmd = f"sed -n '{start_i},{end_i}p' {quoted}"
+    coerced = _canonicalize_tool_argument_keys(
+        {
+            "cmd": cmd,
+            "command": cmd,
+            "input": cmd,
+            "justification": f"Read {path}",
+        },
+        tools,
+        command_name,
+    )
+    if not coerced:
+        return None, None
+    return command_name, coerced
+
+
+def _command_tool_name_from_schema(tools):
+    allowed = _tool_names_from_schema(tools)
+    name_map = _tool_name_map_from_schema(tools)
+    for candidate in (
+        "exec_command",
+        "invoke_command",
+        "run_command",
+        "execute_command",
+        "bash",
+        "shell",
+        "terminal",
+        "Bash",
+        "Shell",
+    ):
+        canonical = _canonical_tool_name(candidate, name_map)
+        if canonical in allowed:
+            return canonical
+    return None
+
+
+def _last_user_text(processed_messages):
+    for message in reversed(processed_messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+    return ""
+
+
+def _extract_simple_write_request(text):
+    if not isinstance(text, str) or not text.strip():
+        return None
+    lowered = text.lower()
+    if not any(word in lowered for word in ("write", "create", "save")):
+        return None
+    if "containing exactly" not in lowered:
+        return None
+    content_match = re.search(
+        r"containing exactly\s+(.+?)(?:\s*,?\s+then\b|[.。]\s*$|$)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not content_match:
+        return None
+    window_start = max(0, content_match.start() - 500)
+    prefix_window = text[window_start:content_match.start()]
+    relative_matches = list(re.finditer(
+        r"\b(?:create|write|save)\s+(?:a\s+)?(?:simple\s+)?(?:text\s+)?"
+        r"(?:file\s+)?(?:named\s+|at\s+)?([A-Za-z0-9._~/-]+\.[A-Za-z0-9][A-Za-z0-9._-]*)",
+        prefix_window,
+        re.IGNORECASE,
+    ))
+    absolute_matches = list(re.finditer(r"(/[^\s'\"`;,<>]+)", prefix_window))
+    path_match = absolute_matches[-1] if absolute_matches else (relative_matches[-1] if relative_matches else None)
+    if not path_match:
+        return None
+    file_path = path_match.group(1).strip().strip("'\"`")
+    content = content_match.group(1).strip().strip("'\"`")
+    if content.endswith(".") and "\n" not in content:
+        content = content[:-1]
+    if not file_path or not content:
+        return None
+    return {"filename": file_path, "content": content}
+
+
+def _synthesize_write_command_tool_call(processed_messages, tools, dropped_tool_names=None):
+    dropped = {
+        re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+        for name in (dropped_tool_names or [])
+    }
+    if dropped and "applypatch" not in dropped:
+        return None
+    request = _extract_simple_write_request(_last_user_text(processed_messages))
+    if not request:
+        return None
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name:
+        return None
+    filename = request["filename"]
+    content = request["content"]
+    cmd = (
+        f"mkdir -p {shlex.quote(os.path.dirname(filename) or '.')} && "
+        f"printf %s {shlex.quote(content)} > {shlex.quote(filename)} && "
+        f"cat {shlex.quote(filename)}"
+    )
+    args = _canonicalize_tool_argument_keys(
+        {
+            "cmd": cmd,
+            "command": cmd,
+            "input": cmd,
+            "justification": f"Create {filename}",
+        },
+        tools,
+        command_name,
+    )
+    args = _coerce_codex_control_tool_arguments(args, tools, command_name)
+    if not args:
+        return None
+    return _openai_tool_call(command_name, args, 0)
+
+
+def _tool_retry_gen_params(gen_params, attempt):
+    """Sampling nudge for a tool retry; a temp-0 replay would be deterministic."""
+    retry = dict(gen_params or {})
+    temps = TOOL_UNUSABLE_RETRY_TEMPERATURES
+    temp = temps[min(max(attempt, 1), len(temps)) - 1]
+    try:
+        current = float(retry.get("temperature") or 0.0)
+    except (TypeError, ValueError):
+        current = 0.0
+    retry["temperature"] = max(temp, current)
+    retry.pop("seed", None)
+    return retry
+
+
+def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
+                      thinking_mode):
+    """True when a buffered tool-mode generation can be returned as-is.
+
+    Mirrors the response-path checks: a validated tool call, a synthesizable
+    simple write, or real visible content all count; empty/malformed tool
+    markup and leaked reasoning do not.
+    """
+    tool_calls, remaining_text = _parse_tool_calls(
+        full_output or "", tool_module, tools
+    )
+    if tool_calls:
+        validated, dropped, dropped_names = _validate_outgoing_tool_calls(
+            tool_calls,
+            tools,
+            return_dropped=True,
+            return_dropped_names=True,
+        )
+        if validated:
+            return True
+        if dropped and _synthesize_write_command_tool_call(
+            processed_messages,
+            tools,
+            dropped_names,
+        ):
+            return True
+        return False
+    safe_text = _strip_raw_tool_blocks(
+        remaining_text or full_output or "", tool_module
+    )
+    _, content = split_thinking_text(
+        safe_text,
+        assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
+    )
+    content = _scrub_goal_state_echo((content or "").strip())
+    return bool(content) and not _looks_like_leaked_reasoning_content(content)
+
+
+def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
+                             rank_request, prompt, max_tokens, thinking_mode,
+                             gen_params, image_path, token_ids, session_id,
+                             session_source, tool_module, tools,
+                             processed_messages, req_id, stream,
+                             should_abort=None, progress_cb=None):
+    """Regenerate an unusable tool turn in place instead of falling back.
+
+    MiniMax occasionally emits empty or malformed tool markup, especially in
+    thinking mode at long context. Tool-mode output is buffered, so a bounded
+    resample at a nudged temperature is invisible to the client and keeps
+    Codex/Claude Code agent loops alive; the prose fallback would be treated
+    as a final answer and end a long-running goal. Each retry re-broadcasts a
+    normal generation request, so rank 1 mirrors it like any client retry.
+    """
+    if not (TOOL_COMPAT_OVERLAY and tools and tool_module is not None):
+        return full_output
+    if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
+        return full_output
+    if _usable_tool_turn(full_output, tool_module, tools, processed_messages,
+                         thinking_mode):
+        return full_output
+    label = "stream" if stream else "non-stream"
+    ceiling = MAX_TOKENS_CEILING if MAX_TOKENS_CEILING > 0 else 16384
+    retry_max_tokens = min(ceiling, max(int(max_tokens or 0), 2048) * 2)
+    if TOOL_UNUSABLE_RETRY_MAX_TOKENS > 0:
+        retry_max_tokens = min(retry_max_tokens, TOOL_UNUSABLE_RETRY_MAX_TOKENS)
+    for attempt in range(1, TOOL_UNUSABLE_RETRY_ATTEMPTS + 1):
+        if should_abort and should_abort():
+            return full_output
+        retry_params = _tool_retry_gen_params(gen_params, attempt)
+        snippet = re.sub(r"\s+", " ", full_output or "")
+        logger.warning(
+            "[rank 0] %s %s produced an unusable tool turn; retry %d/%d "
+            "(temperature=%s, max_tokens=%s, raw_head=%r, raw_tail=%r)",
+            label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            retry_params.get("temperature"), retry_max_tokens,
+            snippet[:200], snippet[-160:],
+        )
+        retry_request = dict(rank_request)
+        retry_request["gen_params"] = retry_params
+        retry_request["max_tokens"] = retry_max_tokens
+        _clear_stop_request()
+        _clear_prefill_stop_file("rank 0 tool retry")
+        _bcast(retry_request, rank)
+        try:
+            full_output = run_generation(
+                model, processor, prompt, retry_max_tokens, rank,
+                image=image_path, thinking_mode=thinking_mode,
+                gen_params=retry_params, progress_cb=progress_cb,
+                token_ids=token_ids,
+                session_id=session_id, session_source=session_source,
+                reset_incomplete_thinking_on_limit=False,
+                tool_module=tool_module, tools=tools,
+            )
+        except Exception as e:
+            logger.error(
+                "[rank 0] %s %s tool retry %d failed: %s",
+                label, req_id, attempt, e,
+            )
+            return full_output
+        if _usable_tool_turn(full_output, tool_module, tools,
+                             processed_messages, thinking_mode):
+            logger.warning(
+                "[rank 0] %s %s tool retry %d/%d recovered a usable tool turn",
+                label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            )
+            return full_output
+    snippet = re.sub(r"\s+", " ", full_output or "")
+    logger.warning(
+        "[rank 0] %s %s tool turn still unusable after %d retries; "
+        "sending compatibility fallback (raw_head=%r, raw_tail=%r)",
+        label, req_id, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        snippet[:200], snippet[-160:],
+    )
+    return full_output
+
+
+def _validate_outgoing_tool_calls(
+    tool_calls,
+    tools,
+    *,
+    return_dropped=False,
+    return_dropped_names=False,
+):
+    """Return OpenAI tool_calls that match the submitted schema exactly.
+
+    The MiniMax parser and recovery paths can infer aliases such as
+    `invoke_command`, `cmd`, or `shell`. Some agent shims are stricter than
+    OpenAI here and stop if the returned function name is not byte-for-byte one
+    of the names they advertised. Canonicalize once at the boundary.
+    """
+    if not tool_calls:
+        if return_dropped and return_dropped_names:
+            return [], 0, []
+        return ([], 0) if return_dropped else []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    validated = []
+    dropped = 0
+    dropped_names = []
+    for index, call in enumerate(tool_calls):
+        if not isinstance(call, dict):
+            dropped += 1
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+        raw_name = fn.get("name") or call.get("name") or call.get("tool")
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                decoded = json.loads(arguments) if arguments.strip() else {}
+            except json.JSONDecodeError:
+                decoded = {"input": arguments}
+        elif isinstance(arguments, dict):
+            decoded = arguments
+        else:
+            decoded = {}
+
+        if not TOOL_COMPAT_OVERLAY:
+            name = raw_name if isinstance(raw_name, str) else ""
+            if not name or (allowed and name not in allowed):
+                logger.warning("dropping outgoing tool call with unknown name=%r", raw_name)
+                dropped += 1
+                if raw_name:
+                    dropped_names.append(str(raw_name))
+                continue
+            if not isinstance(decoded, dict):
+                decoded = {}
+            decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
+            decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+            required = _tool_schema_required_names(tools, name)
+            missing_required = [
+                key for key in required
+                if key not in decoded or decoded.get(key) in (None, "")
+            ]
+            if missing_required:
+                logger.warning(
+                    "dropping outgoing %s tool call missing required arguments=%s",
+                    name,
+                    missing_required,
+                )
+                dropped += 1
+                if name:
+                    dropped_names.append(str(name))
+                continue
+            if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
+                logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
+                dropped += 1
+                dropped_names.append(str(name))
+                continue
+            validated.append({
+                "type": "function",
+                "index": index,
+                "id": call.get("id") or str(uuid.uuid4()),
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(decoded, ensure_ascii=False),
+                },
+            })
+            continue
+
+        name = _canonical_tool_name(raw_name, name_map)
+        if not name or (allowed and name not in allowed):
+            coerced_name, coerced_args = _coerce_file_tool_to_command(
+                raw_name,
+                decoded,
+                tools,
+            )
+            if not (coerced_name and coerced_args) and _is_apply_patch_tool_name(raw_name):
+                # apply_patch may be hidden from the schema on purpose; keep
+                # honoring add-file intents by rewriting them as shell writes.
+                coerced_name, coerced_args = _exec_write_from_malformed_patch(
+                    decoded,
+                    tools,
+                )
+            if coerced_name and coerced_args:
+                logger.warning(
+                    "coerced outgoing %s tool call to %s",
+                    raw_name,
+                    coerced_name,
+                )
+                name = coerced_name
+                decoded = coerced_args
+            else:
+                logger.warning("dropping outgoing tool call with unknown name=%r", raw_name)
+                dropped += 1
+                if raw_name:
+                    dropped_names.append(str(raw_name))
+                continue
+        decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
+        decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+        if not decoded and _tool_schema_expects_arguments(tools, name):
+            logger.warning("dropping outgoing %s tool call with empty arguments", name)
+            dropped += 1
+            if name:
+                dropped_names.append(str(name))
+            continue
+        required = _tool_schema_required_names(tools, name)
+        missing_required = [
+            key for key in required
+            if key not in decoded or decoded.get(key) in (None, "")
+        ]
+        if missing_required:
+            logger.warning(
+                "dropping outgoing %s tool call missing required arguments=%s",
+                name,
+                missing_required,
+            )
+            dropped += 1
+            if name:
+                dropped_names.append(str(name))
+            continue
+        if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
+            coerced_name, coerced_args = _exec_write_from_malformed_patch(decoded, tools)
+            if coerced_name and coerced_args:
+                logger.warning(
+                    "coerced malformed apply_patch add-file payload into %s write",
+                    coerced_name,
+                )
+                validated.append({
+                    "type": "function",
+                    "index": index,
+                    "id": call.get("id") or str(uuid.uuid4()),
+                    "function": {
+                        "name": coerced_name,
+                        "arguments": json.dumps(coerced_args, ensure_ascii=False),
+                    },
+                })
+                continue
+            logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
+            dropped += 1
+            dropped_names.append(str(name))
+            continue
+        validated.append({
+            "type": "function",
+            "index": index,
+            "id": call.get("id") or str(uuid.uuid4()),
+            "function": {
+                "name": name,
+                "arguments": json.dumps(decoded, ensure_ascii=False),
+            },
+        })
+    if return_dropped and return_dropped_names:
+        return validated, dropped, dropped_names
+    return (validated, dropped) if return_dropped else validated
+
+
+def _tool_call_names(tool_calls):
+    names = []
+    for call in tool_calls or []:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if isinstance(fn, dict):
+            names.append(str(fn.get("name") or ""))
+    return [name for name in names if name]
+
+
+def _tool_call_arg_keys(tool_calls):
+    keys = []
+    for call in tool_calls or []:
+        fn = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(fn, dict):
+            keys.append([])
+            continue
+        args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except json.JSONDecodeError:
+                args = {}
+        keys.append(sorted(args.keys()) if isinstance(args, dict) else [])
+    return keys
+
+
+def _sanitize_inbound_tool_call_content(message, content_text):
+    if isinstance(message, dict) and message.get("tool_calls"):
+        return ""
+    return content_text
+
+
+def _tool_call_blocks(text, tool_module):
+    start, end = _tool_call_markers(tool_module)
+    if not text or not start:
+        return []
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if start not in text:
+        if ns_token and _looks_like_raw_tool_fragment(text, tool_module):
+            return [text[text.find(ns_token):]]
+        return []
+    if end:
+        pattern = re.compile(
+            f"{re.escape(start)}(?P<body>.*?){re.escape(end)}",
+            flags=re.DOTALL,
+        )
+        blocks = [m.group("body") for m in pattern.finditer(text)]
+        if blocks:
+            return blocks
+        # Agent-shaped MiniMax outputs sometimes close the inner <invoke> but
+        # omit </tool_call>. Inspect the trailing block only after the explicit
+        # start marker so normal prose is not treated as a tool.
+        start_pos = text.find(start)
+        if start_pos >= 0:
+            return [text[start_pos + len(start):]]
+        return []
+    pattern = re.compile(f"{re.escape(start)}(?P<body>.*?)(?:\n|$)", re.DOTALL)
+    return [m.group("body") for m in pattern.finditer(text)]
+
+
+def _clean_loose_tool_segment(segment):
+    segment = (segment or "").strip()
+    if not segment:
+        return ""
+    if re.fullmatch(r"[\[\]>\s]*", segment):
+        return ""
+    if (
+        len(segment) >= 2
+        and segment.startswith("[")
+        and segment.endswith("]")
+        and not segment.startswith("[Tool call:")
+    ):
+        segment = segment[1:-1].strip()
+        if not segment or re.fullmatch(r"[\[\]>\s]*", segment):
+            return ""
+    if segment.startswith("</"):
+        return ""
+    segment = re.sub(r"^<(?P<tag>[A-Za-z_$][\w:.$-]*)(?:\s[^>]*)?>", "", segment).strip()
+    segment = re.sub(r"</(?P<tag>[A-Za-z_$][\w:.$-]*)>$", "", segment).strip()
+    if re.fullmatch(r"[\[\]>\s]*", segment):
+        return ""
+    return segment
+
+
+def _loose_tool_segments(body, ns_token):
+    if not body or not ns_token:
+        return []
+    segments = []
+    for part in body.split(ns_token):
+        cleaned = _clean_loose_tool_segment(part)
+        if cleaned and not cleaned.startswith("<"):
+            segments.append(cleaned)
+    return segments
+
+
+def _looks_like_shell_command(value):
+    text = (value or "").strip()
+    if not text:
+        return False
+    first = text.split(maxsplit=1)[0]
+    commands = {
+        "ls", "pwd", "cat", "rg", "grep", "find", "git", "python",
+        "python3", "node", "npm", "pnpm", "yarn", "uv", "pytest",
+        "sed", "awk", "curl", "mkdir", "touch", "cp", "mv", "rm",
+    }
+    return (
+        first in commands
+        or text.startswith(("./", "../", "/", "~"))
+        or ("/" in text and (" " in text or '"' in text or "'" in text))
+    )
+
+
+def _normalize_loose_shell_command(cmd):
+    text = (cmd or "").strip()
+    if not text:
+        return ""
+    # MiniMax occasionally emits typographic dashes in bare command fragments.
+    # Keep this narrow: only normalize a dash immediately before an option word.
+    text = re.sub(r"(?<=\s)[\u2010-\u2015](?=[A-Za-z])", "--", text)
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    return text
+
+
+def _loose_shell_command_is_complete(cmd):
+    text = _normalize_loose_shell_command(cmd)
+    if not text:
+        return False
+    if re.search(r"(?:&&|\|\||\||;|\\)\s*$", text):
+        return False
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    first = os.path.basename(parts[0])
+    if first in {"python", "python3"} and "-c" in parts:
+        idx = parts.index("-c")
+        if idx + 1 >= len(parts):
+            return False
+        code = parts[idx + 1].strip()
+        # A truncated Python -c body such as "import" or "from" is almost
+        # always a partial MiniMax tool fragment, not an executable intent.
+        if code in {"import", "from", "print", "def", "class", "with", "for", "if"}:
+            return False
+    return True
+
+
+_NS_ARG_TAG_RE = re.compile(r"<(?P<close>/)?(?P<tag>[A-Za-z_$][\w:.$-]*)\s*>")
+
+
+def _arguments_from_ns_arg_tags(raw_body, ns_token, tools, name):
+    """Drift-tolerant extractor for MiniMax-M3 direct arg tags.
+
+    Well-formed wire format: every STRUCTURAL tag is ns-prefixed
+    (ns<path>value ns</path>); anything not behind the ns token — bare HTML,
+    JSX, generics — is value content by contract. The stock parser enforces
+    this strictly, so a drifted block (bare closer, missing closer) lands in
+    the repair chain, whose _normalize_body rewrite ns-prefixes tags INSIDE
+    values and shreds markup payloads (2026-07-06 audit, SEV-3). This
+    extractor splits on the ns token instead: values round-trip byte-exact,
+    the only repairs are stripping a bare same-name closer off a value tail
+    and closing a dangling arg at block end.
+    """
+    if not raw_body or ns_token not in raw_body:
+        return None
+    props = _tool_schema_property_names(tools, name)
+    if not props:
+        return None
+    args = {}
+    current = None
+    parts = []
+
+    def _finish():
+        val = "".join(parts)
+        stripped_tail = val.rstrip()
+        bare_close = f"</{current}>"
+        if stripped_tail.endswith(bare_close):
+            val = stripped_tail[: -len(bare_close)]
+        return val.strip()
+
+    for i, segment in enumerate(raw_body.split(ns_token)):
+        m = _NS_ARG_TAG_RE.match(segment) if segment else None
+        if m and not m.group("close") and m.group("tag") not in ("invoke", "tool_call"):
+            if current is not None:
+                args[current] = _finish()
+            current = m.group("tag")
+            parts = [segment[m.end():]]
+        elif m and m.group("close"):
+            if current is not None and m.group("tag") in (current, "invoke", "tool_call"):
+                args[current] = _finish()
+                current = None
+                parts = []
+            elif current is not None:
+                # bare closer for something else mid-value: content
+                parts.append(ns_token + segment)
+        else:
+            if current is not None:
+                # literal ns token inside a value — restore it verbatim
+                parts.append(ns_token + segment)
+            # else: preamble/whitespace between args — drift noise
+    if current is not None:
+        args[current] = _finish()
+    if not args:
+        return None
+    # Only accept when the extracted keys look like this tool's schema —
+    # this is a repair path, not a place to invent arguments.
+    lower_props = {p.lower() for p in props}
+    matched = sum(1 for k in args if k.lower() in lower_props)
+    if not matched or matched < len(args) / 2:
+        return None
+    return args
+
+
+def _arguments_from_loose_segments(body, ns_token, tools, name):
+    segments = _loose_tool_segments(body, ns_token)
+    if not segments:
+        return None
+    props = _tool_schema_property_names(tools, name)
+    required = _tool_schema_required_names(tools, name)
+    lower_props = {p.lower(): p for p in props}
+
+    command_prop = next(
+        (
+            lower_props[prop]
+            for prop in ("command", "cmd", "input")
+            if prop in lower_props
+        ),
+        None,
+    )
+    if name and command_prop and (
+        name.lower() in {"bash", "shell"}
+        or _canonical_tool_name(name, _tool_name_map_from_schema(tools)) == name
+    ):
+        command_idx = None
+        for i, segment in enumerate(segments):
+            if _looks_like_shell_command(segment):
+                command_idx = i
+                break
+        if command_idx is None:
+            command_idx = len(segments) - 1
+        command = _normalize_loose_shell_command(segments[command_idx])
+        if not _loose_shell_command_is_complete(command):
+            return None
+        args = {command_prop: command}
+        if "description" in lower_props:
+            desc = next((s for i, s in enumerate(segments) if i != command_idx), "")
+            if desc:
+                args[lower_props["description"]] = desc
+        if "justification" in lower_props:
+            desc = next((s for i, s in enumerate(segments) if i != command_idx), "")
+            if desc:
+                args[lower_props["justification"]] = desc
+        if not args.get(command_prop):
+            return None
+        return args
+
+    ordered = []
+    for field in required + props:
+        if field not in ordered:
+            ordered.append(field)
+    if not ordered:
+        return {"input": segments[0]} if len(segments) == 1 else {"items": segments}
+    args = {}
+    for field, value in zip(ordered, segments):
+        args[field] = value
+    if any(not args.get(field) for field in required):
+        return None
+    return args
+
+
+def _json_balanced_end(text, start):
+    if start < 0 or start >= len(text) or text[start] not in "{[":
+        return -1
+    stack = [text[start]]
+    in_string = False
+    escape = False
+    pairs = {"{": "}", "[": "]"}
+    for i in range(start + 1, len(text)):
+        ch = text[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch in "{[":
+            stack.append(ch)
+            continue
+        if ch in "}]":
+            if not stack or pairs.get(stack[-1]) != ch:
+                return -1
+            stack.pop()
+            if not stack:
+                return i + 1
+    return -1
+
+
+def _loads_json_string_fragment(fragment):
+    try:
+        return json.loads(f'"{fragment}"')
+    except Exception:
+        return fragment.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def _coerce_tool_arguments(arguments):
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            decoded = json.loads(arguments)
+            if isinstance(decoded, dict):
+                return decoded
+        except json.JSONDecodeError:
+            return {"input": arguments}
+    return {}
+
+
+def _tool_call_from_json_object(obj, tools, name_map, index):
+    if not isinstance(obj, dict):
+        return None
+    raw_name = obj.get("name") or obj.get("tool") or obj.get("function")
+    if isinstance(raw_name, dict):
+        raw_name = raw_name.get("name")
+    name = _canonical_tool_name(raw_name, name_map)
+    allowed = set(name_map.values())
+    if not name or (allowed and name not in allowed):
+        return None
+    arguments = (
+        obj.get("arguments")
+        if "arguments" in obj
+        else obj.get("args", obj.get("parameters", {}))
+    )
+    arguments = _coerce_tool_arguments(arguments)
+    if not arguments and _tool_schema_expects_arguments(tools, name):
+        return None
+    return _openai_tool_call(name, arguments, index)
+
+
+def _split_pseudo_tool_args(arg_text):
+    """Parse Codex-style pseudo tool args: key: "value", count=3.
+
+    This intentionally accepts only simple literal values inside the explicit
+    <<< ... >>> wrapper. It is a compatibility bridge for agent shims that put
+    a pseudo call in the assistant text before MiniMax's XML block.
+    """
+    args = {}
+    if not isinstance(arg_text, str) or not arg_text.strip():
+        return args
+    pair_re = re.compile(
+        r"""
+        (?P<key>[A-Za-z_][\w-]*)\s*[:=]\s*
+        (?:
+            (?P<quote>["'])(?P<quoted>(?:\\.|(?!\2).)*)(?P=quote)
+            |
+            (?P<bare>[^,\s)]+)
+        )
+        """,
+        flags=re.DOTALL | re.VERBOSE,
+    )
+    for match in pair_re.finditer(arg_text):
+        key = match.group("key")
+        if match.group("quote"):
+            value = _loads_json_string_fragment(match.group("quoted") or "")
+        else:
+            raw = (match.group("bare") or "").strip()
+            if re.fullmatch(r"-?\d+", raw):
+                try:
+                    value = int(raw)
+                except ValueError:
+                    value = raw
+            elif re.fullmatch(r"-?\d+\.\d+", raw):
+                try:
+                    value = float(raw)
+                except ValueError:
+                    value = raw
+            elif raw.lower() in {"true", "false"}:
+                value = raw.lower() == "true"
+            else:
+                value = raw
+        args[key] = value
+    return args
+
+
+def _recover_codex_pseudo_tool_calls(text, tools):
+    """Recover explicit Codex pseudo calls such as <<< $g=create_goal(...) >>>."""
+    if not text:
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    if not allowed:
+        return []
+    pseudo_re = re.compile(
+        r"""
+        <<<\s*
+        (?:\$?[A-Za-z_][\w-]*\s*=\s*)?
+        (?P<name>[A-Za-z_][\w:.-]*)\s*
+        \((?P<args>.*?)\)
+        \s*;?\s*>>>
+        """,
+        flags=re.DOTALL | re.VERBOSE,
+    )
+    calls = []
+    for match in pseudo_re.finditer(text):
+        name = _canonical_tool_name(match.group("name"), name_map)
+        if not name or (allowed and name not in allowed):
+            continue
+        args = _split_pseudo_tool_args(match.group("args"))
+        args = _canonicalize_tool_argument_keys(args, tools, name)
+        if not args and _tool_schema_expects_arguments(tools, name):
+            continue
+        calls.append(_openai_tool_call(name, args, len(calls)))
+    if calls:
+        logger.warning("recovered %d Codex pseudo tool call(s)", len(calls))
+    return calls
+
+
+def _recover_display_tool_calls(text, tools):
+    """Recover display-style tool calls: [Tool call: exec]\n{"cmd": "..."}."""
+    if not isinstance(text, str) or "[Tool call:" not in text:
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    if not allowed:
+        return []
+    call_re = re.compile(
+        r"""\[Tool call:\s*(?P<name>[A-Za-z_][\w:.-]*)\s*\]""",
+        flags=re.IGNORECASE,
+    )
+    calls = []
+    pos = 0
+    while True:
+        match = call_re.search(text, pos)
+        if not match:
+            break
+        raw_name = match.group("name")
+        if raw_name.lower() == "exec":
+            raw_name = "exec_command"
+        name = _canonical_tool_name(raw_name, name_map)
+        if not name or (allowed and name not in allowed):
+            pos = match.end()
+            continue
+        arg_start = match.end()
+        while arg_start < len(text) and text[arg_start].isspace():
+            arg_start += 1
+        # MiniMax often emits the namespace marker before the display line.
+        if text.startswith("]<]minimax[>[", arg_start):
+            arg_start += len("]<]minimax[>[")
+            while arg_start < len(text) and text[arg_start].isspace():
+                arg_start += 1
+        args = {}
+        has_json_args = False
+        if arg_start < len(text) and text[arg_start] == "{":
+            arg_end = _json_balanced_end(text, arg_start)
+            if arg_end > arg_start:
+                try:
+                    decoded = json.loads(text[arg_start:arg_end])
+                    if isinstance(decoded, dict):
+                        args = decoded
+                        has_json_args = True
+                except json.JSONDecodeError:
+                    args = {}
+                pos = arg_end
+            else:
+                pos = match.end()
+        else:
+            pos = match.end()
+        # 2026-07-06 audit: without the args JSON, "[Tool call: name]" is
+        # indistinguishable from prose mentioning a call (docs, log quotes).
+        # Recovering it manufactured executions for zero-arg tools.
+        if not has_json_args:
+            continue
+        args = _canonicalize_tool_argument_keys(args, tools, name)
+        if not args and _tool_schema_expects_arguments(tools, name):
+            continue
+        calls.append(_openai_tool_call(name, args, len(calls)))
+    if calls:
+        logger.warning("recovered %d display-style tool call(s)", len(calls))
+    return calls
+
+
+def _looks_like_codex_pseudo_tool_call(text):
+    return bool(
+        isinstance(text, str)
+        and "<<<" in text
+        and ">>>" in text
+        and re.search(r"<<<\s*(?:\$?\w+\s*=\s*)?\w+\s*\(", text)
+    )
+
+
+def _recover_jsonish_tool_calls(text, tool_module, tools):
+    """Recover common MiniMax/ZCode JSON-ish tool calls after official parse fails.
+
+    MiniMax occasionally emits blocks like:
+      {"name": "Bash", {"description": "...", "input": "..."}}
+    inside its tool marker. That is not valid JSON/XML, but the intended OpenAI
+    function call is clear. Repair only this narrow shape and only for declared
+    tools, leaving normal MiniMax XML invocations to the upstream parser.
+    """
+    if not text or tool_module is None:
+        return []
+    blocks = _tool_call_blocks(text, tool_module)
+    if not blocks:
+        return []
+
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    calls = []
+    name_re = re.compile(r'\{\s*"name"\s*:\s*"(?P<name>(?:\\.|[^"])*)"\s*,', re.DOTALL)
+    for block in blocks:
+        pos = 0
+        while True:
+            obj_start = block.find("{", pos)
+            if obj_start < 0:
+                break
+            obj_end = _json_balanced_end(block, obj_start)
+            if obj_end <= obj_start:
+                pos = obj_start + 1
+                continue
+            try:
+                obj = json.loads(block[obj_start:obj_end])
+            except json.JSONDecodeError:
+                pos = obj_start + 1
+                continue
+            call = _tool_call_from_json_object(obj, tools, name_map, len(calls))
+            if call is not None:
+                calls.append(call)
+            pos = obj_end
+        pos = 0
+        while True:
+            match = name_re.search(block, pos)
+            if not match:
+                break
+            raw_name = _loads_json_string_fragment(match.group("name")).strip()
+            name = _canonical_tool_name(raw_name, name_map)
+            if allowed and name not in allowed:
+                pos = match.end()
+                continue
+            arg_start = match.end()
+            while arg_start < len(block) and block[arg_start].isspace():
+                arg_start += 1
+            # Most observed bad calls put the argument object directly after
+            # the comma. Also accept {"arguments": {...}} if the model drifts.
+            arguments = None
+            if arg_start < len(block) and block[arg_start] == "{":
+                arg_end = _json_balanced_end(block, arg_start)
+                if arg_end > arg_start:
+                    try:
+                        arguments = json.loads(block[arg_start:arg_end])
+                    except json.JSONDecodeError:
+                        arguments = None
+                    pos = arg_end
+                else:
+                    pos = match.end()
+            else:
+                pos = match.end()
+            if isinstance(arguments, dict) and set(arguments) == {"arguments"}:
+                inner = arguments.get("arguments")
+                arguments = inner if isinstance(inner, dict) else arguments
+            if not isinstance(arguments, dict):
+                continue
+            if not arguments and _tool_schema_expects_arguments(tools, name):
+                continue
+            calls.append(_openai_tool_call(name, arguments, len(calls)))
+    if calls:
+        logger.warning("recovered %d malformed JSON-ish tool call(s)", len(calls))
+    return calls
+
+
+def _recover_loose_segment_tool_calls(text, tool_module, tools):
+    """Recover nameless MiniMax tool blocks made only of bracket fragments.
+
+    Observed shape from Codex/ZCode-style requests:
+      ]<]minimax[>[<tool_call>
+      ]<]minimax[>[]<]minimax[>[python3 -version]
+      ]<]minimax[>[]<]minimax[>[Run project check]
+      ]<]minimax[>[</tool_call>
+
+    There is no invoke tag or JSON object to parse, but if the fragments contain
+    a shell command and the client advertised exactly a command-like tool, we can
+    safely reconstruct the OpenAI tool call instead of leaking raw markup.
+    """
+    if not text or tool_module is None:
+        return []
+    blocks = _tool_call_blocks(text, tool_module)
+    if not blocks:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token:
+        return []
+
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    command_name = None
+    for candidate in (
+        "exec_command",
+        "invoke_command",
+        "run_command",
+        "execute_command",
+        "Bash",
+        "bash",
+        "Shell",
+        "shell",
+        "terminal",
+    ):
+        canonical = _canonical_tool_name(candidate, name_map)
+        if canonical in allowed:
+            command_name = canonical
+            break
+    if not command_name:
+        return []
+
+    calls = []
+    for block in blocks:
+        if re.search(r"<\s*(?:invoke|[A-Za-z_$][\w:.$-]+)\b", block) or "{" in block:
+            continue
+        segments = _loose_tool_segments(block, ns_token)
+        if not segments:
+            continue
+        command_idx = next(
+            (i for i, segment in enumerate(segments) if _looks_like_shell_command(segment)),
+            None,
+        )
+        if command_idx is None:
+            continue
+        args = _arguments_from_loose_segments(block, ns_token, tools, command_name)
+        if args is None:
+            continue
+        args = _canonicalize_tool_argument_keys(args, tools, command_name)
+        if not args and _tool_schema_expects_arguments(tools, command_name):
+            continue
+        calls.append(_openai_tool_call(command_name, args, len(calls)))
+    if calls:
+        logger.warning("recovered %d loose-segment MiniMax tool call(s)", len(calls))
+    return calls
+
+
+def _recover_malformed_xml_tool_calls(text, tool_module, tools):
+    """Repair narrow MiniMax XML attr drift, e.g. <invoke name Bash">.
+
+    This intentionally refuses empty argument calls for tools whose schema
+    declares parameters; sending an empty Bash/Read call is worse than dropping
+    a malformed block and asking the model/client to continue.
+    """
+    if not text or tool_module is None:
+        return []
+    blocks = _tool_call_blocks(text, tool_module)
+    if not blocks:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token:
+        return []
+
+    def _normalize_body(body):
+        # MiniMax's parser expects the namespace marker before both opening and
+        # closing tags. Some agent runs have produced bare closing tags inside
+        # an otherwise MiniMax-shaped block, e.g. <command>ls</command>.
+        if not body:
+            return body
+        tag = r"[A-Za-z_$][\w:.$-]*"
+        body = re.sub(
+            rf"(?<!{re.escape(ns_token)})</(?P<tag>{tag})>",
+            rf"{ns_token}</\g<tag>>",
+            body,
+        )
+        body = re.sub(
+            rf"(?<!{re.escape(ns_token)})<(?P<tag>{tag})(?P<attrs>[^>/]*)>",
+            rf"{ns_token}<\g<tag>\g<attrs>>",
+            body,
+        )
+        return body
+
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    invoke_re = re.compile(
+        rf"{re.escape(ns_token)}\s*<?invoke\b(?P<attrs>[^>]*)>"
+        rf"(?P<body>.*?){re.escape(ns_token)}</invoke>",
+        flags=re.DOTALL,
+    )
+    loose_invoke_re = re.compile(
+        rf"{re.escape(ns_token)}\s*<?invoke\b(?P<attrs>[^>]*)>"
+        rf"(?P<body>.*?)(?:{re.escape(ns_token)}</tool_call>|$)",
+        flags=re.DOTALL,
+    )
+    named_tag_invoke_re = re.compile(
+        rf"{re.escape(ns_token)}\s*<(?P<tag>[A-Za-z_$][\w:.$-]*)(?P<attrs>[^>]*)>"
+        rf"(?P<body>.*?){re.escape(ns_token)}</invoke>",
+        flags=re.DOTALL,
+    )
+    name_attr_re = re.compile(
+        r"""\bname\s*=\s*(?:(["'])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))""",
+        flags=re.DOTALL,
+    )
+    broken_name_re = re.compile(
+        r"""\bname\s+(?P<name>[A-Za-z_$][\w:.$-]*)(?:"|')?""",
+        flags=re.DOTALL,
+    )
+    positional_name_re = re.compile(
+        r"""^\s*(?P<name>[A-Za-z_$][\w:.$-]*)\s*$""",
+        flags=re.DOTALL,
+    )
+    calls = []
+    for block in blocks:
+        matches = list(invoke_re.finditer(block))
+        if not matches:
+            matches = list(loose_invoke_re.finditer(block))
+        if not matches:
+            matches = list(named_tag_invoke_re.finditer(block))
+        for match in matches:
+            attrs = match.group("attrs") or ""
+            tag_name = match.groupdict().get("tag")
+            name_match = name_attr_re.search(attrs)
+            raw_name = (
+                (name_match.group("quoted") or name_match.group("bare"))
+                if name_match else None
+            )
+            if not raw_name and tag_name and tag_name not in {"invoke", "tool_call"}:
+                raw_name = tag_name.strip().strip("\"'")
+            if not raw_name:
+                broken = broken_name_re.search(attrs)
+                raw_name = broken.group("name") if broken else None
+            if not raw_name:
+                # Some MiniMax/Hermes tool turns drift from
+                # <invoke name="execute_search"> to <invoke execute_search>.
+                # Treat a lone positional attr as the function name, but still
+                # validate it against the declared OpenAI tool schema below.
+                positional = positional_name_re.match(attrs or "")
+                raw_name = positional.group("name") if positional else None
+            name = _canonical_tool_name(raw_name, name_map)
+            if not name or (allowed and name not in allowed):
+                name = _infer_tool_name_from_body(attrs, match.group("body"), tools, name_map)
+            if allowed and name not in allowed:
+                continue
+            raw_body = match.group("body") or ""
+            # Payload-safe fast path: when the body carries one balanced JSON
+            # object, take it verbatim. The repair chain below rewrites tags
+            # (_normalize_body) and slices on tag-like boundaries
+            # (loose segments) — both corrupt markup-bearing code payloads
+            # (HTML/JSX inside JSON string values): the 2026-07-06
+            # shredded-single-file-game bug. JSON is opaque to markup; if it
+            # parses whole, no repair is needed or wanted.
+            _js = raw_body.find("{")
+            if _js >= 0:
+                _je = _json_balanced_end(raw_body, _js)
+                if _je > _js:
+                    try:
+                        _obj = json.loads(raw_body[_js:_je])
+                    except json.JSONDecodeError:
+                        _obj = None
+                    if isinstance(_obj, dict) and _obj:
+                        _obj = _canonicalize_tool_argument_keys(_obj, tools, name)
+                        if _obj or not _tool_schema_expects_arguments(tools, name):
+                            calls.append(_openai_tool_call(
+                                name,
+                                json.dumps(_obj, ensure_ascii=False),
+                                len(calls),
+                            ))
+                            continue
+            # XML-args fast paths (2026-07-06 audit): _normalize_body
+            # prefixes EVERY tag with the namespace token — including markup
+            # INSIDE argument values — the same corruption class as the
+            # shredded-JSON bug, for XML-style arg encodings. Repair ladder:
+            #   1. parse the un-rewritten body (well-formed loose blocks);
+            #   2. ns-segment extractor (drifted blocks, values verbatim);
+            #   3. only then the rewriting chain below.
+            parsed_items = None
+            raw_fixed = (
+                f'{ns_token}<invoke name="{name}">'
+                f'{raw_body}{ns_token}</invoke>'
+            )
+            try:
+                parsed = tool_module.parse_tool_call(raw_fixed, tools)
+                parsed_items = parsed if isinstance(parsed, list) else [parsed]
+            except Exception:
+                parsed_items = None
+            if not parsed_items:
+                ns_args = _arguments_from_ns_arg_tags(
+                    raw_body, ns_token, tools, name
+                )
+                if ns_args:
+                    ns_args = _canonicalize_tool_argument_keys(ns_args, tools, name)
+                    if ns_args or not _tool_schema_expects_arguments(tools, name):
+                        parsed_items = [{
+                            "name": name,
+                            "arguments": json.dumps(ns_args, ensure_ascii=False),
+                        }]
+            if not parsed_items:
+                body = _normalize_body(match.group("body"))
+                fixed = (
+                    f'{ns_token}<invoke name="{name}">'
+                    f'{body}{ns_token}</invoke>'
+                )
+                try:
+                    parsed = tool_module.parse_tool_call(fixed, tools)
+                    parsed_items = parsed if isinstance(parsed, list) else [parsed]
+                except Exception:
+                    args = _arguments_from_loose_segments(body, ns_token, tools, name)
+                    if args is None:
+                        continue
+                    parsed_items = [{"name": name, "arguments": json.dumps(args, ensure_ascii=False)}]
+            for item in parsed_items:
+                if not isinstance(item, dict):
+                    continue
+                item_name = _canonical_tool_name(item.get("name"), name_map) or name
+                if allowed and item_name not in allowed:
+                    continue
+                args = item.get("arguments", {})
+                arg_obj = None
+                if isinstance(args, str):
+                    try:
+                        arg_obj = json.loads(args)
+                    except json.JSONDecodeError:
+                        arg_obj = None
+                elif isinstance(args, dict):
+                    arg_obj = args
+                if isinstance(arg_obj, dict) and not arg_obj and _tool_schema_expects_arguments(tools, item_name):
+                    loose_args = _arguments_from_loose_segments(body, ns_token, tools, item_name)
+                    if loose_args is None:
+                        continue
+                    args = json.dumps(loose_args, ensure_ascii=False)
+                calls.append(_openai_tool_call(item_name, args, len(calls)))
+    if calls:
+        logger.warning("recovered %d malformed MiniMax XML tool call(s)", len(calls))
+    return calls
+
+
+def _parse_tool_calls(text, tool_module, tools):
+    if not text or tool_module is None:
+        return [], text
+    start, _ = _tool_call_markers(tool_module)
+    try:
+        from mlx_vlm.server.responses_state import process_tool_calls
+
+        parsed = process_tool_calls(text, tool_module, tools)
+        calls = parsed.get("calls") or []
+        remaining = parsed.get("remaining_text") or ""
+        if calls:
+            return calls, remaining
+        if not TOOL_COMPAT_OVERLAY:
+            if start and start in text:
+                logger.warning(
+                    "native tool marker was generated but no valid OpenAI "
+                    "tool_calls were parsed; stripping raw tool markup"
+                )
+                return [], _strip_raw_tool_blocks(text, tool_module)
+            return [], remaining or text
+        if (
+            (start and start in text)
+            or _looks_like_raw_tool_fragment(text, tool_module)
+            or _looks_like_codex_pseudo_tool_call(text)
+            or "[Tool call:" in text
+        ):
+            recovered = _recover_jsonish_tool_calls(text, tool_module, tools)
+            if not recovered:
+                recovered = _recover_codex_pseudo_tool_calls(text, tools)
+            if not recovered:
+                recovered = _recover_display_tool_calls(text, tools)
+            if not recovered:
+                recovered = _recover_loose_segment_tool_calls(text, tool_module, tools)
+            if not recovered:
+                recovered = _recover_malformed_xml_tool_calls(text, tool_module, tools)
+            if recovered:
+                return recovered, _strip_raw_tool_blocks(text, tool_module)
+            logger.warning(
+                "tool-call marker was generated but no valid OpenAI tool_calls "
+                "were parsed; stripping raw tool markup from assistant content"
+            )
+            # Forensics (2026-07-07): every rung of the repair ladder missed
+            # this markup (seen live on zcode turns — the agent's action gets
+            # dropped and it looks stalled). Capture the raw bytes so the
+            # next occurrence hands us the exact format to add a rung for.
+            try:
+                import json as _json
+                with open(os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    "ops", "logs", "tool_parse_failures.jsonl"), "a") as _f:
+                    # Marker-centered window: thinking turns run thousands
+                    # of reasoning chars before the call; a head-truncated
+                    # capture misses the markup entirely (learned 12:28).
+                    _idx = text.find(start) if start else -1
+                    if _idx < 0:
+                        _idx = max(len(text) - 3500, 0)
+                    _f.write(_json.dumps({
+                        "at": round(time.time(), 3),
+                        "tools_advertised": [
+                            (t.get("function") or {}).get("name")
+                            for t in (tools or [])][:16],
+                        "head": text[:600],
+                        "marker_at": _idx,
+                        "raw": text[max(_idx - 500, 0):_idx + 3500],
+                    }) + "\n")
+            except Exception:
+                pass
+            return [], _strip_raw_tool_blocks(text, tool_module)
+        return [], remaining or text
+    except Exception as e:
+        logger.warning(f"tool-call parse failed: {e}")
+        return [], _strip_raw_tool_blocks(text, tool_module)
+
+
+def _tool_block_emission_finished(text, tool_module):
+    """True when the last opened tool block has a closing tag.
+
+    Judging stop/invalid on an unclosed block truncates the model mid-call
+    (a patch cut off at 31 tokens, `cat >` losing its filename) and then
+    manufactures the very malformed calls the recovery paths exist to repair.
+    Accept the namespaced or bare closing tag; MiniMax emits both.
+    """
+    start, _ = _tool_call_markers(tool_module)
+    if not start or not text:
+        return False
+    last_start = text.rfind(start)
+    if last_start < 0:
+        return False
+    return "</tool_call" in text[last_start + len(start):]
+
+
+def _tool_call_complete_for_stop(text, tool_module, tools):
+    """True once a buffered tool response has enough structure to stop decode."""
+    if not text or tool_module is None or not tools:
+        return False
+    start, end = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token or ns_token not in text:
+        return False
+    if not _tool_block_emission_finished(text, tool_module):
+        return False
+    try:
+        from mlx_vlm.server.responses_state import process_tool_calls
+
+        parsed = process_tool_calls(text, tool_module, tools)
+        calls = parsed.get("calls") or []
+        validated, dropped = _validate_outgoing_tool_calls(
+            calls,
+            tools,
+            return_dropped=True,
+        )
+        if validated or dropped:
+            return True
+    except Exception:
+        pass
+    if not TOOL_COMPAT_OVERLAY:
+        return False
+    calls = _recover_jsonish_tool_calls(text, tool_module, tools)
+    if not calls:
+        calls = _recover_loose_segment_tool_calls(text, tool_module, tools)
+    if not calls:
+        calls = _recover_malformed_xml_tool_calls(text, tool_module, tools)
+    if calls:
+        validated, dropped = _validate_outgoing_tool_calls(
+            calls,
+            tools,
+            return_dropped=True,
+        )
+        if validated or dropped:
+            return True
+    return False
+
+
+def _tool_call_contains_complete_but_invalid(text, tool_module, tools):
+    if not text or tool_module is None or not tools:
+        return False
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token or ns_token not in text:
+        return False
+    if not _tool_block_emission_finished(text, tool_module):
+        return False
+    candidates = []
+    try:
+        from mlx_vlm.server.responses_state import process_tool_calls
+
+        parsed = process_tool_calls(text, tool_module, tools)
+        candidates.extend(parsed.get("calls") or [])
+    except Exception:
+        pass
+    if not TOOL_COMPAT_OVERLAY:
+        return False
+    candidates.extend(_recover_jsonish_tool_calls(text, tool_module, tools))
+    candidates.extend(_recover_loose_segment_tool_calls(text, tool_module, tools))
+    candidates.extend(_recover_malformed_xml_tool_calls(text, tool_module, tools))
+    if not candidates:
+        return False
+    validated, dropped = _validate_outgoing_tool_calls(
+        candidates,
+        tools,
+        return_dropped=True,
+    )
+    if dropped and not validated:
+        return True
+    return False
+
+
+def _sanitize_inbound_message_content(role, content):
+    """Remove prior hidden MiniMax reasoning markup before re-templating chat history."""
+    if not isinstance(content, str):
+        return content
+    if role != "assistant":
+        return _canonicalize_volatile_context_lines(content)
+    content = _strip_thinking_control_markers(content).strip()
+    if _looks_like_tool_compat_fallback_content(content):
+        return ""
+    if _looks_like_leaked_reasoning_content(content):
+        return ""
+    return content
+
+
+def _looks_like_tool_compat_fallback_content(content):
+    """Detect server-generated compatibility text that should not steer the model."""
+    if not isinstance(content, str):
+        return False
+    text = re.sub(r"\s+", " ", content.strip().lower())
+    if not text or len(text) > 500:
+        return False
+    markers = (
+        "empty tool-call markers",
+        "tool-call markers instead of a valid function name",
+        "tool action was incomplete",
+        "tool call was malformed",
+        "call was malformed and was not executed",
+        "could not form a complete tool call",
+        "could not produce a valid tool call",
+        "previous tool action was incomplete",
+        "previous apply_patch call was malformed",
+        "previous exec_command call was malformed",
+        "previous tool call was malformed",
+        "malformed apply_patch",
+        "malformed exec_command",
+        "could not complete that tool step",
+        "previous `",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _scrub_goal_state_echo(content):
+    """Cut a parroted goal-runner JSON state block from visible content.
+
+    Codex-style goal harnesses inject a `{"prompt": ..., "goal": ...,
+    "tools": [...]}` state payload into context each cycle; the model
+    sometimes copies it verbatim into its visible answer.
+
+    2026-07-06 audit: only treat the blob as an echo when it IS the answer
+    (content starts with it). Prose that merely embeds such JSON — "show me
+    an example request with tools" — is the user's requested output and was
+    being silently deleted by the substring version of this guard.
+    """
+    if not isinstance(content, str) or '{"prompt"' not in content:
+        return content
+    if not content.strip().startswith('{"prompt"'):
+        return content
+    head, sep, tail = content.partition('{"prompt"')
+    blob = sep + tail
+    if '"tools"' in blob and '"function"' in blob:
+        return head.strip()
+    return content
+
+
+def _looks_like_leaked_reasoning_content(content):
+    """Detect reasoning text that a client echoed back as assistant content.
+
+    2026-07-06 audit: this predicate used to flag ANY short text opening with
+    "let me "/"i need to "/"i should " — killing legitimate replies like
+    "Let me know if you want me to continue." and replacing them with the
+    canned could-not-produce-a-tool-call fallback (then erasing them from
+    re-templated history). A model never opens a reply to its user with
+    third-person narration ABOUT the user, so that is the only reliable
+    signature. First-person openers are common in real answers; a missed
+    leak is cosmetic, a false positive destroys the answer — under-block.
+    """
+    if not isinstance(content, str):
+        return False
+    text = content.strip()
+    if not text or len(text) > 1200:
+        return False
+    if text.endswith("?"):
+        return False
+    lowered = text.lower()
+    starts_like_reasoning = lowered.startswith((
+        "the user ",
+        "user asked",
+        "user wants",
+    ))
+    reasoning_phrases = (
+        "no tools needed",
+        "i should respond",
+        "i should use",
+        "i got a result",
+        "the user asked",
+        "the user wants",
+        "the user just",
+    )
+    return bool(
+        starts_like_reasoning and any(p in lowered for p in reasoning_phrases)
+    )
+
+
+def _should_emit_reasoning_fields(tools):
+    return bool(not tools or EMIT_TOOL_REASONING)
+
+
+def _tool_request_fallback_content(
+    processed_messages,
+    *,
+    dropped_tool_names=None,
+    available_tool_names=None,
+    empty_tool_markers=False,
+    thinking_mode=None,
+):
+    dropped_tool_names = [
+        str(name).strip()
+        for name in (dropped_tool_names or [])
+        if str(name or "").strip()
+    ]
+    available_tool_names = sorted(
+        str(name).strip()
+        for name in (available_tool_names or [])
+        if str(name or "").strip()
+    )
+    last_user = ""
+    for message in reversed(processed_messages or []):
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content")
+            if isinstance(content, str):
+                last_user = content.strip()
+            break
+    if re.fullmatch(r"(?is)\s*(hi|hello|hey|hey!|hi!|hello!|yo|sup)[\s!.]*", last_user):
+        return "Hey! How can I help?"
+    # One stable sentence for every unusable shape (dropped call, empty
+    # markers, incomplete action). It is only reached after the in-place
+    # retries in _ensure_usable_tool_turn are exhausted. The phrase
+    # "could not produce a valid tool call" is the marker keyed on by
+    # _looks_like_tool_compat_fallback_content and the gateway's
+    # unusable-content detector, so keep it verbatim.
+    return (
+        "I could not produce a valid tool call for this step, so it was not "
+        "executed. Continue from the results already gathered."
+    )
+
+
+def _canonicalize_volatile_context_lines(text):
+    """Stabilize UI-injected clock lines so they do not bust KV reuse every turn."""
+    if not isinstance(text, str) or "Current" not in text:
+        return text
+    text = re.sub(
+        r"(?im)^(\s*[-*]?\s*(?:Full\s+)?Current\s+datetime\s*:\s*"
+        r"\d{4}-\d{2}-\d{2})(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?.*$",
+        r"\1 [stable-time]",
+        text,
+    )
+    text = re.sub(
+        r"(?im)^(\s*[-*]?\s*Current\s+time\s*:\s*).*$",
+        r"\1[stable]",
+        text,
+    )
+    return text
+
+
+def _assistant_content_for_template(message, content, *, session_id=None,
+                                    session_source=None):
+    """Return model-facing assistant content, restoring preserved reasoning.
+
+    OpenAI-compatible UIs often keep visible assistant content separate from
+    `reasoning` / `reasoning_content`. MiniMax generated that reasoning inside
+    its native thinking block, so dropping it on the next request makes the new
+    chat template diverge from the hot KV cache right where the previous
+    assistant response begins. Reinsert preserved reasoning only for the
+    model-facing prompt; the API response remains split into reasoning/content.
+    """
+    visible = _sanitize_inbound_message_content("assistant", content or "")
+    reasoning = (
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+    )
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        reasoning = _recall_assistant_reasoning(
+            session_id,
+            visible,
+            tool_calls=message.get("tool_calls"),
+            session_source=session_source,
+        )
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return visible
+    reasoning = _strip_thinking_control_markers(reasoning).strip()
+    if not reasoning:
+        return visible
+    if visible:
+        return f"<mm:think>{reasoning}</mm:think>\n{visible}"
+    return f"<mm:think>{reasoning}</mm:think>"
+
+
+def _client_preserves_assistant_reasoning(messages):
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        reasoning = (
+            message.get("reasoning_content")
+            or message.get("reasoning")
+            or message.get("thinking")
+        )
+        if isinstance(reasoning, str) and reasoning.strip():
+            return True
+    return False
+
+
+def _has_model_facing_reasoning(content):
+    return (
+        isinstance(content, str)
+        and "<mm:think>" in content
+        and "</mm:think>" in content
+    )
+
+
+# Which generator the ACTIVE request runs. EOS-swap arming is safe only on
+# the batch path: the stream generator pre-builds step N+1 before yielding N,
+# so an injected EOS breaks its loop while asymmetric collectives are queued
+# (the photographed mutual-send deadlock). Single generation slot => a plain
+# module flag is race-free. Both ranks compute the same value.
+_BATCH_PATH_ACTIVE = {"value": False}
+
+
+def _generation_iter(rank, gen_kwargs):
+    """The request's token generator: upstream stream_generate, or the
+    step-synchronous batch-cancel mirror loop when MLX_M3_BATCH_CANCEL=1.
+
+    Unsupported shapes (multimodal, kv-quant) fall back to the stream path —
+    that decision is a pure function of the broadcast request + shared env,
+    so both ranks always pick the same generator. Any OTHER construction
+    error raises into the existing symmetric generation-error protocol.
+    """
+    from mlx_vlm.generate import stream_generate
+    import m3_batch_cancel
+
+    _BATCH_PATH_ACTIVE["value"] = False
+    if m3_batch_cancel.enabled():
+        try:
+            it = m3_batch_cancel.batch_cancel_stream_generate(
+                rank=rank, **gen_kwargs
+            )
+            _BATCH_PATH_ACTIVE["value"] = True
+            return it
+        except m3_batch_cancel.Unsupported as e:
+            logger.info("rank %s: batch-cancel unsupported for request (%s); "
+                        "using stream_generate", rank, e)
+    return stream_generate(**gen_kwargs)
+
+
+def run_generation(model, processor, prompt, max_tokens, rank, image=None,
+                   thinking_mode="adaptive", gen_params=None, progress_cb=None,
+                   token_ids=None, session_id=None, session_source=None,
+                   prefill_progress_cb=None,
+                   reset_incomplete_thinking_on_limit=True,
+                   tool_module=None, tools=None):
+    """Both ranks run stream_generate in lockstep. On ANY error, raise so the
+    caller can signal the partner and release memory.
+
+    Robustness for long agentic sessions:
+    - prefill_step_size: chunked prefill so long inputs don't cause a memory
+      spike AND so each Metal command buffer completes within the GPU driver
+      timeout (~10s). The value is configurable via MLX_M3_PREFILL_STEP_SIZE.
+    - max_kv_size: passed through to upstream stream_generate. MiniMax-M3 has
+      a custom KV cache, so high-context trimming must be proven by soak tests
+      rather than assumed from generic MLX rotating-cache behavior.
+    - token_ids: when prompt caching is enabled, both ranks receive the same
+      token_ids (broadcast by rank 0) and compute the same prefix reuse, so
+      only new context is processed on subsequent turns.
+    - Stop flag: checked between tokens so POST /v1/stop can end generation
+      at the next token boundary (both ranks check at the same boundary).
+    """
+    from mlx_vlm.generate import stream_generate
+
+    # Disarm any stale stop from a PREVIOUS request. The stream path resets
+    # this at the stop-nonce site, but the non-stream path never did — so one
+    # /v1/stop poisoned every later non-stream request into an instant-EOS
+    # empty reply ("generation complete: 0 chars", found 2026-07-07).
+    _FORCE_EOS["active"] = False
+    _refresh_generation_stream()
+
+    # Cross-request prompt cache: compute suffix + reused cache (both ranks).
+    prompt_to_send = prompt
+    cached_prompt_cache = None
+    cached_suffix_ids = None
+    cache_marked_in_use = False
+    cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
+    cache_allowed = _prompt_cache_allowed_for_request(thinking_mode, token_ids)
+    if cache_allowed:
+        _expire_idle_prompt_cache()
+        _mark_prompt_cache_in_use(True)
+        cache_marked_in_use = True
+        try:
+            prompt_to_send, cached_prompt_cache = _prepare_cached_prompt(
+                model, processor, prompt, token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                thinking_mode=thinking_mode,
+            )
+            if (
+                PROMPT_CACHE_DIRECT_SUFFIX_IDS
+                and cached_prompt_cache is not None
+                and image is None
+            ):
+                cached_suffix_ids = _prompt_cache_last_suffix_ids()
+        except Exception:
+            _mark_prompt_cache_in_use(False)
+            cache_marked_in_use = False
+            raise
+        prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
+            _prefix_plan_consensus(rank, prompt, prompt_to_send,
+                                   cached_prompt_cache, cached_suffix_ids)
+        )
+
+    gen_kwargs = dict(
+        model=model, processor=processor, prompt=prompt_to_send,
+        max_tokens=max_tokens,
+        enable_thinking=_enable_thinking_for_generation(thinking_mode),
+        prefill_step_size=_runtime_prefill_step_size(len(token_ids)),
+        max_kv_size=MAX_KV_SIZE,
+    )
+    gen_kwargs.update(_kv_quant_kwargs())
+    if cached_prompt_cache is not None:
+        gen_kwargs["prompt_cache"] = cached_prompt_cache
+    if cached_prompt_cache is not None and cached_suffix_ids:
+        gen_kwargs["input_ids"] = mx.array([cached_suffix_ids], dtype=mx.int32)
+        gen_kwargs["mask"] = None
+    if image is not None:
+        gen_kwargs["image"] = image
+    if gen_params:
+        gen_kwargs.update(gen_params)
+    if prefill_progress_cb is not None or UNSAFE_INFLIGHT_STOP:
+        def _prefill_progress(processed_tokens, total_tokens):
+            if prefill_progress_cb is not None:
+                prefill_progress_cb(processed_tokens, total_tokens)
+            if UNSAFE_INFLIGHT_STOP:
+                _check_prefill_stop(rank, processed_tokens, total_tokens)
+
+        gen_kwargs["prefill_progress_callback"] = _prefill_progress
+
+    text = ""
+    n = 0
+    generated_token_ids = []
+    tool_accumulated = ""
+    raw_tool_fragment_tokens = 0
+    stopped = False
+    try:
+        force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
+        with _tokenizer_runtime_lock, _decode_eval_context(force_eval):
+            for response in _generation_iter(rank, gen_kwargs):
+                generation_tokens = int(getattr(response, "generation_tokens", 0) or 0)
+                token = getattr(response, "token", None)
+                if token is not None and generation_tokens > len(generated_token_ids):
+                    generated_token_ids.append(token)
+                # 2026-07-06 TAIL-LOSS FIX: no manual EOS break. The native
+                # 0.6.4 generator checks EOS itself on EVERY rank (the synced
+                # token is identical), so both generators end naturally and
+                # lockstep is preserved without our break. The old manual
+                # break fired on the FINAL flush yield — which in 0.6.4
+                # carries detokenizer.finalize()'s buffered tail text — and
+                # silently dropped the last words of every response.
+                if (
+                    _FORCE_EOS.get("active")
+                    and _FORCE_EOS.get("eos_id") is not None
+                    and token is not None
+                    and int(token) == int(_FORCE_EOS["eos_id"])
+                ):
+                    stopped = True  # bookkeeping only; generator ends itself
+                token_text = getattr(response, "text", None) or ""
+                if token_text:
+                    tool_accumulated += token_text
+                    if rank == 0:
+                        text += token_text
+                n += 1
+                if rank == 0 and progress_cb is not None:
+                    metrics = {}
+                    if n == 1:
+                        metrics = {
+                            "prompt_tps": float(getattr(response, "prompt_tps", 0.0) or 0.0),
+                            "prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
+                            "cached_tokens": int(getattr(response, "cached_tokens", 0) or 0),
+                            "prompt_cache_prepare": _prompt_cache_status().get("last_prepare_event"),
+                        }
+                    try:
+                        progress_cb(n, len(text), metrics)
+                    except Exception:
+                        try:
+                            progress_cb(n, len(text))
+                        except Exception:
+                            pass
+                _watchdog_tick(progress=True)
+                # Safe decode-phase stop (2026-07-06 EOS redesign): the stop
+                # file exists only on rank 0, so rank 0 arms EOS injection in
+                # the sampled-token sync instead of breaking; rank 1 simply
+                # follows the synced EOS. `stopped` marks the turn cancelled
+                # for cache handling once the loop ends naturally.
+                # BATCH PATH ONLY: the stream generator pre-builds the next
+                # step, so an injected EOS deadlocks it (rig 0/5 history).
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"] and n % 8 == 0):
+                    _sp = _read_prefill_stop_file()
+                    if (
+                        _sp
+                        and _sp.get("phase") == "decode"
+                        and _sp.get("nonce")
+                        and _sp.get("nonce") == _STOP_NONCE.get("value")
+                        and int(_sp.get("stop_at_tokens") or 0) > 0
+                        and n >= int(_sp.get("stop_at_tokens") or 0)
+                    ):
+                        logger.info(
+                            "rank 0: decode stop honored at token %d — "
+                            "forcing EOS via sampled-token sync "
+                            "(stop_at=%s, reason=%s)",
+                            n,
+                            _sp.get("stop_at_tokens"), _sp.get("reason"),
+                        )
+                        _FORCE_EOS["active"] = True
+                        stopped = True
+                # In-flight stop: both ranks check at the same token boundary.
+                if UNSAFE_INFLIGHT_STOP:
+                    stop_now, stop_reason = _stop_requested_synced_reason(rank, n)
+                else:
+                    stop_now, stop_reason = False, None
+                if stop_now:
+                    stopped = stop_reason != "tool"
+                    logger.info(
+                        "rank %s: %s stop requested at token %d; breaking",
+                        rank,
+                        stop_reason or "unknown",
+                        n,
+                    )
+                    break
+                tool_stop_ready = _tool_call_complete_for_stop(
+                    tool_accumulated, tool_module, tools
+                )
+                if tool_stop_ready:
+                    logger.info(
+                        "rank %s: complete tool call detected at token %d; "
+                        "requesting synchronized decode stop",
+                        rank, n,
+                    )
+                    if UNSAFE_INFLIGHT_STOP:
+                        _set_stop_request("tool")
+                        continue
+                    break
+                if (
+                    tools
+                    and THINKING_RAW_SILENT_LIMIT > 0
+                    and _tool_fragment_looks_degenerate(tool_accumulated, tool_module)
+                ):
+                    raw_tool_fragment_tokens += 1
+                    if raw_tool_fragment_tokens >= THINKING_RAW_SILENT_LIMIT:
+                        logger.warning(
+                            "rank %s: incomplete raw tool fragment guard tripped "
+                            "at token %d (raw_tool_tokens=%d, limit=%d); "
+                            "requesting synchronized decode stop",
+                            rank,
+                            n,
+                            raw_tool_fragment_tokens,
+                            THINKING_RAW_SILENT_LIMIT,
+                        )
+                        if UNSAFE_INFLIGHT_STOP:
+                            _set_stop_request("tool")
+                            continue
+                        break
+                else:
+                    raw_tool_fragment_tokens = 0
+        # On clean completion, record the full token sequence in the cache.
+        preserve_existing_cache = (
+            cache_allowed and _prompt_cache_prepare_preserves_existing_cache()
+        )
+        incomplete_thinking = (
+            bool(reset_incomplete_thinking_on_limit)
+            and _thinking_generation_hit_limit(thinking_mode, n, max_tokens)
+        )
+        if cache_allowed and incomplete_thinking:
+            logger.info(
+                "prompt-cache: dropping cache after thinking generation hit "
+                "max_tokens (%d/%s); treating turn as incomplete",
+                n,
+                max_tokens,
+            )
+            _reset_prompt_cache("reset after incomplete thinking output",
+                                clear_resident=False)
+        elif cache_allowed and not stopped and not preserve_existing_cache:
+            _update_prompt_cache_after_generation(
+                token_ids,
+                generated_token_ids=generated_token_ids,
+                generated_tokens=n,
+                include_generated_ids=(cache_mode == "full"),
+                session_id=session_id,
+                session_source=session_source,
+                prompt=prompt,
+                model=model,
+                processor=processor,
+                save_reason="nonstream_generation",
+            )
+        elif preserve_existing_cache:
+            logger.info("prompt-cache: preserved existing cache after bypassed request")
+        if stopped:
+            _reset_prompt_cache("reset after stop", clear_resident=False)
+        return text if rank == 0 else None
+    except GenerationCancelled as e:
+        stopped = True
+        logger.info("rank %s: %s; generation cancelled", rank, e)
+        _reset_prompt_cache("reset after stop", clear_resident=False)
+        return text if rank == 0 else None
+    except Exception as e:
+        logger.error(f"rank {rank}: generation error at token {n}: {e}")
+        _reset_prompt_cache("reset after error", clear_resident=False)
+        raise
+    finally:
+        if cache_marked_in_use:
+            _mark_prompt_cache_in_use(False)
+
+
+def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None,
+                          thinking_mode="adaptive", enable_thinking=True,
+                          gen_params=None, token_ids=None,
+                          session_id=None, session_source=None,
+                          prefill_progress_cb=None,
+                          reset_incomplete_thinking_on_limit=True,
+                          tool_module=None, tools=None):
+    """Streaming generation. Yields delta dicts with keys from
+    {"reasoning", "content"} in OpenAI delta format.
+
+    Routing matches the official mlx_vlm server: we accumulate the raw text
+    and call split_stream_thinking_delta on every token so reasoning/content
+    are separated correctly even when </mm:think> spans token boundaries.
+
+    Runs on BOTH ranks in lockstep (same forward calls). Only rank 0 yields.
+    token_ids enables cross-request prompt caching (both ranks get the same
+    ids via _bcast and compute identical prefix reuse).
+    """
+    from mlx_vlm.generate import stream_generate
+
+    # Disarm any stale stop from a PREVIOUS request. The stream path resets
+    # this at the stop-nonce site, but the non-stream path never did — so one
+    # /v1/stop poisoned every later non-stream request into an instant-EOS
+    # empty reply ("generation complete: 0 chars", found 2026-07-07).
+    _FORCE_EOS["active"] = False
+    _refresh_generation_stream()
+
+    # Cross-request prompt cache: compute suffix + reused cache (both ranks).
+    prompt_to_send = prompt
+    cached_prompt_cache = None
+    cached_suffix_ids = None
+    cache_marked_in_use = False
+    cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
+    cache_allowed = _prompt_cache_allowed_for_request(thinking_mode, token_ids)
+    timing = {
+        "cache_prepare_started_at": None,
+        "cache_prepare_finished_at": None,
+        "stream_generate_started_at": None,
+        "runtime_lock_wait_started_at": None,
+        "runtime_lock_acquired_at": None,
+        "first_generator_yield_at": None,
+    }
+    if cache_allowed:
+        _expire_idle_prompt_cache()
+        _mark_prompt_cache_in_use(True)
+        cache_marked_in_use = True
+        try:
+            timing["cache_prepare_started_at"] = time.time()
+            prompt_to_send, cached_prompt_cache = _prepare_cached_prompt(
+                model, processor, prompt, token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                thinking_mode=thinking_mode,
+            )
+            if (
+                PROMPT_CACHE_DIRECT_SUFFIX_IDS
+                and cached_prompt_cache is not None
+                and image is None
+            ):
+                cached_suffix_ids = _prompt_cache_last_suffix_ids()
+            prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
+                _prefix_plan_consensus(rank, prompt, prompt_to_send,
+                                       cached_prompt_cache, cached_suffix_ids)
+            )
+            timing["cache_prepare_finished_at"] = time.time()
+        except Exception:
+            _mark_prompt_cache_in_use(False)
+            cache_marked_in_use = False
+            raise
+
+    gen_kwargs = dict(
+        model=model, processor=processor, prompt=prompt_to_send,
+        max_tokens=max_tokens,
+        enable_thinking=_enable_thinking_for_generation(thinking_mode),
+        prefill_step_size=_runtime_prefill_step_size(len(token_ids)),
+        max_kv_size=MAX_KV_SIZE,
+    )
+    gen_kwargs.update(_kv_quant_kwargs())
+    if cached_prompt_cache is not None:
+        gen_kwargs["prompt_cache"] = cached_prompt_cache
+    if cached_prompt_cache is not None and cached_suffix_ids:
+        gen_kwargs["input_ids"] = mx.array([cached_suffix_ids], dtype=mx.int32)
+        gen_kwargs["mask"] = None
+    if image is not None:
+        gen_kwargs["image"] = image
+    if gen_params:
+        gen_kwargs.update(gen_params)
+    if prefill_progress_cb is not None or UNSAFE_INFLIGHT_STOP:
+        def _prefill_progress(processed_tokens, total_tokens):
+            if prefill_progress_cb is not None:
+                prefill_progress_cb(processed_tokens, total_tokens)
+            if UNSAFE_INFLIGHT_STOP:
+                _check_prefill_stop(rank, processed_tokens, total_tokens)
+
+        gen_kwargs["prefill_progress_callback"] = _prefill_progress
+
+    # Routing state (mirrors mlx_vlm/server/openai.py:1493-1497)
+    in_thinking = bool(enable_thinking)
+    accumulated = ""
+    at_response_start = True
+    n = 0
+    generated_token_ids = []
+    stopped = False
+    malformed_thinking = False
+    raw_silent_tokens = 0
+    thinking_active = _enable_thinking_for_generation(thinking_mode)
+    try:
+        force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
+        timing["stream_generate_started_at"] = time.time()
+        timing["runtime_lock_wait_started_at"] = time.time()
+        with _tokenizer_runtime_lock, _decode_eval_context(force_eval):
+            timing["runtime_lock_acquired_at"] = time.time()
+            for response in _generation_iter(rank, gen_kwargs):
+                if timing["first_generator_yield_at"] is None:
+                    timing["first_generator_yield_at"] = time.time()
+                    if rank == 0:
+                        _t0 = timing.get("cache_prepare_started_at")
+                        _t1 = timing.get("cache_prepare_finished_at")
+                        _lw = timing.get("runtime_lock_wait_started_at")
+                        _la = timing.get("runtime_lock_acquired_at")
+                        _fy = timing["first_generator_yield_at"]
+                        logger.info(
+                            "[rank 0] ttft breakdown: prepare=%.2fs lock_wait=%.2fs "
+                            "generator=%.2fs (prepare start -> first yield %.2fs)",
+                            (_t1 - _t0) if _t0 and _t1 else -1,
+                            (_la - _lw) if _lw and _la else -1,
+                            _fy - (_la or _fy),
+                            _fy - (_t0 or _fy),
+                        )
+                generation_tokens = int(getattr(response, "generation_tokens", 0) or 0)
+                token = getattr(response, "token", None)
+                if token is not None and generation_tokens > len(generated_token_ids):
+                    generated_token_ids.append(token)
+                # 2026-07-06 TAIL-LOSS FIX: no manual EOS break (see mirror
+                # loop). The 0.6.4 generator ends on EOS itself on every rank;
+                # the final flush yield carries the buffered tail text and
+                # must be processed, not skipped.
+                if (
+                    _FORCE_EOS.get("active")
+                    and _FORCE_EOS.get("eos_id") is not None
+                    and token is not None
+                    and int(token) == int(_FORCE_EOS["eos_id"])
+                ):
+                    stopped = True  # bookkeeping only; generator ends itself
+                token_text = getattr(response, "text", None) or ""
+                n += 1
+                _watchdog_tick(progress=True)
+                # Safe decode-phase stop: rank 0 watches the coordinated stop
+                # file every 8 tokens and, when the boundary is reached, ARMS
+                # EOS injection (it does NOT break here — that would desync
+                # rank 1). The EOS then flows to both ranks through the sync
+                # and the unconditional EOS break above ends both identically.
+                # BATCH PATH ONLY: the stream generator pre-builds the next
+                # step, so an injected EOS deadlocks it (rig 0/5 history).
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"] and n % 8 == 0):
+                    _sp = _read_prefill_stop_file()
+                    if (
+                        _sp
+                        and _sp.get("phase") == "decode"
+                        # nonce match = this stop belongs to THIS generation
+                        and _sp.get("nonce")
+                        and _sp.get("nonce") == _STOP_NONCE.get("value")
+                        and int(_sp.get("stop_at_tokens") or 0) > 0
+                        and n >= int(_sp.get("stop_at_tokens") or 0)
+                    ):
+                        logger.info(
+                            "rank 0: decode stop honored at token %d — "
+                            "forcing EOS via sampled-token sync "
+                            "(stop_at=%s, reason=%s)",
+                            n,
+                            _sp.get("stop_at_tokens"), _sp.get("reason"),
+                        )
+                        _FORCE_EOS["active"] = True
+                        stopped = True
+                # Check distributed stop before local stream guards. A prior
+                # tool-complete stop may already be armed; if rank 0 trips a
+                # local guard first, the next request can enter JACCL with the
+                # mirror rank still in the previous decode loop.
+                if UNSAFE_INFLIGHT_STOP:
+                    stop_now, stop_reason = _stop_requested_synced_reason(rank, n)
+                else:
+                    stop_now, stop_reason = False, None
+                if stop_now:
+                    stopped = stop_reason != "tool"
+                    logger.info(
+                        "rank %s: %s stop requested at token %d; breaking",
+                        rank,
+                        stop_reason or "unknown",
+                        n,
+                    )
+                    break
+                accumulated += token_text
+                (in_thinking, accumulated, at_response_start,
+                 delta_reasoning, delta_content) = split_stream_thinking_delta(
+                    accumulated, token_text, in_thinking,
+                    at_response_start=at_response_start,
+                )
+                routed_delta_text = (delta_reasoning or "") + (delta_content or "")
+                visible_delta_text = _strip_thinking_control_markers(
+                    routed_delta_text
+                ).strip()
+                # Count decode steps that do not produce visible routed
+                # reasoning/content. MiniMax can emit long runs of control
+                # markup that split_stream_thinking_delta technically routes
+                # but the OpenAI stream will not expose as useful progress.
+                # Treat those as silent in both thinking and no-thinking modes
+                # so we break inside the generation loop before the distributed
+                # process watchdog has to kill both ranks.
+                if visible_delta_text:
+                    raw_silent_tokens = 0
+                else:
+                    # A HEALTHY tool call is invisible by design: after the
+                    # ns marker the holdback silences the client while the
+                    # block buffers, so a big Write/Edit call is hundreds of
+                    # "silent" tokens. Killing at 32 truncated every large
+                    # call two tokens into <invoke (12:45 specimen) — the
+                    # dropped-action bug. Buffering an OPEN, non-degenerate
+                    # block is progress; only true silence and marker-spam
+                    # (the degenerate classifier) count toward the limit.
+                    _tool_buffering = bool(
+                        tools and tool_module is not None
+                        and _looks_like_raw_tool_fragment(accumulated, tool_module)
+                        and not _tool_block_emission_finished(accumulated, tool_module)
+                        and not _tool_fragment_looks_degenerate(accumulated, tool_module)
+                    )
+                    if _tool_buffering:
+                        raw_silent_tokens = 0
+                    else:
+                        raw_silent_tokens += 1
+
+                if (
+                    THINKING_RAW_SILENT_LIMIT > 0
+                    and not tools  # oMLX PARITY (2026-07-07): oMLX has NO
+                    # no-visible guard. On a TOOL turn the holdback silences
+                    # the client for the whole (legitimately long) tool block,
+                    # and in thinking mode the model reasons for thousands of
+                    # tokens before the call — the guard fired at raw_silent=32
+                    # and killed generation right at <invoke (token 2841,
+                    # every Flappy-Bird/file-write turn). Marker-spam runaway
+                    # is still caught by the degenerate-fragment guard; total
+                    # runaway by max_tokens + the decode watchdog. The
+                    # no-visible guard now protects ONLY toolless turns.
+                    and n >= THINKING_RAW_SILENT_LIMIT
+                    and raw_silent_tokens >= THINKING_RAW_SILENT_LIMIT
+                ):
+                    malformed_thinking = True
+                    logger.warning(
+                        "rank %s: no-visible stream guard tripped at token %d "
+                        "(raw_silent=%d, limit=%d, thinking=%s); breaking",
+                        rank,
+                        n,
+                        raw_silent_tokens,
+                        THINKING_RAW_SILENT_LIMIT,
+                        thinking_active,
+                    )
+                    if UNSAFE_INFLIGHT_STOP:
+                        _set_stop_request("tool")
+                        continue
+                    break
+                tool_stop_ready = _tool_call_complete_for_stop(
+                    accumulated, tool_module, tools
+                )
+                if rank != 0:
+                    if tool_stop_ready:
+                        logger.info(
+                            "rank %s: complete tool call detected at token %d; "
+                            "requesting synchronized mirror stop",
+                            rank, n,
+                        )
+                        if UNSAFE_INFLIGHT_STOP:
+                            _set_stop_request("tool")
+                            continue
+                        break
+                    continue  # mirror rank: run forward calls, but emit nothing
+
+                metrics = {}
+                if n == 1:
+                    metrics = {
+                        "_prompt_tps": float(getattr(response, "prompt_tps", 0.0) or 0.0),
+                        "_prompt_tokens": int(getattr(response, "prompt_tokens", 0) or 0),
+                        "_cached_tokens": int(getattr(response, "cached_tokens", 0) or 0),
+                        "_prompt_cache_prepare": _prompt_cache_status().get("last_prepare_event"),
+                        "_cache_prepare_started_at": timing["cache_prepare_started_at"],
+                        "_cache_prepare_finished_at": timing["cache_prepare_finished_at"],
+                        "_stream_generate_started_at": timing["stream_generate_started_at"],
+                        "_runtime_lock_wait_started_at": timing["runtime_lock_wait_started_at"],
+                        "_runtime_lock_acquired_at": timing["runtime_lock_acquired_at"],
+                        "_first_generator_yield_at": timing["first_generator_yield_at"],
+                    }
+                metrics["_generation_tokens"] = generation_tokens or n
+                raw_attached = False
+                if delta_reasoning:
+                    yield {"reasoning": delta_reasoning, "_raw": token_text} | metrics
+                    raw_attached = True
+                if delta_content:
+                    chunk = {"content": delta_content}
+                    if not raw_attached:
+                        chunk["_raw"] = token_text
+                        raw_attached = True
+                    yield chunk | metrics
+                if token_text and not delta_reasoning and not delta_content:
+                    yield {"_raw": token_text} | metrics
+                elif metrics and not delta_reasoning and not delta_content and not token_text:
+                    yield metrics
+
+                if tool_stop_ready:
+                    logger.info(
+                        "rank %s: complete tool call detected at token %d; "
+                        "requesting synchronized stream stop",
+                        rank, n,
+                    )
+                    if UNSAFE_INFLIGHT_STOP:
+                        _set_stop_request("tool")
+                        continue
+                    break
+
+        # Flush any trailing buffered text
+        if rank == 0 and accumulated and not stopped:
+            if malformed_thinking:
+                fallback = _strip_thinking_control_markers(accumulated).strip()
+                if fallback:
+                    yield {
+                        "content": fallback,
+                        "_malformed_thinking_truncated": True,
+                    }
+            else:
+                reasoning, content = split_thinking_text(
+                    accumulated, assume_in_thinking=in_thinking)
+                if reasoning:
+                    yield {"reasoning": reasoning}
+                if content:
+                    yield {"content": content}
+        # On clean completion, record the full token sequence in the cache.
+        if cache_allowed:
+            preserve_existing_cache = _prompt_cache_prepare_preserves_existing_cache()
+            incomplete_thinking = (
+                bool(reset_incomplete_thinking_on_limit)
+                and _thinking_generation_hit_limit(thinking_mode, n, max_tokens)
+            )
+            if stopped:
+                _reset_prompt_cache("reset after stop", clear_resident=False)
+            elif malformed_thinking:
+                _reset_prompt_cache("reset after no-visible generation stream")
+            elif incomplete_thinking:
+                logger.info(
+                    "prompt-cache: dropping cache after thinking stream hit "
+                    "max_tokens (%d/%s); treating turn as incomplete",
+                    n,
+                    max_tokens,
+                )
+                _reset_prompt_cache("reset after incomplete thinking output",
+                                clear_resident=False)
+            elif preserve_existing_cache:
+                logger.info("prompt-cache: preserved existing cache after bypassed stream request")
+            else:
+                _update_prompt_cache_after_generation(
+                    token_ids,
+                    generated_token_ids=generated_token_ids,
+                    generated_tokens=n,
+                    include_generated_ids=(cache_mode == "full"),
+                    session_id=session_id,
+                    session_source=session_source,
+                    prompt=prompt,
+                    model=model,
+                    processor=processor,
+                    save_reason="stream_generation",
+                )
+    except GenerationCancelled as e:
+        stopped = True
+        logger.info("rank %s: %s; stream generation cancelled", rank, e)
+        _reset_prompt_cache("reset after stop", clear_resident=False)
+        if rank == 0:
+            yield {
+                "_cancelled": True,
+                "_raw": accumulated,
+                "_generation_tokens": n,
+            }
+        return
+    except Exception as e:
+        logger.error(f"rank {rank}: stream generation error at token {n}: {e}")
+        _reset_prompt_cache("reset after error", clear_resident=False)
+        raise
+    finally:
+        if cache_marked_in_use:
+            _mark_prompt_cache_in_use(False)
+
+
+def _materialize_image(image_source):
+    """Return a local temp-file path for an OpenAI image_url/input_image value."""
+    if not image_source:
+        return None
+
+    if isinstance(image_source, dict):
+        image_source = image_source.get("url") or image_source.get("image_url")
+    if not isinstance(image_source, str) or not image_source:
+        return None
+
+    import base64
+    import tempfile
+    import urllib.request
+
+    if image_source.startswith("data:"):
+        header, b64 = image_source.split(",", 1)
+        suffix = ".png"
+        if "jpeg" in header or "jpg" in header:
+            suffix = ".jpg"
+        elif "webp" in header:
+            suffix = ".webp"
+        data = base64.b64decode(b64)
+        tf = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tf.write(data)
+        tf.close()
+        return tf.name
+
+    tf = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
+    urllib.request.urlretrieve(image_source, tf.name)
+    tf.close()
+    return tf.name
+
+
+def _extract_image_source(part):
+    """Extract an image URL/path/data URI from OpenAI chat/response content."""
+    if not isinstance(part, dict):
+        return None
+    for key in ("image_url", "input_image", "image", "url", "path"):
+        value = part.get(key)
+        if isinstance(value, dict):
+            value = value.get("url") or value.get("image_url") or value.get("path")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Loading
+# ---------------------------------------------------------------------------
+def _install_rank0_token_sync(group):
+    """Force every distributed rank to feed rank 0's sampled token.
+
+    MLX generation runs the sampler independently in each process. That is OK
+    only while every rank produces exactly the same token. MiniMax-M3 tensor and
+    pipeline modes both depend on the next decode step seeing the same token ids
+    on every rank, so gather the sampled token and keep rank 0 as the source of
+    truth.
+    """
+    enabled = os.environ.get("MLX_M3_SYNC_SAMPLED_TOKENS", "1").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    if not enabled or group.size() <= 1:
+        return
+    try:
+        import importlib
+
+        ar_mod = importlib.import_module("mlx_vlm.generate.ar")
+    except Exception as e:
+        logger.warning("rank0 sampled-token sync unavailable: %s", e)
+        return
+
+    orig = ar_mod._sample_with_positions
+    if getattr(orig, "_m3_rank0_token_sync", False):
+        return
+
+    sync_rank = group.rank()
+
+    def _synced_sample_with_positions(*args, **kwargs):
+        y = orig(*args, **kwargs)
+        # Decode stop = rank 0 forces EOS as its sampled token; every rank
+        # receives it through this same all_gather and the generation ends
+        # identically everywhere (no per-rank stop files, no extra
+        # collectives, no break-point drift).
+        if (
+            sync_rank == 0
+            and _FORCE_EOS["active"]
+            and _FORCE_EOS["eos_id"] is not None
+        ):
+            y = mx.full(y.shape, _FORCE_EOS["eos_id"], dtype=y.dtype)
+        gathered = mx.distributed.all_gather(y, group=group)
+        return gathered[: y.shape[0]]
+
+    _synced_sample_with_positions._m3_rank0_token_sync = True
+    _synced_sample_with_positions._m3_original = orig
+    ar_mod._sample_with_positions = _synced_sample_with_positions
+    logger.info("rank0 sampled-token sync enabled")
+
+
+def sharded_load_tensor(repo):
+    """Load MiniMax-M3 using its built-in tensor-parallel language shard.
+
+    mlx_vlm.utils.sharded_load() only checks the top-level VLM wrapper for
+    .shard(), but MiniMax-M3 exposes tensor parallelism on
+    model.language_model.shard(group). This path keeps the official MiniMax
+    forward/cache implementation intact and avoids the custom layer-pipeline
+    forward that currently stalls at the sparse-attention block boundary.
+    """
+    from mlx_vlm.utils import (
+        get_model_path,
+        load_model,
+        load_processor,
+        load_image_processor,
+    )
+
+    group = mx.distributed.init()
+    model_path = get_model_path(repo)
+    model = load_model(model_path, lazy=True, strict=False)
+    if not hasattr(model, "language_model") or not hasattr(model.language_model, "shard"):
+        raise ValueError("MiniMax tensor loader requires model.language_model.shard()")
+    model.language_model.shard(group)
+    logger.info("rank %s: applied MiniMax language tensor shard", group.rank())
+
+    logger.info("rank %s: materializing tensor-sharded model", group.rank())
+    mx.eval(model.language_model.parameters())
+    model.eval()
+    mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+
+    eos_token_id = getattr(model.config, "eos_token_id", None)
+    processor = load_processor(model_path, True, eos_token_ids=eos_token_id)
+    image_processor = load_image_processor(model_path)
+    if image_processor is not None:
+        processor.image_processor = image_processor
+    try:
+        resolved = str(model_path)
+        setattr(model, "_thundermlx_model_path", resolved)
+        setattr(processor, "_thundermlx_model_path", resolved)
+    except Exception:
+        pass
+    return model, processor
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+def main():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    _install_shutdown_handlers()
+
+    # NOTE: we do NOT override mx.async_eval. An earlier version forced it
+    # synchronous (mx.async_eval = lambda *a: mx.eval(list(a))) based on a
+    # theory that async command buffers cause GPU timeouts. That theory was
+    # WRONG — the real crash causes were (a) the mx.eval(h) after all_gather
+    # in the pipeline patch and (b) the watchdog false-positive during long
+    # prefills, both now fixed. Forcing async_eval synchronous destroys
+    # prefill performance (no compute/transfer overlap -> 64-token prompts
+    # went from ~6s to >90s) AND starves the watchdog's heartbeat ticker
+    # thread of the GIL. The canonical mlx_lm server and glm4_moe pipeline
+    # never override async_eval. Leave it native.
+    logger.info("mx.async_eval left native (canonical behavior)")
+    logger.info(
+        "prompt cache: enabled=%s min_reuse=%s ttl=%ss max_tokens=%s ceiling=%s",
+        PROMPT_CACHE_ENABLED,
+        PROMPT_CACHE_MIN_REUSE if PROMPT_CACHE_ENABLED else "n/a",
+        PROMPT_CACHE_TTL_SECONDS if PROMPT_CACHE_ENABLED else "n/a",
+        PROMPT_CACHE_MAX_TOKENS if PROMPT_CACHE_MAX_TOKENS > 0 else "off",
+        MAX_TOKENS_CEILING,
+    )
+    _install_omlx_minimax_overlay()
+    _configure_metal_memory_limits()
+    _install_decode_eval_patch()
+
+    group = mx.distributed.init()
+    world, rank = group.size(), group.rank()
+    logging.getLogger().handlers[0].setFormatter(
+        logging.Formatter(f"%(asctime)s [rank {rank}] %(levelname)s %(message)s"))
+    logger.info(f"distributed init OK: rank {rank} of {world}")
+    if SHARDING_MODE == "tensor":
+        _install_rank0_token_sync(group)
+
+    if SHARDING_MODE == "pipeline":
+        from m3_pipeline_patch import sharded_load_pipeline
+        logger.info(f"sharded_load_pipeline on rank {rank} ...")
+        model, processor = sharded_load_pipeline(MODEL)
+    elif SHARDING_MODE == "tensor":
+        logger.info(f"sharded_load_tensor on rank {rank} ...")
+        model, processor = sharded_load_tensor(MODEL)
+    else:
+        raise ValueError(f"unsupported M3_SHARDING_MODE={SHARDING_MODE!r}")
+    logger.info(f"rank {rank}: model loaded")
+    try:
+        _tok = getattr(processor, "tokenizer", None) or processor
+        _eid = getattr(_tok, "eos_token_id", None)
+        if isinstance(_eid, (list, tuple, set)):
+            _eid = next(iter(_eid), None)
+        _FORCE_EOS["eos_id"] = int(_eid) if _eid is not None else None
+        logger.info("decode-stop EOS id: %s", _FORCE_EOS["eos_id"])
+    except Exception as e:
+        logger.warning("decode-stop EOS id unavailable: %s", e)
+    with _prompt_cache_lock:
+        _load_prompt_cache_session_manifest_unlocked()
+    _start_prompt_cache_janitor()
+
+    if rank == 0:
+        run_http_server(model, processor, rank)
+    else:
+        run_mirror(model, processor, rank)
+
+
+def run_http_server(model, processor, rank):
+    from fastapi import FastAPI, Request
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import JSONResponse
+    import uvicorn
+
+    app = FastAPI()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    generation_lock = threading.Lock()
+    generation_lock_owner = {"kind": None, "started_at": None, "reason": None}
+
+    def set_generation_lock_owner(kind, reason=None):
+        with state_lock:
+            generation_lock_owner["kind"] = kind
+            generation_lock_owner["started_at"] = time.time() if kind else None
+            generation_lock_owner["reason"] = reason
+
+    def clear_generation_lock_owner(kind=None):
+        with state_lock:
+            if kind is None or generation_lock_owner.get("kind") == kind:
+                generation_lock_owner["kind"] = None
+                generation_lock_owner["started_at"] = None
+                generation_lock_owner["reason"] = None
+    state_lock = threading.Lock()
+    request_state = {
+        "queued": 0,
+        "active": None,
+        "completed": 0,
+        "failed": 0,
+        "last_error": None,
+        "releasing": None,
+        "shutdown_requested": False,
+        # last_request: summary of the most recently completed request, so the
+        # dashboard can show an authoritative tokens/sec per request.
+        "last_request": None,
+        # Latest request with enough output tokens for decode TPS to be
+        # meaningful. Very short replies are dominated by TTFT and prompt work.
+        "last_meaningful_request": None,
+        "recent_requests": [],
+        "lifetime_tokens": {
+            "requests": 0,
+            "prompt_processed": 0,
+            "prompt_logical": 0,
+            "prompt_cached": 0,
+            "prompt_avoided": 0,
+            "decode": 0,
+            "processed_total": 0,
+            "logical_total": 0,
+        },
+    }
+
+    # Lifetime token counters survive restarts: overlay the last persisted
+    # snapshot at boot and rewrite it (atomically) after every release.
+    lifetime_tokens_path = os.environ.get(
+        "MLX_M3_LIFETIME_TOKENS_PATH",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "lifetime_tokens.json"),
+    )
+
+    def _load_lifetime_tokens():
+        try:
+            with open(lifetime_tokens_path, "r", encoding="utf-8") as fh:
+                saved = json.load(fh)
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            logger.warning("lifetime tokens load failed (%s); starting fresh", exc)
+            return
+        if not isinstance(saved, dict):
+            return
+        lifetime = request_state["lifetime_tokens"]
+        for key in lifetime:
+            try:
+                lifetime[key] = int((saved.get("lifetime_tokens") or {}).get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        for key in ("completed", "failed"):
+            try:
+                request_state[key] = int(saved.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        logger.info(
+            "lifetime tokens restored: %s requests, %s tokens total",
+            lifetime.get("requests"), lifetime.get("processed_total"),
+        )
+
+    def _persist_lifetime_tokens():
+        if rank != 0:
+            return
+        with state_lock:
+            snapshot = {
+                "lifetime_tokens": dict(request_state["lifetime_tokens"]),
+                "completed": request_state.get("completed"),
+                "failed": request_state.get("failed"),
+                "saved_at": time.time(),
+            }
+        tmp_path = lifetime_tokens_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump(snapshot, fh)
+            os.replace(tmp_path, lifetime_tokens_path)
+        except Exception as exc:
+            logger.warning("lifetime tokens persist failed: %s", exc)
+
+    if rank == 0:
+        # NOTE: a later `import atexit` inside this function makes the name
+        # function-local; import here too or this line hits it unbound.
+        import atexit
+        _load_lifetime_tokens()
+        atexit.register(_persist_lifetime_tokens)
+    generation_jobs = queue.Queue()
+
+    def schedule_process_exit(delay=0.25):
+        def _delayed_exit():
+            time.sleep(delay)
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        threading.Thread(target=_delayed_exit, daemon=True).start()
+
+    def shutdown_idle_cluster(reason):
+        logger.info("shutting down idle cluster (%s)", reason)
+        try:
+            _bcast({"shutdown": True}, rank)
+        except Exception as e:
+            logger.warning(f"shutdown broadcast failed: {e}")
+        schedule_process_exit()
+
+    def admin_localhost_only(req: Request):
+        client_host = req.client.host if req.client else ""
+        return client_host in ("127.0.0.1", "::1", "localhost")
+
+    def generation_worker():
+        logger.info("[rank 0] persistent generation worker started")
+        while True:
+            job = generation_jobs.get()
+            if job is None:
+                return
+            try:
+                job()
+            except Exception:
+                logger.error(
+                    "[rank 0] unhandled generation worker error:\n%s",
+                    traceback.format_exc(),
+                )
+
+    threading.Thread(target=generation_worker, daemon=True).start()
+
+    def submit_generation_job(job):
+        generation_jobs.put(job)
+
+    async def run_generation_control_job(name, job, timeout=1800):
+        """Run a localhost admin control op on the generation worker thread.
+
+        Some MLX tensors in the live prompt cache are owned by the generation
+        worker's stream. Running serialization from uvicorn's request thread can
+        fail with a missing current Stream, so control jobs that touch KV state
+        must execute on the same worker lane as generation.
+        """
+        done = threading.Event()
+        result = {}
+
+        def _job():
+            acquired = False
+            try:
+                recover_stale_generation_lock(f"before control {name}")
+                generation_lock.acquire()
+                acquired = True
+                set_generation_lock_owner("control", name)
+                # generation_lock first, then the op-channel mutex: control
+                # jobs may broadcast ops (e.g. SSD save) and must own the
+                # channel for the whole job.
+                _RANK0_OP_MUTEX.acquire()
+                try:
+                    result["value"] = job()
+                finally:
+                    _RANK0_OP_MUTEX.release()
+            except BaseException as e:
+                result["error"] = e
+                logger.error(
+                    "[rank 0] generation control job %s failed:\n%s",
+                    name,
+                    traceback.format_exc(),
+                )
+            finally:
+                if acquired:
+                    clear_generation_lock_owner("control")
+                    try:
+                        generation_lock.release()
+                    except RuntimeError:
+                        pass
+                done.set()
+
+        submit_generation_job(_job)
+        completed = await asyncio.to_thread(done.wait, timeout)
+        if not completed:
+            raise TimeoutError(f"generation control job timed out: {name}")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def coordinated_keepwarm(size=32, repeats=1, reason="prompt-cache keepwarm"):
+        with state_lock:
+            if (
+                request_state.get("active") is not None
+                or int(request_state.get("queued") or 0) > 0
+                or request_state.get("shutdown_requested")
+            ):
+                return {"skipped": True, "reason": "generation busy"}
+        acquired = generation_lock.acquire(blocking=False)
+        if not acquired:
+            return {"skipped": True, "reason": "generation lock busy"}
+        set_generation_lock_owner("keepwarm", reason)
+        op_channel_acquired = False
+        try:
+            # generation_lock first, then the op-channel mutex (lock order).
+            # Bounded wait: skip rather than queue behind a long request
+            # transaction holding the broadcast channel.
+            op_channel_acquired = _RANK0_OP_MUTEX.acquire(timeout=2)
+            if not op_channel_acquired:
+                return {"skipped": True, "reason": "rank0 op channel busy"}
+            with state_lock:
+                if (
+                    request_state.get("active") is not None
+                    or int(request_state.get("queued") or 0) > 0
+                    or request_state.get("shutdown_requested")
+                ):
+                    return {"skipped": True, "reason": "generation busy"}
+            if PROMPT_CACHE_KEEPWARM_MODE == "prewarm":
+                snapshot = _prompt_cache_current_prompt_snapshot()
+                if not snapshot:
+                    return {"skipped": True, "reason": "no exact prompt snapshot"}
+                try:
+                    _bcast({
+                        "op": "prewarm_prompt_cache",
+                        "prompt": snapshot["prompt"],
+                        "token_ids": snapshot["token_ids"],
+                        "reason": reason,
+                        "visible_source": "idle_keepwarm",
+                        "thinking_mode": DEFAULT_THINKING_MODE,
+                        "session_id": snapshot.get("session_id"),
+                        "session_source": snapshot.get("session_source"),
+                    }, rank)
+                except Exception as e:
+                    logger.debug("coordinated keepwarm prewarm broadcast failed: %s", e)
+                    return {"ok": False, "error": str(e), "reason": reason}
+                started = time.time()
+                ok = _prewarm_prompt_cache(
+                    model,
+                    processor,
+                    snapshot["prompt"],
+                    snapshot["token_ids"],
+                    reason=reason,
+                    session_id=snapshot.get("session_id"),
+                    session_source=snapshot.get("session_source"),
+                    reset_on_failure=False,
+                )
+                return {
+                    "ok": bool(ok),
+                    "action": "prompt_cache_prewarm",
+                    "reason": reason,
+                    "at": round(time.time(), 3),
+                    "prompt_tokens": len(snapshot["token_ids"]),
+                    "cache_len": snapshot.get("cache_len"),
+                    "elapsed_ms": round((time.time() - started) * 1000, 3),
+                }
+            try:
+                _bcast({
+                    "op": "metal_warmup",
+                    "matrix_size": size,
+                    "repeats": repeats,
+                    "reason": reason,
+                }, rank)
+            except Exception as e:
+                logger.debug("coordinated keepwarm broadcast failed: %s", e)
+                return {"ok": False, "error": str(e), "reason": reason}
+            return _metal_warmup_touch(size=size, repeats=repeats, reason=reason)
+        finally:
+            if op_channel_acquired:
+                _RANK0_OP_MUTEX.release()
+            clear_generation_lock_owner("keepwarm")
+            generation_lock.release()
+
+    _start_prompt_cache_keepwarm(warmup_cb=coordinated_keepwarm)
+
+    post_response_keepwarm_state = {"scheduled": False}
+    post_response_keepwarm_state_lock = threading.Lock()
+
+    def schedule_post_response_keepwarm(req_id):
+        if not PROMPT_CACHE_POST_RESPONSE_KEEPWARM_ENABLED:
+            return False
+        if not _prompt_cache_request_start_keepwarm_candidate(min_idle_seconds=0):
+            return False
+        with post_response_keepwarm_state_lock:
+            if post_response_keepwarm_state["scheduled"]:
+                return False
+            post_response_keepwarm_state["scheduled"] = True
+
+        def _run():
+            delay = max(0.0, PROMPT_CACHE_POST_RESPONSE_KEEPWARM_DELAY_SECONDS)
+            try:
+                if delay > 0:
+                    time.sleep(delay)
+                with state_lock:
+                    busy = (
+                        request_state.get("active") is not None
+                        or int(request_state.get("queued") or 0) > 0
+                        or request_state.get("shutdown_requested")
+                    )
+                if busy:
+                    return
+                acquired = generation_lock.acquire(blocking=False)
+                if not acquired:
+                    return
+                set_generation_lock_owner("keepwarm", f"post-response:{req_id}")
+                op_channel_acquired = False
+                try:
+                    # generation_lock first, then the op-channel mutex (lock
+                    # order). Bounded wait: skip rather than queue behind a
+                    # long request transaction holding the broadcast channel.
+                    op_channel_acquired = _RANK0_OP_MUTEX.acquire(timeout=2)
+                    if not op_channel_acquired:
+                        return
+                    with state_lock:
+                        busy = (
+                            request_state.get("active") is not None
+                            or int(request_state.get("queued") or 0) > 0
+                            or request_state.get("shutdown_requested")
+                        )
+                    if busy:
+                        return
+                    candidate = _prompt_cache_request_start_keepwarm_candidate(
+                        min_idle_seconds=0
+                    )
+                    if not candidate:
+                        return
+                    size = PROMPT_CACHE_POST_RESPONSE_KEEPWARM_MATRIX_SIZE
+                    repeats = PROMPT_CACHE_POST_RESPONSE_KEEPWARM_REPEATS
+                    reason = f"post-response keepwarm:{req_id}"
+                    started = time.time()
+                    _bcast({
+                        "op": "metal_warmup",
+                        "matrix_size": size,
+                        "repeats": repeats,
+                        "reason": reason,
+                    }, rank)
+                    local = _metal_warmup_touch(
+                        size=size,
+                        repeats=repeats,
+                        reason=reason,
+                    )
+                    event = {
+                        "ok": bool(local.get("ok")),
+                        "action": "post_response_metal_touch",
+                        "at": round(time.time(), 3),
+                        "elapsed_ms": round((time.time() - started) * 1000, 3),
+                        "matrix_size": int(local.get("matrix_size") or size),
+                        "repeats": int(local.get("repeats") or repeats),
+                        **candidate,
+                    }
+                    if not local.get("ok"):
+                        event["error"] = local.get("error")
+                    with _prompt_cache_lock:
+                        holder = _prompt_cache_holder
+                        holder["last_keepwarm_event"] = event
+                        holder["last_keepwarm_at"] = event["at"]
+                        holder["keepwarm_count"] = int(holder.get("keepwarm_count") or 0) + 1
+                    logger.info(
+                        "prompt-cache post-response keepwarm after %s: %s",
+                        req_id,
+                        event,
+                    )
+                finally:
+                    if op_channel_acquired:
+                        _RANK0_OP_MUTEX.release()
+                    clear_generation_lock_owner("keepwarm")
+                    try:
+                        generation_lock.release()
+                    except RuntimeError:
+                        pass
+            except Exception as e:
+                with _prompt_cache_lock:
+                    _prompt_cache_holder["last_keepwarm_event"] = {
+                        "ok": False,
+                        "action": "post_response_metal_touch_error",
+                        "at": round(time.time(), 3),
+                        "error": str(e),
+                    }
+                logger.debug("prompt-cache post-response keepwarm failed: %s", e)
+            finally:
+                with post_response_keepwarm_state_lock:
+                    post_response_keepwarm_state["scheduled"] = False
+
+        threading.Thread(
+            target=_run,
+            name="prompt-cache-post-response-keepwarm",
+            daemon=True,
+        ).start()
+        return True
+
+    def request_start_keepwarm(req_id):
+        if not PROMPT_CACHE_REQUEST_START_KEEPWARM_ENABLED:
+            return None
+        candidate = _prompt_cache_request_start_keepwarm_candidate()
+        if not candidate:
+            return None
+        size = PROMPT_CACHE_REQUEST_START_KEEPWARM_MATRIX_SIZE
+        repeats = PROMPT_CACHE_REQUEST_START_KEEPWARM_REPEATS
+        reason = f"request-start keepwarm:{req_id}"
+        started = time.time()
+        # Warm bcast + local touch is one op-channel transaction. Reentrant
+        # under the request transaction (the producer already owns the
+        # channel); bounded so any other caller skips instead of queueing.
+        if not _RANK0_OP_MUTEX.acquire(timeout=2):
+            return None
+        try:
+            _bcast({
+                "op": "metal_warmup",
+                "matrix_size": size,
+                "repeats": repeats,
+                "reason": reason,
+            }, rank)
+            local = _metal_warmup_touch(
+                size=size,
+                repeats=repeats,
+                reason=reason,
+            )
+            event = {
+                "ok": bool(local.get("ok")),
+                "action": "request_start_metal_touch",
+                "at": round(time.time(), 3),
+                "elapsed_ms": round((time.time() - started) * 1000, 3),
+                "matrix_size": int(local.get("matrix_size") or size),
+                "repeats": int(local.get("repeats") or repeats),
+                **candidate,
+            }
+            if not local.get("ok"):
+                event["error"] = local.get("error")
+            with _prompt_cache_lock:
+                holder = _prompt_cache_holder
+                holder["last_keepwarm_event"] = event
+                holder["last_keepwarm_at"] = event["at"]
+                holder["keepwarm_count"] = int(holder.get("keepwarm_count") or 0) + 1
+            logger.info(
+                "prompt-cache request-start keepwarm for %s: %s",
+                req_id,
+                event,
+            )
+            return event
+        except Exception as e:
+            event = {
+                "ok": False,
+                "action": "request_start_metal_touch_error",
+                "at": round(time.time(), 3),
+                "elapsed_ms": round((time.time() - started) * 1000, 3),
+                "error": str(e),
+                **candidate,
+            }
+            with _prompt_cache_lock:
+                _prompt_cache_holder["last_keepwarm_event"] = event
+            logger.debug("prompt-cache request-start keepwarm failed: %s", e)
+            return event
+        finally:
+            _RANK0_OP_MUTEX.release()
+
+    def _cache_effective_metrics(summary):
+        shape = summary.get("request_shape") or {}
+        prepare = summary.get("prompt_cache_prepare") or {}
+        processed_prompt_tokens = int(summary.get("prompt_tokens") or 0)
+        full_prompt_tokens = int(
+            shape.get("full_prompt_tokens")
+            or prepare.get("prompt_tokens")
+            or processed_prompt_tokens
+        )
+        reuse_tokens = int(prepare.get("reuse_tokens") or 0)
+        avoided_tokens = max(0, full_prompt_tokens - processed_prompt_tokens, reuse_tokens)
+        first_token_s = float(summary.get("first_token_s") or 0.0)
+        cache_efficiency = (
+            round(avoided_tokens / full_prompt_tokens, 4)
+            if full_prompt_tokens > 0 else 0.0
+        )
+        effective_prompt_tps = (
+            round(full_prompt_tokens / first_token_s, 2)
+            if first_token_s > 0 and full_prompt_tokens > 0 else 0.0
+        )
+        return {
+            "full_prompt_tokens": full_prompt_tokens,
+            "processed_prompt_tokens": processed_prompt_tokens,
+            "cache_avoided_prompt_tokens": avoided_tokens,
+            "cache_efficiency": cache_efficiency,
+            "effective_prompt_tps": effective_prompt_tps,
+            "prompt_tps_excluding_cache": float(summary.get("prompt_tps") or 0.0),
+        }
+
+    def _history_row(summary):
+        shape = summary.get("request_shape") or {}
+        prepare = summary.get("prompt_cache_prepare") or {}
+        cache_metrics = _cache_effective_metrics(summary)
+        return {
+            "id": summary.get("id"),
+            "ok": bool(summary.get("ok")),
+            "finished_at": summary.get("finished_at"),
+            "model": shape.get("response_model") or shape.get("requested_model"),
+            "thinking_mode": shape.get("thinking_mode"),
+            "stream": bool(summary.get("stream")),
+            "tools_count": int(shape.get("tools_count") or 0),
+            "image_count": int(shape.get("image_count") or 0),
+            "tokens": int(summary.get("tokens") or 0),
+            "reasoning_chars": int(summary.get("reasoning_chars") or 0),
+            "content_chars": int(summary.get("content_chars") or 0),
+            "reasoning_only": (
+                int(summary.get("reasoning_chars") or 0) > 0
+                and int(summary.get("content_chars") or 0) == 0
+            ),
+            "prompt_tokens": int(summary.get("prompt_tokens") or 0),
+            "full_prompt_tokens": cache_metrics["full_prompt_tokens"],
+            "processed_prompt_tokens": cache_metrics["processed_prompt_tokens"],
+            "prompt_tps": float(summary.get("prompt_tps") or 0.0),
+            "prompt_tps_excluding_cache": cache_metrics["prompt_tps_excluding_cache"],
+            "effective_prompt_tps": cache_metrics["effective_prompt_tps"],
+            "decode_tps": float(summary.get("decode_tps") or 0.0),
+            "request_tps": float(summary.get("tps") or 0.0),
+            "ttft_s": float(summary.get("first_token_s") or 0.0),
+            "first_generator_token_s": float(
+                summary.get("first_generator_token_s") or 0.0
+            ),
+            "first_visible_delta_s": float(
+                summary.get("first_visible_delta_s") or 0.0
+            ),
+            "cache_prepare_s": float(summary.get("cache_prepare_s") or 0.0),
+            "first_yield_after_generate_s": float(
+                summary.get("first_yield_after_generate_s") or 0.0
+            ),
+            "runtime_lock_wait_s": float(
+                summary.get("runtime_lock_wait_s") or 0.0
+            ),
+            "first_yield_after_lock_s": float(
+                summary.get("first_yield_after_lock_s") or 0.0
+            ),
+            "cache_action": prepare.get("action"),
+            "cache_miss_reason": prepare.get("miss_reason"),
+            # 2026-07-06 audit: prepare-time reuse_ratio lies on rebuild rows
+            # (hard 0 even when a prefix matched) and on bypass rows (positive
+            # reuse that was never applied). The generator's cached_tokens is
+            # ground truth for what this request actually skipped.
+            "cache_reuse_ratio": (
+                round(
+                    cache_metrics["cache_avoided_prompt_tokens"]
+                    / cache_metrics["full_prompt_tokens"],
+                    4,
+                )
+                if cache_metrics.get("full_prompt_tokens")
+                else prepare.get("reuse_ratio")
+            ),
+            "cache_prepare_reuse_ratio": prepare.get("reuse_ratio"),
+            "cache_reuse_tokens": prepare.get("reuse_tokens"),
+            "cache_suffix_tokens": prepare.get("suffix_tokens"),
+            "cache_min_suffix_backtrack_tokens": prepare.get("min_suffix_backtrack_tokens"),
+            "cache_missed_tokens": prepare.get("missed_tokens"),
+            "cache_avoided_prompt_tokens": cache_metrics["cache_avoided_prompt_tokens"],
+            "cache_efficiency": cache_metrics["cache_efficiency"],
+            "cache_would_reprocess_tokens": prepare.get("would_reprocess_tokens"),
+            "protected_cache_tokens": prepare.get("protected_cache_tokens"),
+            "protected_session_id": prepare.get("protected_session_id"),
+        }
+
+    def _history_stats(rows):
+        ok_rows = [
+            row for row in rows
+            if row.get("ok") and int(row.get("tokens") or 0) > 0
+        ]
+        meaningful = [
+            row for row in ok_rows
+            if int(row.get("tokens") or 0) >= 16
+        ]
+        prompt_meaningful = [
+            row for row in ok_rows
+            if int(row.get("processed_prompt_tokens") or row.get("prompt_tokens") or 0) >= 512
+        ]
+        hot = [
+            row for row in ok_rows
+            if float(row.get("cache_reuse_ratio") or 0.0) >= 0.95
+        ]
+        effective_hot = [
+            row for row in ok_rows
+            if float(row.get("cache_efficiency") or 0.0) >= 0.95
+        ]
+        bypassed = [
+            row for row in ok_rows
+            if str(row.get("cache_action") or "").startswith("bypass_preserve")
+        ]
+        if not ok_rows:
+            return {
+                "count": len(rows),
+                "ok_count": 0,
+                "meaningful_count": 0,
+                "hot_count": 0,
+                "effective_hot_count": 0,
+                "protected_bypass_count": 0,
+                "total_cache_reuse_tokens": 0,
+                "total_cache_avoided_prompt_tokens": 0,
+            }
+
+        def avg(key, items):
+            # Ratios/efficiencies must average over ALL rows: excluding zeros
+            # turned "avg reuse" into "avg reuse among requests that reused
+            # anything", hiding total cache loss (2026-07-06 audit).
+            if key.endswith("_ratio") or key.endswith("efficiency"):
+                vals = [float(row.get(key) or 0.0) for row in items]
+                return round(sum(vals) / len(vals), 4) if vals else 0.0
+            vals = [float(row.get(key) or 0.0) for row in items if float(row.get(key) or 0.0) > 0]
+            return round(sum(vals) / len(vals), 2) if vals else 0.0
+
+        def total(key, items):
+            return int(sum(int(row.get(key) or 0) for row in items))
+
+        return {
+            "count": len(rows),
+            "ok_count": len(ok_rows),
+            "meaningful_count": len(meaningful),
+            "hot_count": len(hot),
+            "effective_hot_count": len(effective_hot),
+            "protected_bypass_count": len(bypassed),
+            "avg_decode_tps": avg("decode_tps", meaningful),
+            "avg_prompt_tps": avg("prompt_tps", ok_rows),
+            "avg_prompt_tps_meaningful": avg("prompt_tps", prompt_meaningful),
+            "avg_effective_prompt_tps": avg("effective_prompt_tps", ok_rows),
+            "avg_effective_prompt_tps_meaningful": avg("effective_prompt_tps", prompt_meaningful),
+            "avg_ttft_s": avg("ttft_s", ok_rows),
+            "avg_cache_reuse_ratio": avg("cache_reuse_ratio", ok_rows),
+            "avg_cache_efficiency": avg("cache_efficiency", ok_rows),
+            "effective_hot_avg_ttft_s": avg("ttft_s", effective_hot),
+            "effective_hot_avg_decode_tps": avg("decode_tps", effective_hot),
+            "effective_hot_avg_effective_prompt_tps": avg("effective_prompt_tps", effective_hot),
+            "avg_cache_suffix_tokens": avg("cache_suffix_tokens", ok_rows),
+            "hot_avg_suffix_tokens": avg("cache_suffix_tokens", hot),
+            "hot_avg_ttft_s": avg("ttft_s", hot),
+            "hot_avg_decode_tps": avg("decode_tps", hot),
+            "hot_avg_effective_prompt_tps": avg("effective_prompt_tps", hot),
+            "total_cache_reuse_tokens": total("cache_reuse_tokens", ok_rows),
+            "total_cache_avoided_prompt_tokens": total("cache_avoided_prompt_tokens", ok_rows),
+            "total_cache_suffix_tokens": total("cache_suffix_tokens", ok_rows),
+        }
+
+    def recover_stale_generation_lock(reason):
+        with state_lock:
+            owner = dict(generation_lock_owner)
+            owner_kind = owner.get("kind")
+            owner_age = (
+                time.time() - float(owner.get("started_at") or 0.0)
+                if owner.get("started_at") else None
+            )
+            stale = (
+                request_state.get("active") is None
+                and request_state.get("releasing") is None
+                and generation_lock.locked()
+                and not (
+                    owner_kind in {"keepwarm", "control"}
+                    and (owner_age is None or owner_age < 120.0)
+                )
+            )
+            if stale:
+                request_state["last_error"] = (
+                    f"recovered stale generation lock: {reason}"
+                )
+        if not stale:
+            return False
+        try:
+            generation_lock.release()
+            clear_generation_lock_owner()
+            logger.warning("recovered stale generation lock (%s)", reason)
+            return True
+        except RuntimeError:
+            return False
+
+    async def acquire_generation_slot(req_id, *, stream, max_tokens, image_count,
+                                      request_shape=None):
+        recover_stale_generation_lock(f"before acquire {req_id}")
+        acquired = False
+        queued_counted = False
+        with state_lock:
+            request_state["queued"] += 1
+            queued_counted = True
+        wait_started = time.time()
+        try:
+            # Bounded waits + recovery retries: a leaked lock with a single
+            # queued waiter used to block until ANOTHER request arrived to
+            # trigger the before-acquire recovery (P5b sat 6.5 min behind the
+            # one observed leak, 2026-07-07 09:52). Now every waiter re-runs
+            # the stale check itself every 30s — any leak costs <=30s.
+            while True:
+                got = await asyncio.to_thread(generation_lock.acquire, True, 30.0)
+                if got:
+                    break
+                recover_stale_generation_lock(f"acquire-wait retry {req_id}")
+            acquired = True
+            set_generation_lock_owner("request", req_id)
+            active = {
+                "id": req_id,
+                "stream": bool(stream),
+                "max_tokens": int(max_tokens),
+                "image_count": int(image_count),
+                "started": time.time(),
+                "wait_s": round(time.time() - wait_started, 3),
+                "client_connected": True,
+                "tokens_emitted": 0,
+                "chunks_emitted": 0,
+                "chars_raw": 0,
+                "reasoning_chars": 0,
+                "content_chars": 0,
+                "first_token_s": 0.0,
+                "first_generator_token_s": 0.0,
+                "first_visible_delta_s": 0.0,
+                "cache_prepare_s": 0.0,
+                "first_yield_after_generate_s": 0.0,
+                "runtime_lock_wait_s": 0.0,
+                "first_yield_after_lock_s": 0.0,
+                "prefill_processed_tokens": 0,
+                "prefill_total_tokens": 0,
+                "prefill_progress": 0.0,
+                "prefill_last_progress_s": 0.0,
+                "prompt_tps": 0.0,
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
+                "prompt_cache_prepare": None,
+                "generation_elapsed_s": 0.0,
+                "last_progress_s": 0.0,
+                "request_shape": request_shape or {},
+            }
+            with state_lock:
+                request_state["queued"] -= 1
+                queued_counted = False
+                request_state["active"] = active
+        except BaseException:
+            with state_lock:
+                if queued_counted:
+                    request_state["queued"] -= 1
+            if acquired:
+                try:
+                    generation_lock.release()
+                except RuntimeError:
+                    pass
+            raise
+        logger.info(
+            "[rank 0] request %s acquired distributed generation slot "
+            "(stream=%s, max_tokens=%s, images=%s, waited=%.3fs)",
+            req_id, stream, max_tokens, image_count, active["wait_s"],
+        )
+        return active
+
+    def update_generation_slot(active, **updates):
+        with state_lock:
+            current = request_state.get("active")
+            if current is active:
+                if (
+                    "tokens_emitted" in updates
+                    and int(updates.get("tokens_emitted") or 0) > 0
+                    and not current.get("first_token_s")
+                ):
+                    updates["first_token_s"] = round(
+                        time.time() - current["started"], 3
+                    )
+                current.update(updates)
+
+    def _lifetime_with_active(snapshot, active):
+        lifetime = dict(snapshot.get("lifetime_tokens") or {})
+        active_prompt = int(active.get("prompt_tokens") or 0) if active else 0
+        active_decode = int(active.get("tokens_emitted") or 0) if active else 0
+        lifetime["active_prompt_processed"] = active_prompt
+        lifetime["active_decode"] = active_decode
+        lifetime["active_processed_total"] = active_prompt + active_decode
+        lifetime["processed_total_live"] = (
+            int(lifetime.get("processed_total") or 0)
+            + lifetime["active_processed_total"]
+        )
+        lifetime["decode_live"] = int(lifetime.get("decode") or 0) + active_decode
+        lifetime["prompt_processed_live"] = (
+            int(lifetime.get("prompt_processed") or 0) + active_prompt
+        )
+        return lifetime
+
+    def release_generation_slot(req_id, active, error=None):
+        if active is None:
+            logger.warning(
+                "[rank 0] release requested for %s with no active slot object",
+                req_id,
+            )
+            return
+        with state_lock:
+            if active.get("_released"):
+                logger.warning(
+                    "[rank 0] duplicate release ignored for request %s",
+                    req_id,
+                )
+                return
+            active["_released"] = True
+            request_state["releasing"] = req_id
+        shutdown_after_release = False
+        total_elapsed = time.time() - active["started"]
+        generation_elapsed = float(active.get("generation_elapsed_s") or 0.0)
+        elapsed = generation_elapsed if generation_elapsed > 0 else total_elapsed
+        tokens = int(active.get("tokens_emitted") or 0)
+        first_token_s = float(active.get("first_token_s") or 0.0)
+        post_first_s = max(0.0, elapsed - first_token_s) if first_token_s > 0 else 0.0
+        decode_tokens = max(0, tokens - 1)
+        decode_tps = (
+            round(decode_tokens / post_first_s, 2)
+            if post_first_s > 0 and decode_tokens > 0 else 0.0
+        )
+        # Authoritative total TPS for the dashboard. This includes prefill /
+        # time-to-first-token, while decode_tps isolates token generation after
+        # the first token has landed.
+        tps = round(tokens / elapsed, 2) if elapsed > 0 and tokens > 0 else 0.0
+        last_summary = {
+            "id": req_id,
+            "tokens": tokens,
+            "elapsed_s": round(elapsed, 2),
+            "total_elapsed_s": round(total_elapsed, 2),
+            "post_generation_s": round(max(0.0, total_elapsed - elapsed), 2),
+            "tps": tps,
+            "first_token_s": round(first_token_s, 2),
+            "first_generator_token_s": round(
+                float(active.get("first_generator_token_s") or 0.0), 2
+            ),
+            "first_visible_delta_s": round(
+                float(active.get("first_visible_delta_s") or 0.0), 2
+            ),
+            "cache_prepare_s": round(
+                float(active.get("cache_prepare_s") or 0.0), 3
+            ),
+            "first_yield_after_generate_s": round(
+                float(active.get("first_yield_after_generate_s") or 0.0), 3
+            ),
+            "runtime_lock_wait_s": round(
+                float(active.get("runtime_lock_wait_s") or 0.0), 3
+            ),
+            "first_yield_after_lock_s": round(
+                float(active.get("first_yield_after_lock_s") or 0.0), 3
+            ),
+            "prompt_tps": round(float(active.get("prompt_tps") or 0.0), 2),
+            "prompt_tokens": int(active.get("prompt_tokens") or 0),
+            "cached_tokens": int(active.get("cached_tokens") or 0),
+            "prompt_cache_prepare": active.get("prompt_cache_prepare"),
+            "decode_tps": decode_tps,
+            "short_output": tokens > 0 and tokens < 16,
+            "chars": int(active.get("chars_raw") or 0),
+            "reasoning_chars": int(active.get("reasoning_chars") or 0),
+            "content_chars": int(active.get("content_chars") or 0),
+            "stream": bool(active.get("stream")),
+            "ok": error is None,
+            "finished_at": time.time(),
+            "request_shape": active.get("request_shape") or {},
+        }
+        last_summary.update(_cache_effective_metrics(last_summary))
+        processed_prompt_tokens = int(last_summary.get("processed_prompt_tokens") or 0)
+        full_prompt_tokens = int(last_summary.get("full_prompt_tokens") or 0)
+        cached_tokens = int(last_summary.get("cached_tokens") or 0)
+        avoided_prompt_tokens = int(last_summary.get("cache_avoided_prompt_tokens") or 0)
+        decoded_tokens = int(last_summary.get("tokens") or 0)
+        lifetime_delta = {
+            "requests": 1,
+            "prompt_processed": processed_prompt_tokens,
+            "prompt_logical": full_prompt_tokens,
+            "prompt_cached": cached_tokens,
+            "prompt_avoided": avoided_prompt_tokens,
+            "decode": decoded_tokens,
+            "processed_total": processed_prompt_tokens + decoded_tokens,
+            "logical_total": full_prompt_tokens + decoded_tokens,
+        }
+        if error is None:
+            with state_lock:
+                lifetime = request_state["lifetime_tokens"]
+                for key, value in lifetime_delta.items():
+                    lifetime[key] = int(lifetime.get(key) or 0) + int(value or 0)
+                request_state["completed"] += 1
+                request_state["last_error"] = None
+                request_state["active"] = None
+                request_state["last_request"] = last_summary
+                if tokens >= 32:
+                    request_state["last_meaningful_request"] = last_summary
+                history = request_state["recent_requests"]
+                history.append(_history_row(last_summary))
+                if REQUEST_HISTORY_MAX > 0:
+                    del history[:-REQUEST_HISTORY_MAX]
+                else:
+                    history.clear()
+                shutdown_after_release = bool(request_state["shutdown_requested"])
+            _persist_lifetime_tokens()
+        else:
+            with state_lock:
+                lifetime = request_state["lifetime_tokens"]
+                for key, value in lifetime_delta.items():
+                    lifetime[key] = int(lifetime.get(key) or 0) + int(value or 0)
+                request_state["failed"] += 1
+                request_state["last_error"] = f"{type(error).__name__}: {error}"
+                request_state["active"] = None
+                request_state["last_request"] = last_summary
+                if tokens >= 32:
+                    request_state["last_meaningful_request"] = last_summary
+                history = request_state["recent_requests"]
+                history.append(_history_row(last_summary))
+                if REQUEST_HISTORY_MAX > 0:
+                    del history[:-REQUEST_HISTORY_MAX]
+                else:
+                    history.clear()
+                shutdown_after_release = bool(request_state["shutdown_requested"])
+            _persist_lifetime_tokens()
+        logger.info(
+            "[rank 0] request %s released distributed generation slot "
+            "(elapsed=%.2fs, first_token=%.2fs, prompt_tps=%.2f, tokens=%s, "
+            "tps=%.2f, decode_tps=%.2f)",
+            req_id, elapsed, first_token_s, last_summary["prompt_tps"], tokens,
+            tps, decode_tps,
+        )
+        try:
+            clear_generation_lock_owner("request")
+            generation_lock.release()
+        except RuntimeError:
+            logger.warning(
+                "[rank 0] generation lock was already released for request %s",
+                req_id,
+            )
+        finally:
+            with state_lock:
+                if request_state.get("releasing") == req_id:
+                    request_state["releasing"] = None
+        if error is None and tokens > 0:
+            schedule_post_response_keepwarm(req_id)
+        if shutdown_after_release:
+            shutdown_idle_cluster(f"deferred after request {req_id}")
+
+    @asynccontextmanager
+    async def generation_slot(req_id, *, stream, max_tokens, image_count,
+                              request_shape=None):
+        active = await acquire_generation_slot(
+            req_id, stream=stream, max_tokens=max_tokens,
+            image_count=image_count, request_shape=request_shape
+        )
+        error = None
+        try:
+            yield
+        except BaseException as e:
+            error = e
+            raise
+        finally:
+            release_generation_slot(req_id, active, error)
+
+    @app.get("/health")
+    async def health():
+        with state_lock:
+            snapshot = dict(request_state)
+            recent_requests = list(request_state.get("recent_requests") or [])
+        active = snapshot["active"]
+        if active is None and int(snapshot.get("queued") or 0) == 0:
+            _recover_stale_prompt_cache_in_use("health idle recovery")
+        if active is not None:
+            active = dict(active)
+            elapsed = time.time() - active["started"]
+            active["elapsed_s"] = round(elapsed, 3)
+            tokens = int(active.get("tokens_emitted") or 0)
+            first_token_s = float(active.get("first_token_s") or 0.0)
+            post_first_s = max(0.0, elapsed - first_token_s) if first_token_s > 0 else 0.0
+            decode_tokens = max(0, tokens - 1)
+            active["decode_tps"] = round(decode_tokens / post_first_s, 2) if post_first_s > 0 and decode_tokens > 0 else 0.0
+            active["request_tps"] = round(tokens / elapsed, 2) if elapsed > 0 and tokens > 0 else 0.0
+            last_progress = float(active.get("last_progress_s") or 0.0)
+            active["seconds_since_progress"] = round(
+                elapsed - last_progress if last_progress > 0 else elapsed,
+                3,
+            )
+            processed = int(active.get("prefill_processed_tokens") or 0)
+            total = int(active.get("prefill_total_tokens") or 0)
+            if tokens > 0:
+                active["phase"] = "decode"
+            elif total > 0 and processed < total:
+                active["phase"] = "prefill"
+            elif total > 0 and processed >= total:
+                active["phase"] = "decode_starting"
+            else:
+                active["phase"] = "preparing"
+        return {"status": "healthy", "loaded_model": MODEL_ID,
+                "loaded_model_path": MODEL,
+                "distributed": SHARDING_MODE, "ranks": int(mx.distributed.init().size()),
+                "generation_lock_owner": dict(generation_lock_owner),
+                "metal_limits": _METAL_LIMITS,
+                "omlx_minimax_overlay": OMLX_MINIMAX_OVERLAY,
+                "single_flight": EFFECTIVE_MAX_CONCURRENT_REQUESTS == 1,
+                "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
+                "effective_max_concurrent_requests": EFFECTIVE_MAX_CONCURRENT_REQUESTS,
+                "stream_mode": STREAM_MODE,
+                "generation_defaults": _generation_defaults_status(),
+                "kernel_stats": _kernel_stats_status(),
+                "metal_warmup": _metal_warmup_status(),
+                "request_queue_depth": snapshot["queued"],
+                "active_request": active,
+                "requests_completed": snapshot["completed"],
+                "requests_failed": snapshot["failed"],
+                "prompt_cache": _prompt_cache_status(),
+                "lifetime_tokens": _lifetime_with_active(snapshot, active),
+                "last_request": snapshot.get("last_request"),
+                "last_meaningful_request": snapshot.get("last_meaningful_request"),
+                "recent_requests": recent_requests,
+                "recent_request_stats": _history_stats(recent_requests),
+                "last_error": snapshot["last_error"]}
+
+    @app.get("/v1/models")
+    async def models():
+        return {"object": "list", "data": [
+            {"id": model_id, "object": "model", "created": 1, "owned_by": "mlx-vlm"}
+            for model_id in VISIBLE_MODEL_IDS
+        ]}
+
+    @app.post("/admin/request-history/reset")
+    async def admin_request_history_reset(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "request history reset is localhost-only"},
+            )
+        with state_lock:
+            cleared = len(request_state.get("recent_requests") or [])
+            request_state["recent_requests"] = []
+        return {"ok": True, "cleared": cleared, "recent_request_stats": _history_stats([])}
+
+    @app.post("/admin/shutdown")
+    async def admin_shutdown(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "admin shutdown is localhost-only"},
+            )
+
+        logger.info("localhost admin shutdown requested")
+        with state_lock:
+            request_state["shutdown_requested"] = True
+            active = request_state["active"]
+            if active is not None:
+                active = dict(active)
+                active["elapsed_s"] = round(time.time() - active["started"], 3)
+
+        if active is not None:
+            logger.info("shutdown deferred until active request finishes: %s", active)
+            return {"status": "deferred", "active_request": active}
+
+        shutdown_idle_cluster("admin request")
+        return {"status": "shutting_down"}
+
+    @app.post("/unload")
+    @app.post("/v1/unload")
+    async def unload(req: Request):
+        # A pipeline-split M3 cannot be hot-unloaded safely while keeping the
+        # distributed process alive. Match the user-facing intent of mlx_vlm's
+        # unload endpoint by doing the clean distributed shutdown path.
+        return await admin_shutdown(req)
+
+    @app.post("/admin/prompt-cache/reset")
+    @app.post("/v1/prompt-cache/reset")
+    async def admin_prompt_cache_reset(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "prompt cache reset is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        body = {}
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        clear_memory = bool(body.get("clear_memory", True))
+        clear_manifest = bool(body.get("clear_manifest", False))
+        reason = str(body.get("reason") or "admin reset")
+        logger.info(
+            "localhost prompt-cache reset requested (clear_memory=%s, clear_manifest=%s)",
+            clear_memory,
+            clear_manifest,
+        )
+        try:
+            _bcast({
+                "op": "reset_prompt_cache",
+                "reason": reason,
+                "clear_memory": clear_memory,
+                "clear_manifest": clear_manifest,
+            }, rank)
+        except Exception as e:
+            logger.warning("prompt-cache reset broadcast failed: %s", e)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"prompt-cache reset broadcast failed: {e}"},
+            )
+        if clear_memory:
+            _reset_prompt_cache_and_clear_memory(reason, clear_manifest=clear_manifest)
+        else:
+            _reset_prompt_cache(reason, clear_manifest=clear_manifest)
+        return {"ok": True, "prompt_cache": _prompt_cache_status()}
+
+    @app.post("/admin/prompt-cache/ssd/prune")
+    @app.post("/v1/prompt-cache/ssd/prune")
+    async def admin_prompt_cache_ssd_prune(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "persistent cache prune is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        reason = str(body.get("reason") or "admin prune")
+        # bcast + local prune is one op-channel transaction. Bounded wait: a
+        # request racing past the idle check above must not park the event
+        # loop behind its whole generation.
+        if not _RANK0_OP_MUTEX.acquire(timeout=2):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "rank0 op channel busy; retry when idle"},
+            )
+        try:
+            try:
+                _bcast({"op": "prompt_cache_ssd_prune", "reason": reason}, rank)
+            except Exception as e:
+                logger.warning("prompt-cache SSD prune broadcast failed: %s", e)
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"prompt-cache SSD prune broadcast failed: {e}"},
+                )
+            with _prompt_cache_lock:
+                result = _prompt_cache_ssd_prune_unlocked(reason=reason)
+                status = _prompt_cache_status()
+            return {"ok": bool(result.get("ok")), "result": result, "prompt_cache": status}
+        finally:
+            _RANK0_OP_MUTEX.release()
+
+    def _admin_prompt_cache_ssd_save_impl(reason):
+        # bcast + checkpoint + save is one op-channel transaction; reentrant
+        # under run_generation_control_job, which already owns the channel.
+        _RANK0_OP_MUTEX.acquire()
+        try:
+            try:
+                _bcast({"op": "prompt_cache_ssd_save", "reason": reason}, rank)
+            except Exception as e:
+                logger.warning("prompt-cache SSD save broadcast failed: %s", e)
+                raise RuntimeError(f"prompt-cache SSD save broadcast failed: {e}") from e
+            with _prompt_cache_lock:
+                checkpointed = _prompt_cache_make_ssd_checkpoint_unlocked(
+                    reason=reason,
+                )
+                saved = _prompt_cache_ssd_save_current_unlocked(
+                    model,
+                    processor,
+                    reason=reason,
+                )
+                status = _prompt_cache_status()
+            return {
+                "ok": bool(saved),
+                "saved": bool(saved),
+                "checkpointed": bool(checkpointed),
+                "prompt_cache": status,
+            }
+        finally:
+            _RANK0_OP_MUTEX.release()
+
+    @app.post("/admin/prompt-cache/ssd/save")
+    @app.post("/v1/prompt-cache/ssd/save")
+    async def admin_prompt_cache_ssd_save(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "persistent cache save is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        reason = str(body.get("reason") or "admin save")
+        try:
+            return await run_generation_control_job(
+                "prompt_cache_ssd_save",
+                lambda: _admin_prompt_cache_ssd_save_impl(reason),
+            )
+        except Exception as e:
+            logger.warning("prompt-cache SSD save failed: %s", e)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"prompt-cache SSD save failed: {e}"},
+            )
+
+    @app.post("/admin/prompt-cache/ssd/clear")
+    @app.post("/v1/prompt-cache/ssd/clear")
+    async def admin_prompt_cache_ssd_clear(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "persistent cache clear is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        reason = str(body.get("reason") or "admin clear")
+        # bcast + local clear is one op-channel transaction. Bounded wait: a
+        # request racing past the idle check above must not park the event
+        # loop behind its whole generation.
+        if not _RANK0_OP_MUTEX.acquire(timeout=2):
+            return JSONResponse(
+                status_code=409,
+                content={"error": "rank0 op channel busy; retry when idle"},
+            )
+        try:
+            try:
+                _bcast({"op": "prompt_cache_ssd_clear", "reason": reason}, rank)
+            except Exception as e:
+                logger.warning("prompt-cache SSD clear broadcast failed: %s", e)
+                return JSONResponse(
+                    status_code=500,
+                    content={"error": f"prompt-cache SSD clear broadcast failed: {e}"},
+                )
+            with _prompt_cache_lock:
+                result = _prompt_cache_ssd_clear_unlocked(reason=reason)
+                status = _prompt_cache_status()
+            return {"ok": bool(result.get("ok")), "result": result, "prompt_cache": status}
+        finally:
+            _RANK0_OP_MUTEX.release()
+
+    @app.post("/admin/metal-warmup")
+    async def admin_metal_warmup(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "metal warmup is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        size = int(body.get("matrix_size") or 128)
+        repeats = int(body.get("repeats") or 2)
+        reason = str(body.get("reason") or "admin request")
+        try:
+            _bcast({
+                "op": "metal_warmup",
+                "matrix_size": size,
+                "repeats": repeats,
+                "reason": reason,
+            }, rank)
+        except Exception as e:
+            logger.warning("metal warmup broadcast failed: %s", e)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"metal warmup broadcast failed: {e}"},
+            )
+        local = _metal_warmup_touch(size=size, repeats=repeats, reason=reason)
+        return {"ok": bool(local.get("ok")), "local": local}
+
+    @app.post("/admin/runtime-tuning")
+    async def admin_runtime_tuning(req: Request):
+        if not admin_localhost_only(req):
+            return JSONResponse(
+                status_code=403,
+                content={"error": "runtime tuning is localhost-only"},
+            )
+        with state_lock:
+            active = request_state.get("active")
+            queued = int(request_state.get("queued") or 0)
+            active_info = dict(active) if active else None
+        if active_info is not None or queued > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "generation in progress; retry when idle",
+                    "active_request": active_info,
+                    "queue_depth": queued,
+                },
+            )
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        values = body.get("values") if isinstance(body.get("values"), dict) else body
+        if not isinstance(values, dict):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "runtime tuning body must be an object"},
+            )
+        previous = _runtime_tuning_status()
+
+        # Changing decode top-k state (reuse window, sparse block count, sort)
+        # clears per-layer selection caches inside the model on both ranks. On
+        # 2026-07-01 doing that under a hot RAM prompt cache desynchronized
+        # distributed decode (wedged at 132 tokens until the watchdog killed
+        # both ranks and orphaned wired memory). Drop the RAM cache on both
+        # ranks before applying such a change; the next request rebuilds it
+        # from prefill or SSD. Normal requests never hit this path.
+        def _tuning_cmp(value):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return str(value)
+
+        decode_state_keys = (
+            "decode_topk_reuse_tokens",
+            "sparse_topk_blocks",
+            "compact_decode_sort_topk",
+        )
+        decode_state_changing = any(
+            key in values and _tuning_cmp(values[key]) != _tuning_cmp(previous.get(key))
+            for key in decode_state_keys
+        )
+        cache_reset_before_tuning = False
+        if decode_state_changing:
+            pc_status = _prompt_cache_status()
+            resident_slots = (pc_status.get("session_map") or {}).get("resident_slots") or []
+            if pc_status.get("loaded") or resident_slots:
+                reset_reason = "runtime tuning decode top-k state change"
+                try:
+                    _bcast({
+                        "op": "reset_prompt_cache",
+                        "reason": reset_reason,
+                        "clear_memory": False,
+                        "clear_manifest": False,
+                    }, rank)
+                except Exception as e:
+                    logger.warning("pre-tuning prompt-cache reset broadcast failed: %s", e)
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": f"pre-tuning prompt-cache reset broadcast failed: {e}"},
+                    )
+                _reset_prompt_cache(reset_reason, clear_manifest=False)
+                cache_reset_before_tuning = True
+                logger.info(
+                    "dropped RAM prompt cache before decode top-k tuning change: %s",
+                    {k: values[k] for k in decode_state_keys if k in values},
+                )
+
+        try:
+            changed = _set_runtime_tuning(values or {})
+        except ValueError as exc:
+            return JSONResponse(status_code=400, content={"error": str(exc)})
+        try:
+            _bcast({
+                "op": "runtime_tuning",
+                "values": _runtime_tuning_status(),
+            }, rank)
+        except Exception as e:
+            _set_runtime_tuning(previous)
+            _apply_runtime_model_tuning(model)
+            logger.warning("runtime tuning broadcast failed: %s", e)
+            return JSONResponse(
+                status_code=500,
+                content={"error": f"runtime tuning broadcast failed: {e}"},
+            )
+        model_tuning = _apply_runtime_model_tuning(model)
+        logger.info("localhost runtime tuning updated: %s", changed)
+        return {
+            "ok": True,
+            "changed": changed,
+            "cache_reset_before_tuning": cache_reset_before_tuning,
+            "model_tuning": model_tuning,
+            "runtime_tuning": _runtime_tuning_status(),
+            "generation_defaults": _generation_defaults_status(),
+        }
+
+    @app.post("/v1/stop")
+    @app.post("/stop")
+    async def stop_generation(req: Request):
+        """Request an in-flight generation to stop at the next token boundary.
+
+        Sets a flag that run_generation / run_generation_stream check between
+        tokens. Both ranks check at the same boundary (they process identical
+        tokens per step), so the pipeline stays in lockstep when it breaks.
+        The flag is cleared at the start of the next request. This does NOT
+        interrupt a collective mid-flight; it takes effect at the next decode
+        step. If no generation is active, this is a no-op.
+        """
+        with state_lock:
+            active = request_state.get("active")
+            active_info = dict(active) if active else None
+        if active_info is None:
+            return {
+                "stopped": False,
+                "mode": "drain_only",
+                "reason": "no active generation",
+                "active_request": None,
+            }
+        if not SAFE_DECODE_STOP:
+            return {
+                "stopped": False,
+                "mode": "drain_only",
+                "reason": ("decode-phase stop is gated off (MLX_M3_SAFE_DECODE_STOP=0) "
+                           "pending offline acceptance; the request drains to its budget"),
+                "active_request": active_info,
+            }
+        stop_state = _request_inflight_stop("api stop", active_info)
+        if active_info is not None:
+            logger.info("[rank 0] in-flight stop requested for %s", active_info.get("id"))
+        return {
+            "stopped": True,
+            "mode": "distributed_token_boundary",
+            "stop_check_every": STOP_CHECK_EVERY,
+            "prefill_stop_check_every": PREFILL_STOP_CHECK_EVERY,
+            **stop_state,
+            "active_request": active_info,
+        }
+
+    @app.post("/v1/chat/completions")
+    async def chat(request: dict):
+        with state_lock:
+            if request_state["shutdown_requested"]:
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {
+                        "message": "Server is shutting down",
+                        "type": "server_shutdown",
+                    }},
+                )
+
+        msgs = request["messages"]
+        if int(request.get("n", 1) or 1) != 1:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {"message": "Only n=1 is supported by this distributed endpoint",
+                                   "type": "invalid_request_error"}},
+            )
+        requested_max_tokens = request.get(
+            "max_tokens",
+            request.get("max_completion_tokens"),
+        )
+        max_tokens_source = "request" if requested_max_tokens is not None else "default"
+        max_tokens = requested_max_tokens if requested_max_tokens is not None else DEFAULT_MAX_TOKENS
+        max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
+        thinking_mode = _resolve_thinking_mode(request)
+        stream = bool(request.get("stream", False))
+        response_model = _response_model_id(request.get("model"))
+        cache_session_id, cache_session_source = _request_cache_session(request)
+        tools = _tools_from_request(request)
+        if (
+            tools
+            and TOOL_THINKING_MODE != "request"
+            and TOOL_THINKING_MODE in VALID_THINKING_MODES
+            and thinking_mode != TOOL_THINKING_MODE
+        ):
+            logger.info(
+                "tool request using internal thinking_mode=%s (client requested %s)",
+                TOOL_THINKING_MODE,
+                thinking_mode,
+            )
+            thinking_mode = TOOL_THINKING_MODE
+        tool_loop_diag = _tool_loop_steering_diag(msgs, tools) if TOOL_COMPAT_OVERLAY else None
+        if tool_loop_diag:
+            reasons = set(tool_loop_diag.get("reasons") or [])
+            if (
+                "repeated_user_tool_prompt" in reasons
+                and int(tool_loop_diag.get("repeated_user_prompt_count") or 0) >= 3
+            ):
+                logger.warning(
+                    "[rank 0] rejecting repeated user tool prompt loop "
+                    "(count=%s, stream=%s, model=%s)",
+                    tool_loop_diag.get("repeated_user_prompt_count"),
+                    stream,
+                    response_model,
+                )
+                return JSONResponse(
+                    status_code=409,
+                    headers={"Retry-After": "30"},
+                    content={"error": {
+                        "message": (
+                            "Repeated long tool prompt loop detected before "
+                            "inference. Stop this agent run and start a fresh "
+                            "session, or ask for a final answer from gathered "
+                            "context."
+                        ),
+                        "type": "tool_loop_detected",
+                        "code": "repeated_user_tool_prompt",
+                    }},
+                )
+            if "force_final" in reasons:
+                tools = None
+                request["_tool_source"] = "tools_loop_force_final"
+            else:
+                tools, filtered_control_tools = _filter_looping_control_tools(
+                    tools,
+                    tool_loop_diag,
+                )
+                if filtered_control_tools:
+                    tool_loop_diag["filtered_tools"] = filtered_control_tools
+                    request["_tool_source"] = "tools_control_loop_filtered"
+            request["_tool_loop_steering"] = tool_loop_diag
+            logger.warning(
+                "tool-loop steering hint active "
+                "(reasons=%s, tool_turns=%s, tool_results=%s, repeated_tool=%s/%s, filtered=%s, source=%s)",
+                ",".join(tool_loop_diag.get("reasons") or []),
+                tool_loop_diag.get("assistant_tool_turns"),
+                tool_loop_diag.get("tool_results"),
+                tool_loop_diag.get("repeated_tool"),
+                tool_loop_diag.get("repeated_tool_count"),
+                ",".join(tool_loop_diag.get("filtered_tools") or []),
+                request.get("_tool_source"),
+            )
+        tool_module = _load_tool_parser(processor) if tools else None
+        gen_params = _request_generation_params(request, tools=tools)
+
+        # Preserve OpenAI message roles/content for the model's native chat
+        # template. Flattening this to "user: ..." text drops assistant/system
+        # structure and, worse, used to disable add_generation_prompt via a
+        # positional-argument mixup below.
+        processed_messages, images = [], []
+        client_preserves_reasoning = _client_preserves_assistant_reasoning(msgs)
+        for m in msgs:
+            role = m.get("role", "user")
+            msg = {"role": role}
+            content = m.get("content", "")
+            if isinstance(content, list):
+                text_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        if part.get("type") in ("text", "input_text"):
+                            text_parts.append(part.get("text", "") or part.get("content", ""))
+                        else:
+                            image_source = _extract_image_source(part)
+                            if image_source:
+                                images.append(image_source)
+                content_text = "\n".join(p for p in text_parts if p)
+            else:
+                content_text = content
+            if role == "assistant":
+                content_text = _sanitize_inbound_tool_call_content(m, content_text)
+                msg["content"] = _assistant_content_for_template(
+                    m,
+                    content_text,
+                    session_id=cache_session_id,
+                    session_source=cache_session_source,
+                )
+                if (
+                    _enable_thinking_for_generation(thinking_mode)
+                    and PROMPT_CACHE_THINKING_MODE == "visible"
+                    and not _has_model_facing_reasoning(msg.get("content"))
+                ):
+                    msg["reasoning_content"] = " "
+            else:
+                msg["content"] = _sanitize_inbound_message_content(role, content_text)
+            if "tool_calls" in m:
+                msg["tool_calls"] = _normalize_tool_calls(m["tool_calls"])
+            for key in ("tool_call_id", "name"):
+                if key in m:
+                    msg[key] = m[key]
+            processed_messages.append(msg)
+        processed_messages = _add_tool_system_hint_if_needed(
+            processed_messages,
+            request,
+            tools,
+            tool_loop_diag=tool_loop_diag,
+        )
+
+        if (
+            requested_max_tokens is None
+            and OPENWEBUI_DEFAULT_MAX_TOKENS > 0
+            and _request_looks_like_openwebui(request, processed_messages)
+        ):
+            if max_tokens > OPENWEBUI_DEFAULT_MAX_TOKENS:
+                logger.info(
+                    "using OpenWebUI default max_tokens=%s instead of text default %s",
+                    OPENWEBUI_DEFAULT_MAX_TOKENS,
+                    max_tokens,
+                )
+                max_tokens = OPENWEBUI_DEFAULT_MAX_TOKENS
+                max_tokens_source = "openwebui_default"
+
+        prompt_char_count = sum(
+            len(m.get("content") or "") for m in processed_messages
+            if isinstance(m.get("content"), str)
+        )
+        logger.info(
+            "[rank 0] chat request prepared "
+            "(messages=%s, prompt_chars=%s, images=%s, stream=%s, max_tokens=%s, "
+            "thinking=%s, model=%s)",
+            len(processed_messages), prompt_char_count, len(images), stream,
+            max_tokens, thinking_mode, response_model,
+        )
+
+        # Build prompt with M3's chat template + requested thinking_mode
+        from mlx_vlm.prompt_utils import apply_chat_template
+        try:
+            tk = _thinking_template_kwargs(
+                model.config,
+                enable_thinking=(thinking_mode == "enabled"),
+                thinking_mode=thinking_mode,
+            )
+            if tools:
+                tk["tools"] = tools
+            def _render_prompt_with_lock():
+                with _tokenizer_runtime_lock:
+                    return apply_chat_template(
+                        processor,
+                        model.config,
+                        processed_messages,
+                        add_generation_prompt=True,
+                        num_images=len(images),
+                        **tk,
+                    )
+
+            # Do not block uvicorn's event loop while another request is
+            # actively decoding and holding the tokenizer/runtime lock. Without
+            # this, a follow-up OpenWebUI request can make /health time out and
+            # look like an orphan even while the active generation is draining.
+            prompt = await asyncio.to_thread(_render_prompt_with_lock)
+        except Exception as e:
+            logger.warning(f"chat template fallback: {e}")
+            prompt = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}"
+                for m in processed_messages
+            )
+
+        # Broadcast image sources so rank 1 materializes the same visual input
+        # instead of mirroring a text-only request.
+        image_sources = images or None
+        image_path = None
+        if image_sources:
+            if requested_max_tokens is None and IMAGE_DEFAULT_MAX_TOKENS > 0:
+                logger.info(
+                    "using image default max_tokens=%s instead of text default %s",
+                    IMAGE_DEFAULT_MAX_TOKENS,
+                    max_tokens,
+                )
+                max_tokens = IMAGE_DEFAULT_MAX_TOKENS
+                max_tokens_source = "image_default"
+            if IMAGE_MAX_TOKENS > 0 and max_tokens > IMAGE_MAX_TOKENS:
+                logger.info(
+                    "clamping image request max_tokens from %s to %s",
+                    max_tokens,
+                    IMAGE_MAX_TOKENS,
+                )
+                max_tokens = IMAGE_MAX_TOKENS
+                max_tokens_source = "image_clamp"
+            try:
+                image_path = [_materialize_image(src) for src in image_sources]
+                image_path = [p for p in image_path if p]
+                if len(image_path) == 1:
+                    image_path = image_path[0]
+            except Exception as e:
+                logger.warning(f"image load failed: {e}")
+
+        if (
+            requested_max_tokens is None
+            and not stream
+            and not image_sources
+            # Tool turns need room for narration + the call itself; clamping
+            # them to the short chat default guarantees truncated, unusable
+            # tool emissions (observed: 512-token cap eaten by narration).
+            and not tools
+            and NONSTREAM_DEFAULT_MAX_TOKENS > 0
+            and max_tokens > NONSTREAM_DEFAULT_MAX_TOKENS
+        ):
+            logger.info(
+                "using non-stream default max_tokens=%s instead of text default %s",
+                NONSTREAM_DEFAULT_MAX_TOKENS,
+                max_tokens,
+            )
+            max_tokens = NONSTREAM_DEFAULT_MAX_TOKENS
+            max_tokens_source = "nonstream_default"
+
+        _apply_default_thinking_budget(gen_params, thinking_mode, max_tokens)
+
+        # Tokenize the rendered prompt so both ranks share the same cache key
+        # (rank 0 broadcasts token_ids to rank 1 via _bcast). Used for cross-
+        # request prompt caching when MLX_M3_PROMPT_CACHE=1.
+        request_token_ids = (
+            await asyncio.to_thread(_tokenize_prompt, processor, prompt)
+            if _should_tokenize_prompt_for_cache(thinking_mode)
+            else None
+        )
+        if request_token_ids is not None:
+            logger.info(
+                "prompt-cache: tokenized prompt -> %d tokens", len(request_token_ids)
+            )
+        elif PROMPT_CACHE_ENABLED and _enable_thinking_for_generation(thinking_mode):
+            with _prompt_cache_lock:
+                _set_prompt_cache_event(
+                    "thinking_cache_bypass",
+                    prompt_tokens=0,
+                    reuse_tokens=0,
+                    reason=f"MLX_M3_PROMPT_CACHE_THINKING_MODE={PROMPT_CACHE_THINKING_MODE}",
+                    tokenization_skipped=True,
+                )
+
+        # Enforce a sane max_tokens ceiling so a runaway request (e.g. an agent
+        # sending max_tokens=65536) can't grind the single-flight slot for ages.
+        if MAX_TOKENS_CEILING > 0 and max_tokens > MAX_TOKENS_CEILING:
+            logger.info(
+                "clamping max_tokens %s -> %s (MLX_M3_MAX_TOKENS_CEILING)",
+                max_tokens, MAX_TOKENS_CEILING,
+            )
+            max_tokens = MAX_TOKENS_CEILING
+            max_tokens_source = "ceiling"
+
+        request_shape = _request_shape_summary(
+            request,
+            processed_messages,
+            prompt,
+            request_token_ids,
+            thinking_mode=thinking_mode,
+            response_model=response_model,
+            max_tokens=max_tokens,
+            max_tokens_source=max_tokens_source,
+            stream=stream,
+            image_count=len(images),
+            tools=tools,
+            gen_params=gen_params,
+        )
+        if request_token_ids is not None:
+            request_shape["prefill_step_size"] = _runtime_prefill_step_size(
+                len(request_token_ids)
+            )
+
+        # Clear any prior in-flight stop flag at the start of a new request.
+        _clear_stop_request()
+        _clear_prefill_stop_file("rank 0 new request")
+
+        rank_request = {"stop_nonce": uuid.uuid4().hex,
+                        "prompt": prompt, "max_tokens": max_tokens,
+                        "thinking_mode": thinking_mode,
+                        "gen_params": gen_params,
+                        "image_sources": image_sources,
+                        "token_ids": request_token_ids,
+                        "session_id": cache_session_id,
+                        "session_source": cache_session_source,
+                        "tools": tools,
+                        # Tool-bearing requests are buffered and parsed after
+                        # decode, so reaching max_tokens can leave no visible
+                        # content even when the stable tool/template prefix is
+                        # still safe to reuse. Keep the stricter incomplete
+                        # thinking reset for normal chat/agent text, but do
+                        # not let short tool probes wipe the shared tool prefix.
+                        "reset_incomplete_thinking_on_limit": not bool(tools)}
+
+        # Generate WITH robust error handling — never hang, never orphan memory
+        if stream:
+            from fastapi.responses import StreamingResponse
+            import json
+
+            async def sse_stream():
+                req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+                created = int(time.time())
+                out_q = queue.Queue()
+                done_event = threading.Event()
+                client_connected = threading.Event()
+                client_connected.set()
+
+                def _put_sse(payload):
+                    if client_connected.is_set():
+                        out_q.put(f"data: {json.dumps(payload)}\n\n")
+
+                def _producer():
+                    """Live token streaming with synchronized cancel on disconnect.
+
+                    Uses run_generation_stream() (the per-token generator) so each
+                    reasoning/content delta is pushed to the SSE queue IMMEDIATELY
+                    as tokens are decoded -> OpenWebUI shows live token generation.
+
+                    On client disconnect, the SSE wrapper sets the shared stop flag.
+                    Both ranks then observe that flag at the same token-boundary
+                    all-sum check inside run_generation_stream(), release the slot,
+                    and avoid the old drain-to-max_tokens behavior.
+                    """
+                    producer_error = None
+                    full_output = ""
+                    visible_output = ""
+                    reasoning_recall_stored = False
+                    generation_tokens = 0
+                    chunks_emitted = 0
+                    chars_raw = 0
+                    reasoning_chars = 0
+                    content_chars = 0
+                    generation_cancelled = False
+                    rank_request_broadcast = False
+                    op_channel_held = False
+                    tool_stream_pending = ""      # live tool-turn content awaiting holdback release
+                    tool_stream_silenced = False  # once markup risk appears, buffer the rest
+                    tool_streamed_len = 0         # chars already streamed live this tool turn
+                    tool_reasoning_live = ""      # reasoning already streamed live this tool turn
+                    try:
+                        # Own the rank-0 op channel for the WHOLE request
+                        # transaction: keepwarm bcast, request bcast, every
+                        # decode collective, and the mirror barrier in the
+                        # finally below. generation_lock is already held by
+                        # this request (acquired in acquire_generation_slot),
+                        # so lock order holds. RLock: same-thread re-entry by
+                        # request_start_keepwarm is fine.
+                        _RANK0_OP_MUTEX.acquire()
+                        op_channel_held = True
+                        _clear_stop_request()
+                        _clear_prefill_stop_file("rank 0 stream generation start")
+                        _STOP_NONCE["value"] = rank_request.get("stop_nonce")
+                        _FORCE_EOS["active"] = False
+                        request_start_keepwarm(req_id)
+                        _bcast(rank_request, rank)
+                        rank_request_broadcast = True
+                        _put_sse({
+                            "id": req_id, "object": "chat.completion.chunk",
+                            "created": created, "model": response_model,
+                            "choices": [{"index": 0, "delta": {"role": "assistant"},
+                                         "finish_reason": None}],
+                        })
+
+                        def _prefill_progress(processed_tokens, total_tokens):
+                            total_tokens = int(total_tokens or 0)
+                            processed_tokens = int(processed_tokens or 0)
+                            progress = (
+                                processed_tokens / total_tokens
+                                if total_tokens > 0 else 0.0
+                            )
+                            _watchdog_tick(progress=True)
+                            update_generation_slot(
+                                active,
+                                prefill_processed_tokens=processed_tokens,
+                                prefill_total_tokens=total_tokens,
+                                prefill_progress=round(progress, 4),
+                                prefill_last_progress_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                                last_progress_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                            )
+
+                        for chunk in run_generation_stream(
+                            model, processor, prompt, max_tokens, rank,
+                            image=image_path, thinking_mode=thinking_mode,
+                            enable_thinking=_enable_thinking_for_generation(thinking_mode),
+                            gen_params=gen_params,
+                            token_ids=request_token_ids,
+                            session_id=cache_session_id,
+                            session_source=cache_session_source,
+                            reset_incomplete_thinking_on_limit=not bool(tools),
+                            prefill_progress_cb=_prefill_progress,
+                            tool_module=tool_module,
+                            tools=tools,
+                        ):
+                            chunks_emitted += 1
+                            prompt_tps = chunk.pop("_prompt_tps", None) if chunk else None
+                            prompt_tokens = chunk.pop("_prompt_tokens", None) if chunk else None
+                            cached_tokens = chunk.pop("_cached_tokens", None) if chunk else None
+                            prompt_cache_prepare = chunk.pop("_prompt_cache_prepare", None) if chunk else None
+                            cache_prepare_started_at = chunk.pop("_cache_prepare_started_at", None) if chunk else None
+                            cache_prepare_finished_at = chunk.pop("_cache_prepare_finished_at", None) if chunk else None
+                            stream_generate_started_at = chunk.pop("_stream_generate_started_at", None) if chunk else None
+                            runtime_lock_wait_started_at = chunk.pop("_runtime_lock_wait_started_at", None) if chunk else None
+                            runtime_lock_acquired_at = chunk.pop("_runtime_lock_acquired_at", None) if chunk else None
+                            first_generator_yield_at = chunk.pop("_first_generator_yield_at", None) if chunk else None
+                            if chunk and chunk.pop("_cancelled", False):
+                                generation_cancelled = True
+                            if chunk:
+                                generation_tokens = int(
+                                    chunk.pop("_generation_tokens", None)
+                                    or generation_tokens
+                                    or chunks_emitted
+                                )
+                            metric_updates = {}
+                            if prompt_tps:
+                                metric_updates["prompt_tps"] = float(prompt_tps)
+                            if prompt_tokens:
+                                metric_updates["prompt_tokens"] = int(prompt_tokens)
+                            if cached_tokens:
+                                metric_updates["cached_tokens"] = int(cached_tokens)
+                            if prompt_cache_prepare:
+                                metric_updates["prompt_cache_prepare"] = prompt_cache_prepare
+                            if (
+                                cache_prepare_started_at
+                                and cache_prepare_finished_at
+                            ):
+                                metric_updates["cache_prepare_s"] = round(
+                                    cache_prepare_finished_at
+                                    - cache_prepare_started_at,
+                                    3,
+                                )
+                            if first_generator_yield_at:
+                                metric_updates["first_generator_token_s"] = round(
+                                    first_generator_yield_at - active["started"],
+                                    3,
+                                )
+                            if (
+                                first_generator_yield_at
+                                and stream_generate_started_at
+                            ):
+                                metric_updates["first_yield_after_generate_s"] = round(
+                                    first_generator_yield_at
+                                    - stream_generate_started_at,
+                                    3,
+                                )
+                            if (
+                                runtime_lock_wait_started_at
+                                and runtime_lock_acquired_at
+                            ):
+                                metric_updates["runtime_lock_wait_s"] = round(
+                                    runtime_lock_acquired_at
+                                    - runtime_lock_wait_started_at,
+                                    3,
+                                )
+                            if (
+                                first_generator_yield_at
+                                and runtime_lock_acquired_at
+                            ):
+                                metric_updates["first_yield_after_lock_s"] = round(
+                                    first_generator_yield_at
+                                    - runtime_lock_acquired_at,
+                                    3,
+                                )
+                            if chunk is None:
+                                update_generation_slot(
+                                    active,
+                                    tokens_emitted=generation_tokens,
+                                    chunks_emitted=chunks_emitted,
+                                    last_progress_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                    **metric_updates,
+                                )
+                                continue
+                            # _raw carries the full decoded text for tool-call parsing later
+                            raw = chunk.pop("_raw", None)
+                            if raw:
+                                chars_raw += len(raw)
+                                full_output += raw
+                            update_generation_slot(
+                                active,
+                                chars_raw=chars_raw,
+                                reasoning_chars=reasoning_chars,
+                                content_chars=content_chars,
+                                tokens_emitted=generation_tokens,
+                                chunks_emitted=chunks_emitted,
+                                last_progress_s=round(time.time() - active["started"], 3),
+                                **metric_updates,
+                            )
+                            # If the client disconnected, the SSE wrapper has
+                            # already requested distributed cancellation. Keep
+                            # consuming until the next synchronized stop boundary,
+                            # but do not queue more SSE chunks.
+                            if not client_connected.is_set():
+                                continue
+                            # Tool-bearing requests: reasoning deltas stream
+                            # live (oMLX parity); raw tool XML is still parsed
+                            # only at the final step so it never leaks as text.
+                            # With MLX_M3_TOOL_STREAM_CONTENT=1, plain visible
+                            # content also streams live (holdback tail so
+                            # markup can never leak; silent once marker risk
+                            # appears).
+                            if tools:
+                                # Thinking streams live on tool turns exactly
+                                # like oMLX: the splitter routes tool markup to
+                                # the content channel (post-</mm:think>), so
+                                # reasoning deltas can never leak tool XML and
+                                # need no holdback. Degenerate marker spam is
+                                # still reaped by the classifier on _raw.
+                                r_piece = chunk.get("reasoning") or ""
+                                if r_piece and EMIT_TOOL_REASONING:
+                                    reasoning_chars += len(r_piece)
+                                    tool_reasoning_live += r_piece
+                                    if not active.get("first_visible_delta_s"):
+                                        metric_updates["first_visible_delta_s"] = round(
+                                            time.time() - active["started"], 3
+                                        )
+                                        update_generation_slot(active, **metric_updates)
+                                    _put_sse({
+                                        "id": req_id, "object": "chat.completion.chunk",
+                                        "created": created, "model": response_model,
+                                        "choices": [{"index": 0,
+                                                     "delta": {"reasoning_content": r_piece},
+                                                     "finish_reason": None}],
+                                    })
+                                if not TOOL_STREAM_CONTENT or tool_stream_silenced:
+                                    continue
+                                piece = chunk.get("content") or ""
+                                if not piece:
+                                    continue
+                                tool_stream_pending += piece
+                                # Release text up to any '<', then classify it:
+                                # a real tool-marker prefix silences the turn;
+                                # ordinary angle brackets (code! generics!
+                                # HTML!) stream through. v1 silenced on EVERY
+                                # '<' and killed streaming ~100 tokens into
+                                # code-heavy turns.
+                                # "]<]minimax" catches the namespace token from
+                                # its first byte; "<]minimax" catches it when
+                                # the scan lands on its inner '<'. Without
+                                # them the raw marker streamed to clients
+                                # before "<tool_call" tripped silencing
+                                # (2026-07-06 audit).
+                                _markers = ("<tool_call", "</tool_call",
+                                            "<invoke", "</invoke", "<minimax",
+                                            "<]minimax", "]<]minimax")
+                                out_parts = []
+                                while True:
+                                    lt_a = tool_stream_pending.find("<")
+                                    lt_b = tool_stream_pending.find("]")
+                                    candidates = [x for x in (lt_a, lt_b) if x >= 0]
+                                    lt = min(candidates) if candidates else -1
+                                    if lt < 0:
+                                        safe_len = len(tool_stream_pending) - TOOL_STREAM_HOLDBACK_CHARS
+                                        if safe_len > 0:
+                                            out_parts.append(tool_stream_pending[:safe_len])
+                                            tool_stream_pending = tool_stream_pending[safe_len:]
+                                        break
+                                    out_parts.append(tool_stream_pending[:lt])
+                                    rest = tool_stream_pending[lt:]
+                                    if any(rest.startswith(m) for m in _markers):
+                                        tool_stream_pending = ""
+                                        tool_stream_silenced = True
+                                        break
+                                    if any(m.startswith(rest) for m in _markers):
+                                        # could still become a marker — wait
+                                        tool_stream_pending = rest
+                                        break
+                                    out_parts.append(rest[0])
+                                    tool_stream_pending = rest[1:]
+                                emit_piece = "".join(out_parts)
+                                if not emit_piece:
+                                    continue
+                                visible_output += emit_piece
+                                content_chars += len(emit_piece)
+                                tool_streamed_len += len(emit_piece)
+                                if not active.get("first_visible_delta_s"):
+                                    metric_updates["first_visible_delta_s"] = round(
+                                        time.time() - active["started"], 3
+                                    )
+                                    update_generation_slot(active, **metric_updates)
+                                _put_sse({
+                                    "id": req_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": response_model,
+                                    "choices": [{"index": 0,
+                                                 "delta": {"content": emit_piece},
+                                                 "finish_reason": None}],
+                                })
+                                continue
+                            # Emit any reasoning/content delta live
+                            delta = {}
+                            if chunk.get("reasoning"):
+                                # reasoning_content ONLY — oMLX parity. An extra
+                                # "reasoning" alias makes downstream shims
+                                # italicize thinking into visible chat text.
+                                delta["reasoning_content"] = chunk["reasoning"]
+                                reasoning_chars += len(chunk["reasoning"])
+                            if chunk.get("content"):
+                                delta["content"] = chunk["content"]
+                                visible_output += chunk["content"]
+                                content_chars += len(chunk["content"])
+                            if not delta:
+                                continue
+                            if not active.get("first_visible_delta_s"):
+                                metric_updates["first_visible_delta_s"] = round(
+                                    time.time() - active["started"],
+                                    3,
+                                )
+                                update_generation_slot(active, **metric_updates)
+                            _put_sse({
+                                "id": req_id, "object": "chat.completion.chunk",
+                                "created": created, "model": response_model,
+                                "choices": [{"index": 0, "delta": delta,
+                                             "finish_reason": None}],
+                            })
+
+                        # Generation complete. Parse tool calls from full output.
+                        if generation_cancelled or _user_stop_requested():
+                            _reset_prompt_cache_on_all_ranks(
+                                rank,
+                                "reset after cancelled stream",
+                                clear_memory=False,
+                                clear_manifest=False,
+                                clear_resident=False,
+                            )
+                            logger.info(
+                                "[rank 0] stream %s cancelled before final "
+                                "tool/content parse; finishing without retry text",
+                                req_id,
+                            )
+                            if client_connected.is_set():
+                                _put_sse({
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": response_model,
+                                    "choices": [{"index": 0, "delta": {},
+                                                 "finish_reason": "stop"}],
+                                })
+                                out_q.put("data: [DONE]\n\n")
+                            return
+                        if tools and client_connected.is_set():
+                            def _retry_progress(tokens, chars, metrics=None):
+                                update_generation_slot(
+                                    active,
+                                    tokens_emitted=int(tokens),
+                                    chars_raw=int(chars),
+                                    last_progress_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                )
+                            full_output = _ensure_usable_tool_turn(
+                                model, processor, rank,
+                                full_output=full_output,
+                                rank_request=rank_request,
+                                prompt=prompt,
+                                max_tokens=max_tokens,
+                                thinking_mode=thinking_mode,
+                                gen_params=gen_params,
+                                image_path=image_path,
+                                token_ids=request_token_ids,
+                                session_id=cache_session_id,
+                                session_source=cache_session_source,
+                                tool_module=tool_module,
+                                tools=tools,
+                                processed_messages=processed_messages,
+                                req_id=req_id,
+                                stream=True,
+                                should_abort=lambda: (
+                                    not client_connected.is_set()
+                                    or _user_stop_requested()
+                                ),
+                                progress_cb=_retry_progress,
+                            )
+                        tool_calls, remaining_text = _parse_tool_calls(
+                            full_output, tool_module, tools
+                        )
+                        safe_remaining_text = (
+                            _strip_raw_tool_blocks(
+                                remaining_text or full_output or "",
+                                tool_module,
+                            )
+                            if tools else (remaining_text or full_output or "")
+                        )
+                        raw_tool_marker_only = bool(
+                            tools
+                            and not tool_calls
+                            and (
+                                _looks_like_raw_tool_fragment(full_output, tool_module)
+                                or "[Tool call:" in (full_output or "")
+                            )
+                            and not _strip_thinking_control_markers(
+                                safe_remaining_text or ""
+                            ).strip()
+                        )
+                        if not client_connected.is_set():
+                            _reset_prompt_cache_on_all_ranks(
+                                rank,
+                                "reset after disconnected stream",
+                                clear_memory=False,
+                                clear_manifest=False,
+                                clear_resident=False,
+                            )
+                            logger.warning(
+                                "[rank 0] disconnected stream %s finished after "
+                                "cancel; skipped tool parsing/prewarm cache update",
+                                req_id,
+                            )
+                            return
+                        prewarm_done = False
+                        prewarm_attempted = False
+                        unsafe_empty_tool_turn = False
+                        dropped_invalid_tool_calls = 0
+                        dropped_invalid_tool_names = []
+                        emit_reasoning_fields = _should_emit_reasoning_fields(tools)
+                        if client_connected.is_set():
+                            if tool_calls:
+                                (
+                                    tool_calls,
+                                    dropped_invalid_tool_calls,
+                                    dropped_invalid_tool_names,
+                                ) = (
+                                    _validate_outgoing_tool_calls(
+                                        tool_calls,
+                                        tools,
+                                        return_dropped=True,
+                                        return_dropped_names=True,
+                                    )
+                                )
+                            if not tool_calls and dropped_invalid_tool_calls:
+                                synthesized = _synthesize_write_command_tool_call(
+                                    processed_messages,
+                                    tools,
+                                    dropped_invalid_tool_names,
+                                )
+                                if synthesized:
+                                    logger.warning(
+                                        "[rank 0] stream %s converted malformed "
+                                        "tool call %s into %s for simple write request",
+                                        req_id,
+                                        dropped_invalid_tool_names,
+                                        synthesized["function"]["name"],
+                                    )
+                                    tool_calls = [synthesized]
+                                    dropped_invalid_tool_calls = 0
+                                    dropped_invalid_tool_names = []
+                            if tool_calls:
+                                reasoning_recall_stored = _remember_assistant_reasoning(
+                                    cache_session_id,
+                                    visible_output,
+                                    full_output,
+                                    thinking_mode=thinking_mode,
+                                    session_source=cache_session_source,
+                                    tool_calls=tool_calls,
+                                )
+                                logger.info(
+                                    "[rank 0] stream %s returning tool_calls=%s arg_keys=%s",
+                                    req_id,
+                                    _tool_call_names(tool_calls),
+                                    _tool_call_arg_keys(tool_calls),
+                                )
+                                _put_sse({
+                                    "id": req_id, "object": "chat.completion.chunk",
+                                    "created": created, "model": response_model,
+                                    "choices": [{"index": 0,
+                                                 "delta": {"role": "assistant",
+                                                           "tool_calls": tool_calls},
+                                                "finish_reason": "tool_calls"}],
+                                })
+                            elif tools:
+                                reasoning, content = split_thinking_text(
+                                    safe_remaining_text,
+                                    assume_in_thinking=_enable_thinking_for_generation(
+                                        thinking_mode
+                                    ),
+                                )
+                                if reasoning and tool_reasoning_live:
+                                    # live deltas already delivered a prefix;
+                                    # send only the remainder (or separator +
+                                    # full text when an in-place retry rewrote
+                                    # the turn)
+                                    if reasoning.startswith(tool_reasoning_live):
+                                        reasoning = (
+                                            reasoning[len(tool_reasoning_live):]
+                                            or None
+                                        )
+                                    else:
+                                        reasoning = "\n" + reasoning
+                                if content:
+                                    content = _scrub_goal_state_echo(content)
+                                if content and _looks_like_leaked_reasoning_content(content):
+                                    content = None
+                                if content and tool_streamed_len:
+                                    # live tool-content streaming already
+                                    # delivered a prefix; send only the
+                                    # remainder (or separator + full text when
+                                    # an in-place retry rewrote the turn)
+                                    streamed_prefix = visible_output[-tool_streamed_len:]
+                                    if content.startswith(streamed_prefix):
+                                        content = content[len(streamed_prefix):] or None
+                                    else:
+                                        content = "\n" + content
+                                delta = {}
+                                if reasoning and emit_reasoning_fields:
+                                    delta["reasoning_content"] = reasoning
+                                    reasoning_chars += len(reasoning)
+                                if content:
+                                    delta["content"] = content
+                                    visible_output += content
+                                    content_chars += len(content)
+                                if TOOL_COMPAT_OVERLAY and (
+                                    dropped_invalid_tool_calls
+                                    or (not content and not tool_streamed_len)
+                                ):
+                                    unsafe_empty_tool_turn = True
+                                    if dropped_invalid_tool_calls:
+                                        fallback = _tool_request_fallback_content(
+                                            processed_messages,
+                                            dropped_tool_names=dropped_invalid_tool_names,
+                                            available_tool_names=_tool_names_from_schema(tools),
+                                        )
+                                    else:
+                                        fallback = _strip_raw_tool_blocks(
+                                            _strip_thinking_control_markers(
+                                                safe_remaining_text
+                                            ),
+                                            tool_module,
+                                        ).strip()
+                                        if (
+                                            not fallback
+                                            or _looks_like_leaked_reasoning_content(fallback)
+                                            or len(fallback) < 24
+                                        ):
+                                            fallback = _tool_request_fallback_content(
+                                                processed_messages,
+                                                empty_tool_markers=raw_tool_marker_only,
+                                                thinking_mode=thinking_mode,
+                                            )
+                                        elif _looks_like_leaked_reasoning_content(fallback):
+                                            fallback = _tool_request_fallback_content(
+                                                processed_messages,
+                                                empty_tool_markers=raw_tool_marker_only,
+                                                thinking_mode=thinking_mode,
+                                            )
+                                    delta["content"] = fallback
+                                    visible_output += fallback
+                                    content_chars += len(fallback)
+                                    logger.warning(
+                                        "[rank 0] tool request %s produced no "
+                                        "valid tool_calls or visible content "
+                                        "(dropped_invalid_tool_calls=%s); "
+                                        "sent compatibility fallback and kept RAM prefix cache",
+                                        req_id,
+                                        dropped_invalid_tool_calls,
+                                    )
+                                if delta:
+                                    _put_sse({
+                                        "id": req_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": response_model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": delta,
+                                            "finish_reason": None,
+                                        }],
+                                    })
+                            if not tool_calls and not unsafe_empty_tool_turn:
+                                reasoning_recall_stored = _remember_assistant_reasoning(
+                                    cache_session_id,
+                                    visible_output,
+                                    full_output,
+                                    thinking_mode=thinking_mode,
+                                    session_source=cache_session_source,
+                                )
+                            if (
+                                VISIBLE_TRANSCRIPT_PREWARM_BLOCKING
+                                and not unsafe_empty_tool_turn
+                            ):
+                                prewarm_attempted = True
+                                prewarm_done = _maybe_prewarm_visible_transcript(
+                                    model,
+                                    processor,
+                                    rank,
+                                    processed_messages,
+                                    full_output,
+                                    thinking_mode=thinking_mode,
+                                    generated_tokens=generation_tokens,
+                                    num_images=len(images),
+                                    tools=tools,
+                                    visible_output=visible_output,
+                                    session_id=cache_session_id,
+                                    session_source=cache_session_source,
+                                    preserve_reasoning=(
+                                        client_preserves_reasoning
+                                        or reasoning_recall_stored
+                                    ),
+                                )
+                            _put_sse({
+                                "id": req_id, "object": "chat.completion.chunk",
+                                "created": created, "model": response_model,
+                                "choices": [{"index": 0, "delta": {},
+                                             "finish_reason": "tool_calls" if tool_calls else "stop"}],
+                            })
+                            out_q.put("data: [DONE]\n\n")
+                            update_generation_slot(
+                                active,
+                                generation_elapsed_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                                reasoning_chars=reasoning_chars,
+                                content_chars=content_chars,
+                            )
+                        if (
+                            not prewarm_done
+                            and not prewarm_attempted
+                            and not unsafe_empty_tool_turn
+                        ):
+                            if not tool_calls and not reasoning_recall_stored:
+                                reasoning_recall_stored = _remember_assistant_reasoning(
+                                    cache_session_id,
+                                    visible_output,
+                                    full_output,
+                                    thinking_mode=thinking_mode,
+                                    session_source=cache_session_source,
+                                )
+                            prewarm_attempted = True
+                            prewarm_done = _maybe_prewarm_visible_transcript(
+                                model,
+                                processor,
+                                rank,
+                                processed_messages,
+                                full_output,
+                                thinking_mode=thinking_mode,
+                                generated_tokens=generation_tokens,
+                                num_images=len(images),
+                                tools=tools,
+                                visible_output=visible_output,
+                                session_id=cache_session_id,
+                                session_source=cache_session_source,
+                                preserve_reasoning=(
+                                    client_preserves_reasoning
+                                    or reasoning_recall_stored
+                                ),
+                            )
+                        if (
+                            prewarm_attempted
+                            and not prewarm_done
+                            and _enable_thinking_for_generation(thinking_mode)
+                            and PROMPT_CACHE_THINKING_MODE == "visible"
+                        ):
+                            # 2026-07-06 cache audit (LEAK 1): this used to drop
+                            # the RAM cache on every gate-skipped prewarm "to
+                            # avoid stale generated-tail reuse". In visible mode
+                            # the cache key stores INPUT ids only and
+                            # _prepare_cached_prompt trims the generated tail,
+                            # so stale-tail reuse cannot occur through the
+                            # prefix math; genuinely failed prewarms already
+                            # self-reset inside _prewarm_prompt_cache. The drop
+                            # converted benign skips into full-transcript
+                            # re-prefills (and wiped all resident slots).
+                            logger.info(
+                                "[rank 0] visible thinking prewarm skipped for "
+                                "%s; keeping RAM prompt cache (input-ids key; "
+                                "next turn trims any generated tail)",
+                                req_id,
+                            )
+                    except Exception as e:
+                        producer_error = e
+                        logger.error(f"[rank 0] stream FAILED: {e}\n{traceback.format_exc()}")
+                        if client_connected.is_set():
+                            _put_sse({
+                                "id": req_id, "object": "chat.completion.chunk",
+                                "created": created, "model": response_model,
+                                "choices": [{"index": 0, "delta": {
+                                    "content": f"\n\n[Generation error: {e}]"
+                                }, "finish_reason": "stop"}],
+                            })
+                            out_q.put("data: [DONE]\n\n")
+                    finally:
+                        if rank_request_broadcast:
+                            try:
+                                update_generation_slot(
+                                    active,
+                                    mirror_sync_started_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                    last_progress_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                )
+                                logger.info(
+                                    "[rank 0] stream %s waiting for rank 1 mirror barrier",
+                                    req_id,
+                                )
+                                _bcast(
+                                    {
+                                        "op": "generation_barrier",
+                                        "request_id": req_id,
+                                        "stream": True,
+                                    },
+                                    rank,
+                                )
+                                update_generation_slot(
+                                    active,
+                                    mirror_sync_done_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                    last_progress_s=round(
+                                        time.time() - active["started"], 3
+                                    ),
+                                )
+                                logger.info(
+                                    "[rank 0] stream %s rank 1 mirror barrier complete",
+                                    req_id,
+                                )
+                            except Exception as e:
+                                producer_error = producer_error or e
+                                logger.error(
+                                    "[rank 0] stream %s mirror barrier failed: %s",
+                                    req_id,
+                                    e,
+                                )
+                        # Transaction over (the mirror barrier above was its
+                        # last collective) — release the op channel before
+                        # the slot releases.
+                        if op_channel_held:
+                            _RANK0_OP_MUTEX.release()
+                        if CLEAR_CACHE_AFTER_REQUEST or (
+                            producer_error is not None and CLEAR_CACHE_AFTER_ERROR
+                        ):
+                            mx.clear_cache()
+                        gc.collect()
+                        release_generation_slot(req_id, active, producer_error)
+                        done_event.set()
+                        if client_connected.is_set():
+                            out_q.put(None)
+                        logger.info(
+                            "[rank 0] stream producer done, mlx_cache_cleared=%s "
+                            "(tokens_emitted=%s, chunks=%s, chars=%s, client=%s)",
+                            bool(
+                                CLEAR_CACHE_AFTER_REQUEST
+                                or (
+                                    producer_error is not None
+                                    and CLEAR_CACHE_AFTER_ERROR
+                                )
+                            ),
+                            generation_tokens, chunks_emitted, chars_raw,
+                            "connected" if client_connected.is_set() else "disconnected-cancelled",
+                        )
+
+                active = await acquire_generation_slot(
+                    req_id, stream=True, max_tokens=max_tokens,
+                    image_count=len(images), request_shape=request_shape,
+                )
+                submit_generation_job(_producer)
+                try:
+                    while True:
+                        try:
+                            if SSE_KEEPALIVE_SECONDS > 0:
+                                item = await asyncio.to_thread(
+                                    out_q.get, True, SSE_KEEPALIVE_SECONDS
+                                )
+                            else:
+                                item = await asyncio.to_thread(out_q.get)
+                        except queue.Empty:
+                            keepalive = {
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": response_model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            yield f"data: {json.dumps(keepalive)}\n\n"
+                            continue
+                        if item is None:
+                            break
+                        yield item
+                except (asyncio.CancelledError, GeneratorExit):
+                    client_connected.clear()
+                    updates = {"client_connected": False}
+                    # Client disconnects trigger the SAFE coordinated stop (file-based,
+                    # both ranks halt at an agreed future token boundary — no
+                    # collectives, no race). The old additional UNSAFE_INFLIGHT_STOP
+                    # gate was historical over-caution that made every client's stop
+                    # button a no-op; the only working stop was killing the cluster.
+                    if STOP_ON_CLIENT_DISCONNECT and SAFE_DECODE_STOP:
+                        stop_state = _request_inflight_stop(
+                            "client_disconnect",
+                            dict(active) if active else None,
+                        )
+                        updates["cancel_requested"] = True
+                        updates["cancel_reason"] = "client_disconnect"
+                        updates.update(stop_state)
+                        logger.warning(
+                            "[rank 0] stream client disconnected; distributed "
+                            "stop requested for %s at next token boundary",
+                            req_id,
+                        )
+                    update_generation_slot(active, **updates)
+                    logger.warning(
+                        "[rank 0] stream client disconnected for request %s "
+                        "(stop_on_disconnect=%s, inflight_stop=%s)",
+                        req_id, STOP_ON_CLIENT_DISCONNECT, UNSAFE_INFLIGHT_STOP,
+                    )
+                    raise
+
+            return StreamingResponse(sse_stream(), media_type="text/event-stream")
+
+        # Non-streaming path
+        req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        try:
+            active = await acquire_generation_slot(
+                req_id, stream=False, max_tokens=max_tokens,
+                image_count=len(images), request_shape=request_shape,
+            )
+            done_event = threading.Event()
+            result = {}
+
+            def _job():
+                job_error = None
+                rank_request_broadcast = False
+                op_channel_held = False
+                try:
+                    # Own the rank-0 op channel for the WHOLE request
+                    # transaction: keepwarm bcast, request bcast, every
+                    # decode collective, and the mirror barrier in the
+                    # finally below. generation_lock is already held by this
+                    # request (acquired in acquire_generation_slot), so lock
+                    # order holds. RLock: same-thread re-entry by
+                    # request_start_keepwarm is fine.
+                    _RANK0_OP_MUTEX.acquire()
+                    op_channel_held = True
+                    _clear_stop_request()
+                    _clear_prefill_stop_file("rank 0 non-stream generation start")
+                    request_start_keepwarm(req_id)
+                    _bcast(rank_request, rank)
+                    rank_request_broadcast = True
+                    def _progress(tokens, chars, metrics=None):
+                        metrics = metrics or {}
+                        update_generation_slot(
+                            active,
+                            tokens_emitted=int(tokens),
+                            chars_raw=int(chars),
+                            last_progress_s=round(time.time() - active["started"], 3),
+                            prompt_tps=float(metrics.get("prompt_tps") or active.get("prompt_tps") or 0.0),
+                            prompt_tokens=int(metrics.get("prompt_tokens") or active.get("prompt_tokens") or 0),
+                            cached_tokens=int(metrics.get("cached_tokens") or active.get("cached_tokens") or 0),
+                        )
+                    def _prefill_progress(processed_tokens, total_tokens):
+                        total_tokens = int(total_tokens or 0)
+                        processed_tokens = int(processed_tokens or 0)
+                        progress = (
+                            processed_tokens / total_tokens
+                            if total_tokens > 0 else 0.0
+                        )
+                        _watchdog_tick(progress=True)
+                        update_generation_slot(
+                            active,
+                            prefill_processed_tokens=processed_tokens,
+                            prefill_total_tokens=total_tokens,
+                            prefill_progress=round(progress, 4),
+                            prefill_last_progress_s=round(
+                                time.time() - active["started"], 3
+                            ),
+                            last_progress_s=round(
+                                time.time() - active["started"], 3
+                            ),
+                        )
+                    result["text"] = run_generation(
+                        model, processor, prompt, max_tokens, rank,
+                        image=image_path, thinking_mode=thinking_mode,
+                        gen_params=gen_params, progress_cb=_progress,
+                        token_ids=request_token_ids,
+                        session_id=cache_session_id,
+                        session_source=cache_session_source,
+                        reset_incomplete_thinking_on_limit=not bool(tools),
+                        prefill_progress_cb=_prefill_progress,
+                        tool_module=tool_module,
+                        tools=tools,
+                    )
+                    if tools:
+                        result["text"] = _ensure_usable_tool_turn(
+                            model, processor, rank,
+                            full_output=result["text"],
+                            rank_request=rank_request,
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            thinking_mode=thinking_mode,
+                            gen_params=gen_params,
+                            image_path=image_path,
+                            token_ids=request_token_ids,
+                            session_id=cache_session_id,
+                            session_source=cache_session_source,
+                            tool_module=tool_module,
+                            tools=tools,
+                            processed_messages=processed_messages,
+                            req_id=req_id,
+                            stream=False,
+                            should_abort=_user_stop_requested,
+                            progress_cb=_progress,
+                        )
+                except Exception as e:
+                    job_error = e
+                    result["error"] = e
+                finally:
+                    if rank_request_broadcast:
+                        try:
+                            update_generation_slot(
+                                active,
+                                mirror_sync_started_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                                last_progress_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                            )
+                            logger.info(
+                                "[rank 0] non-stream %s waiting for rank 1 mirror barrier",
+                                req_id,
+                            )
+                            _bcast(
+                                {
+                                    "op": "generation_barrier",
+                                    "request_id": req_id,
+                                    "stream": False,
+                                },
+                                rank,
+                            )
+                            update_generation_slot(
+                                active,
+                                mirror_sync_done_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                                last_progress_s=round(
+                                    time.time() - active["started"], 3
+                                ),
+                            )
+                            logger.info(
+                                "[rank 0] non-stream %s rank 1 mirror barrier complete",
+                                req_id,
+                            )
+                        except Exception as e:
+                            job_error = job_error or e
+                            result.setdefault("error", e)
+                            logger.error(
+                                "[rank 0] non-stream %s mirror barrier failed: %s",
+                                req_id,
+                                e,
+                            )
+                    # Transaction over (the mirror barrier above was its
+                    # last collective) — release the op channel before the
+                    # slot releases.
+                    if op_channel_held:
+                        _RANK0_OP_MUTEX.release()
+                    if CLEAR_CACHE_AFTER_REQUEST or (
+                        job_error is not None and CLEAR_CACHE_AFTER_ERROR
+                    ):
+                        mx.clear_cache()
+                    gc.collect()
+                    release_generation_slot(req_id, active, job_error)
+                    done_event.set()
+
+            submit_generation_job(_job)
+            await asyncio.to_thread(done_event.wait)
+            if "error" in result:
+                raise result["error"]
+            text = result.get("text")
+            logger.info(f"[rank 0] generation complete: {len(text or '')} chars")
+            tool_calls, remaining_text = _parse_tool_calls(text or "", tool_module, tools)
+            dropped_invalid_tool_calls = 0
+            dropped_invalid_tool_names = []
+            if tool_calls:
+                (
+                    tool_calls,
+                    dropped_invalid_tool_calls,
+                    dropped_invalid_tool_names,
+                ) = _validate_outgoing_tool_calls(
+                    tool_calls,
+                    tools,
+                    return_dropped=True,
+                    return_dropped_names=True,
+                )
+            if not tool_calls and dropped_invalid_tool_calls:
+                synthesized = _synthesize_write_command_tool_call(
+                    processed_messages,
+                    tools,
+                    dropped_invalid_tool_names,
+                )
+                if synthesized:
+                    logger.warning(
+                        "[rank 0] non-stream %s converted malformed tool call "
+                        "%s into %s for simple write request",
+                        req_id,
+                        dropped_invalid_tool_names,
+                        synthesized["function"]["name"],
+                    )
+                    tool_calls = [synthesized]
+                    dropped_invalid_tool_calls = 0
+                    dropped_invalid_tool_names = []
+            if tool_calls:
+                logger.info(
+                    "[rank 0] non-stream %s returning tool_calls=%s arg_keys=%s",
+                    req_id,
+                    _tool_call_names(tool_calls),
+                    _tool_call_arg_keys(tool_calls),
+                )
+                _remember_assistant_reasoning(
+                    cache_session_id,
+                    "",
+                    text or "",
+                    thinking_mode=thinking_mode,
+                    session_source=cache_session_source,
+                    tool_calls=tool_calls,
+                )
+                text = remaining_text
+            elif tools:
+                text = _strip_raw_tool_blocks(
+                    remaining_text or text or "",
+                    tool_module,
+                )
+            raw_tool_marker_only = bool(
+                tools
+                and not tool_calls
+                and (
+                    _looks_like_raw_tool_fragment(result.get("text") or "", tool_module)
+                    or "[Tool call:" in (result.get("text") or "")
+                )
+                and not _strip_thinking_control_markers(text or "").strip()
+            )
+            # Split reasoning/content for the non-streaming response too
+            reasoning, content = split_thinking_text(
+                text or "",
+                assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
+            )
+            if tools and content and _looks_like_leaked_reasoning_content(content):
+                content = None
+            emit_reasoning_fields = _should_emit_reasoning_fields(tools)
+            if (
+                TOOL_COMPAT_OVERLAY
+                and tools
+                and not tool_calls
+                and (dropped_invalid_tool_calls or not content)
+            ):
+                if dropped_invalid_tool_calls:
+                    content = _tool_request_fallback_content(
+                        processed_messages,
+                        dropped_tool_names=dropped_invalid_tool_names,
+                        available_tool_names=_tool_names_from_schema(tools),
+                    )
+                else:
+                    fallback_candidate = _strip_raw_tool_blocks(
+                        _strip_thinking_control_markers(remaining_text or text or ""),
+                        tool_module,
+                    ).strip()
+                    if (
+                        not fallback_candidate
+                        or _looks_like_leaked_reasoning_content(fallback_candidate)
+                        or len(fallback_candidate) < 24
+                    ):
+                        content = _tool_request_fallback_content(
+                            processed_messages,
+                            empty_tool_markers=raw_tool_marker_only,
+                            thinking_mode=thinking_mode,
+                        )
+                    else:
+                        content = fallback_candidate
+                    if _looks_like_leaked_reasoning_content(content):
+                        content = _tool_request_fallback_content(
+                            processed_messages,
+                            empty_tool_markers=raw_tool_marker_only,
+                            thinking_mode=thinking_mode,
+                        )
+                logger.warning(
+                    "[rank 0] non-stream tool request %s produced no valid "
+                    "tool_calls or visible content "
+                    "(dropped_invalid_tool_calls=%s); sent compatibility fallback and "
+                    "kept RAM prefix cache",
+                    req_id,
+                    dropped_invalid_tool_calls,
+                )
+            if content and "]<]minimax[>[" in content:
+                # Raw MiniMax markup must never reach a client, including on
+                # tool-less requests where no tool parser/stripper is active.
+                content = content[:content.find("]<]minimax[>[")].strip()
+            if content:
+                content = _scrub_goal_state_echo(content)
+            message = {"role": "assistant", "content": content or ""}
+            if reasoning and emit_reasoning_fields:
+                message["reasoning_content"] = reasoning
+            if tool_calls:
+                message["tool_calls"] = tool_calls
+                message["content"] = None
+            return {"id": req_id,
+                "object": "chat.completion", "created": int(time.time()),
+                "choices": [
+                {"index": 0, "message": message,
+                 "finish_reason": "tool_calls" if tool_calls else "stop"}],
+                "model": response_model}
+        except Exception as e:
+            logger.error(f"[rank 0] generation FAILED, releasing memory: {e}")
+            mx.clear_cache()
+            gc.collect()
+            return JSONResponse(
+                status_code=500,
+                content={"error": {"message": f"Generation failed: {e}",
+                                   "type": "generation_error"}},
+            )
+
+    logger.info(f"Rank 0 serving OpenAI API on {HOST}:{PORT}")
+    # ORPHAN FIX (2026-07-07): uvicorn replaces our SIGTERM handler on the
+    # main thread, and its graceful drain can stall forever behind a hung
+    # request — sweeps then escalate to SIGKILL, stranding ~150GB of wired
+    # Metal memory (three orphans on 2026-07-06, three reboots). Two-part
+    # closure: atexit runs the Metal clear on EVERY python-level exit path
+    # (incl. uvicorn's own TERM shutdown), and a bounded graceful timeout
+    # keeps TERM from stalling into the KILL escalation window.
+    import atexit
+    atexit.register(_clear_mlx_memory, "atexit")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info",
+                timeout_graceful_shutdown=5)
+
+
+def run_mirror(model, processor, rank):
+    """Rank 1: mirror rank 0's generation in lockstep. Robust: on error,
+    release memory, and keep looping for the next request (don't die)."""
+    logger.info("rank 1: mirror loop (waiting for requests)")
+    while True:
+        req = _bcast(None, rank)  # blocks until rank 0 broadcasts
+        if req is None:
+            if RANK1_IDLE_SLEEP_SECONDS:
+                time.sleep(RANK1_IDLE_SLEEP_SECONDS)
+            continue
+        if isinstance(req, dict) and req.get("shutdown"):
+            logger.info("rank 1: shutdown sentinel received")
+            _clear_mlx_memory("rank 1 shutdown sentinel")
+            return
+        if isinstance(req, dict) and req.get("op") == "reset_prompt_cache":
+            reason = req.get("reason") or "admin reset"
+            clear_memory = bool(req.get("clear_memory", True))
+            clear_manifest = bool(req.get("clear_manifest", False))
+            clear_resident = bool(req.get("clear_resident", True))
+            logger.info(
+                "rank 1: prompt-cache reset sentinel received (%s, clear_memory=%s, "
+                "clear_manifest=%s, clear_resident=%s)",
+                reason,
+                clear_memory,
+                clear_manifest,
+                clear_resident,
+            )
+            if clear_memory:
+                _reset_prompt_cache_and_clear_memory(reason, clear_manifest=clear_manifest,
+                                                     clear_resident=clear_resident)
+            else:
+                _reset_prompt_cache(reason, clear_manifest=clear_manifest,
+                                    clear_resident=clear_resident)
+            continue
+        if isinstance(req, dict) and req.get("op") == "prompt_cache_ssd_prune":
+            reason = req.get("reason") or "rank 0 prune"
+            logger.info("rank 1: prompt-cache SSD prune received (%s)", reason)
+            with _prompt_cache_lock:
+                _prompt_cache_ssd_prune_unlocked(reason=reason)
+            continue
+        if isinstance(req, dict) and req.get("op") == "prompt_cache_ssd_clear":
+            reason = req.get("reason") or "rank 0 clear"
+            logger.info("rank 1: prompt-cache SSD clear received (%s)", reason)
+            with _prompt_cache_lock:
+                _prompt_cache_ssd_clear_unlocked(reason=reason)
+            continue
+        if isinstance(req, dict) and req.get("op") == "prompt_cache_ssd_save":
+            reason = req.get("reason") or "rank 0 save"
+            logger.info("rank 1: prompt-cache SSD save received (%s)", reason)
+            with _prompt_cache_lock:
+                _prompt_cache_make_ssd_checkpoint_unlocked(reason=reason)
+                _prompt_cache_ssd_save_current_unlocked(
+                    model,
+                    processor,
+                    reason=reason,
+                )
+            continue
+        if isinstance(req, dict) and req.get("op") == "runtime_tuning":
+            values = req.get("values") or {}
+            try:
+                changed = _set_runtime_tuning(values)
+                model_tuning = _apply_runtime_model_tuning(model)
+                logger.info(
+                    "rank 1: runtime tuning updated: %s model_tuning=%s",
+                    changed,
+                    model_tuning,
+                )
+            except Exception as e:
+                logger.error("rank 1: runtime tuning update failed: %s", e)
+            continue
+        if isinstance(req, dict) and req.get("op") == "metal_warmup":
+            event = _metal_warmup_touch(
+                size=req.get("matrix_size") or 128,
+                repeats=req.get("repeats") or 2,
+                reason=req.get("reason") or "rank 0 request",
+            )
+            logger.info("rank 1: metal warmup event: %s", event)
+            continue
+        if isinstance(req, dict) and req.get("op") == "prewarm_prompt_cache":
+            reason = req.get("reason") or "rank 0 prewarm"
+            if req.get("visible_source"):
+                reason = f"{reason}:{req.get('visible_source')}"
+            if req.get("thinking_mode"):
+                reason = f"{reason}:{req.get('thinking_mode')}"
+            logger.info("rank 1: prompt-cache prewarm received (%s)", reason)
+            _prewarm_prompt_cache(
+                model,
+                processor,
+                req.get("prompt") or "",
+                req.get("token_ids"),
+                reason=reason,
+                session_id=req.get("session_id"),
+                session_source=req.get("session_source"),
+            )
+            if CLEAR_CACHE_AFTER_REQUEST:
+                mx.clear_cache()
+            continue
+        if isinstance(req, dict) and req.get("op") == "generation_barrier":
+            logger.info(
+                "rank 1: mirror barrier received for %s (stream=%s)",
+                req.get("request_id"),
+                bool(req.get("stream")),
+            )
+            continue
+        # Rank 0 clears its local stop flag before broadcasting each new
+        # request. Rank 1 must clear its flag too; otherwise a previous
+        # distributed cancel can be observed by the next prefill/decode stop
+        # check and produce an empty completion.
+        _clear_stop_request()
+        _clear_prefill_stop_file("rank 1 new request")
+        _STOP_NONCE["value"] = req.get("stop_nonce")
+        _FORCE_EOS["active"] = False
+
+        thinking_mode = req.get("thinking_mode", "adaptive")
+        mirror_tools = req.get("tools")
+        mirror_tool_module = _load_tool_parser(processor) if mirror_tools else None
+        logger.info(f"rank 1: mirroring generation ({req['max_tokens']} tokens)")
+        image_path = None
+        if req.get("image_sources"):
+            try:
+                image_path = [_materialize_image(src) for src in req["image_sources"]]
+                image_path = [p for p in image_path if p]
+                if len(image_path) == 1:
+                    image_path = image_path[0]
+            except Exception as e:
+                logger.warning(f"rank 1: image load failed: {e}")
+        try:
+            run_generation(model, processor, req["prompt"], req["max_tokens"], rank,
+                           image=image_path, thinking_mode=thinking_mode,
+                           gen_params=req.get("gen_params"),
+                           token_ids=req.get("token_ids"),
+                           session_id=req.get("session_id"),
+                           session_source=req.get("session_source"),
+                           reset_incomplete_thinking_on_limit=bool(
+                               req.get("reset_incomplete_thinking_on_limit", True)
+                           ),
+                           tool_module=mirror_tool_module,
+                           tools=mirror_tools)
+            if CLEAR_CACHE_AFTER_REQUEST:
+                mx.clear_cache()
+            logger.info(
+                "rank 1: mirror done, mlx_cache_cleared=%s",
+                CLEAR_CACHE_AFTER_REQUEST,
+            )
+        except Exception as e:
+            logger.error(f"rank 1: generation error, releasing memory: {e}")
+            if CLEAR_CACHE_AFTER_ERROR:
+                mx.clear_cache()
+            logger.info("rank 1: recovered from error, waiting for next request")
+            # CRITICAL: do NOT exit — keep the loop alive so the cluster
+            # survives errors instead of dying and orphaning memory.
+
+
+# ---- distributed object broadcast (modeled on mlx_lm/server.py) ----
+def _bcast(obj, rank):
+    if rank == 0:
+        if obj is None:
+            s = mx.distributed.all_sum(mx.array(0, dtype=mx.int32))
+            mx.eval(s)
+            return None
+        data = mx.array(pickle.dumps(obj), dtype=mx.uint8)
+        sz = mx.distributed.all_sum(mx.array(int(data.size), dtype=mx.int32))
+        mx.eval(sz)
+        sm = mx.distributed.all_sum(data)
+        mx.eval(sm)
+        return obj
+    else:
+        s = mx.distributed.all_sum(mx.array(0, dtype=mx.int32))
+        mx.eval(s)
+        size = int(s.item())
+        if size == 0:
+            return None
+        buf = mx.distributed.all_sum(mx.zeros(int(size), dtype=mx.uint8))
+        mx.eval(buf)
+        return pickle.loads(bytes(buf.tolist()))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        _clear_mlx_memory("process exit")
+        sys.exit(0)
+    except Exception:
+        logger.error(f"fatal server error:\n{traceback.format_exc()}")
+        _clear_mlx_memory("fatal exception")
+        raise

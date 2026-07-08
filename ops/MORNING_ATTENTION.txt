@@ -1,0 +1,50 @@
+=== MORNING BRIEF — 2026-07-06 02:20 (Claude) — READ THIS FIRST ===
+
+WHAT HAPPENED: marathon wedge #16 at 02:02, unit 67 (essay), decode froze ~300
+tokens in, watchdog force-exit at 195s. BOTH RANKS ORPHANED (166.9 / 85.3 GB) —
+endpoint is DOWN, machines up, awaiting your reboot OK (rule respected).
+
+THE HEADLINE STAT: 66 consecutive clean units before it — 3h38m of relentless
+mixed load (10k essays, agent tool-call cycles, short-burst-after-idle, prefill
+probes) on main + overlap + full features. Residual wedge rate ≈ once per
+3.5-4h of continuous heavy load. With guard-build self-heal (~4min) that is
+~98% availability TODAY if you want a deployable endpoint this morning.
+
+WHAT THE WEDGE TAUGHT US:
+1. mlx-main does NOT fix it → the upstream all_reduce-race hypothesis is DEAD.
+   Surviving suspects: mlx#3142 fence-stall (FAST_SYNCH=1 without fence
+   patches — FAST_SYNCH=0 is STILL UNTESTED, one env var), the EXO fork's
+   fence patches, or true silent driver CQE loss (guard build mitigates).
+2. Spindumps fired but the 180s watchdog had already killed both servers —
+   the evidence dies with the process. HUNTING RECIPE for a supervised
+   session: M3_WATCHDOG_DECODE_TIMEOUT=600 + capture at ~60s of stall
+   (capture script fixed: /usr/bin/log + run_with_watchdog in pgrep) — OR
+   guard build, whose ProgressGuard traceback names the exact hung collective.
+3. Overlap was ON during this wedge (suspect but weak — wedge #15 had the
+   identical signature with the overlap not yet existing, and the freeze was
+   in DECODE while overlap touches prefill only). Disambiguate with
+   overlap-off vs on soaks.
+
+MORNING SEQUENCE (suggested):
+1. Approve dual reboot → cluster up on main + overlap (config as-is) → your
+   agentic session (66-unit evidence says hours of clean runway; reinstall
+   Codex CLI first).
+2. Behind it: FAST_SYNCH=0 leg (last cheap suspect), then decide EXO-fork
+   build vs rebasing the guard patches onto main for self-healing.
+3. git push origin main (commits queued).
+
+Everything else from the night was a WIN: baseline/tuned/poller legs all clean
+(poller leg = fastest rounds of the night — dashboard polling is FREE), compat
+audit 7/7, overlap shipped byte-identical at +7% prefill (369-373 tok/s
+record), 168 agent turns clean. Scoreboard: stress_marathon_20260705_222437
+.jsonl · full detail: docs/OVERNIGHT-2026-07-05.md (5AM STATE section).
+
+--- prior entries below ---
+
+=== MORNING ATTENTION 2026-07-05 20:13:09 ===
+trial 1 WEDGED (spindumps attempted; script was not executable — fixed since)
+
+=== MARATHON WEDGE 2026-07-06 02:06:19 unit=essay ===
+SOAK START 20260706_020228 rounds=1 log=soak8_marathon67_20260706_020228.jsonl
+ROUND 1/1: WEDGE after 221 chunks / 195.5s — stream dropped mid-decode
+Machines LEFT UP. Scoreboard: stress_marathon_20260705_222437.jsonl

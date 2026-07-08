@@ -1,0 +1,18 @@
+# Internal ops journals and machine-specific artifacts: kept in the private
+# repo, excluded from public exports (ops/publish_public.sh uses git archive).
+docs/HANDOFF-*.md export-ignore
+docs/OVERNIGHT-*.md export-ignore
+docs/REBOOT-RESUME-*.md export-ignore
+docs/REVIEW-*.md export-ignore
+docs/CURRENT_GOAL_STATUS.md export-ignore
+docs/AGENT_HANDOFF.md export-ignore
+ops/com.thundermlx.overnight.plist export-ignore
+ops/restore-points/ export-ignore
+ops/priv.sh export-ignore
+ops/port_vlm064_to_main.sh export-ignore
+ops/install_mlx_variant.sh export-ignore
+ops/tonight_resume.sh export-ignore
+ops/apply_staged_gateway.sh export-ignore
+ops/restart_vlm064.sh export-ignore
+ops/live_wedge_capture.sh export-ignore
+ops/publish_public.sh export-ignore
