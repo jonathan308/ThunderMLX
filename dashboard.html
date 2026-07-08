@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>THUNDERMLX — CLUSTER CONSOLE</title>
+<style>
+/* ================================================================
+   THUNDERMLX v3 — "INK & CONCRETE"
+   Brutalist typographic console. Paper + ink by day, terminal by
+   night. One accent. Hairline rules. Numbers are the ornament.
+   Zero external dependencies; all animation CSS or cheap rAF.
+   ================================================================ */
+:root{
+  --paper:#EDEAE3; --paper-2:#E3DFD6; --ink:#141311; --ink-2:#3D3A34;
+  --muted:#7A756B; --hair:#141311; --accent:#E8442A; --good:#1D7A3E;
+  --warn:#B5871B; --card:#F2EFE9; --dim:rgba(20,19,17,.06);
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:-apple-system,"Helvetica Neue",Helvetica,Arial,sans-serif;
+}
+body.dark{
+  --paper:#0D0C0B; --paper-2:#131211; --ink:#E9E5DC; --ink-2:#B7B2A6;
+  --muted:#6E6A60; --hair:#E9E5DC; --accent:#FF5533; --good:#3FBF6F;
+  --warn:#D8A62A; --card:#121110; --dim:rgba(233,229,220,.07);
+}
+*{box-sizing:border-box; margin:0; padding:0}
+html,body{height:100%}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:var(--sans); font-size:14px; line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+  transition:background .35s ease, color .35s ease;
+}
+/* concrete grain + scanlines: static, zero runtime cost */
+body::before{
+  content:""; position:fixed; inset:0; pointer-events:none; z-index:2;
+  background:
+    repeating-linear-gradient(0deg, transparent 0 2px, var(--dim) 2px 3px);
+  opacity:.35; mix-blend-mode:multiply;
+}
+body.dark::before{ mix-blend-mode:screen; opacity:.18 }
+#rain{ position:fixed; inset:0; z-index:0; pointer-events:none; opacity:.5 }
+.wrap{ position:relative; z-index:3; max-width:1420px; margin:0 auto; padding:0 26px 90px }
+
+/* ---------------- masthead ---------------- */
+header.mast{ padding:26px 0 0 }
+.mast-row{ display:flex; align-items:flex-end; gap:24px; flex-wrap:wrap }
+h1.wordmark{
+  font-size:clamp(44px,7vw,92px); line-height:.86; letter-spacing:-.035em;
+  font-weight:900; text-transform:uppercase; font-stretch:condensed;
+  position:relative; cursor:default; user-select:none; white-space:nowrap;
+}
+h1.wordmark small{
+  display:block; font-size:11px; letter-spacing:.42em; font-weight:600;
+  color:var(--muted); margin-top:10px; white-space:normal;
+}
+/* glitch: pure CSS, only on hover */
+.wordmark span.g{ position:relative; display:inline-block }
+.wordmark span.g::before,.wordmark span.g::after{
+  content:attr(data-t); position:absolute; left:0; top:0; width:100%;
+  overflow:hidden; opacity:0; pointer-events:none;
+}
+.wordmark:hover span.g::before{
+  opacity:1; color:var(--accent); clip-path:inset(12% 0 58% 0);
+  animation:gl1 .62s steps(2,end) infinite;
+}
+.wordmark:hover span.g::after{
+  opacity:.85; clip-path:inset(64% 0 8% 0);
+  animation:gl2 .47s steps(2,end) infinite reverse;
+}
+@keyframes gl1{ 0%{transform:translate(-3px,-2px)} 50%{transform:translate(2px,1px)} 100%{transform:translate(-1px,2px)} }
+@keyframes gl2{ 0%{transform:translate(3px,1px)} 50%{transform:translate(-2px,-1px)} 100%{transform:translate(1px,-2px)} }
+@media (prefers-reduced-motion: reduce){
+  .wordmark:hover span.g::before,.wordmark:hover span.g::after{ animation:none; opacity:0 }
+}
+.mast-side{ margin-left:auto; text-align:right; font-family:var(--mono); font-size:12px }
+.mast-side .line{ display:flex; gap:8px; justify-content:flex-end; align-items:center; padding:2px 0 }
+.dot{ width:8px; height:8px; border-radius:50%; background:var(--muted); display:inline-block }
+.dot.ok{ background:var(--good) } .dot.busy{ background:var(--accent); animation:pulse 1.1s ease infinite }
+.dot.bad{ background:var(--accent) }
+@keyframes pulse{ 50%{ opacity:.35 } }
+.k{ color:var(--muted); text-transform:uppercase; letter-spacing:.12em; font-size:10px }
+.v{ font-weight:700 }
+/* endpoint strip — the URLs live at the top, always */
+.endpoints{
+  margin-top:16px; border-top:1.5px solid var(--hair); border-bottom:1.5px solid var(--hair);
+  display:flex; flex-wrap:wrap; font-family:var(--mono); font-size:12px;
+}
+.endpoints .ep{ padding:8px 18px 8px 0; margin-right:18px; display:flex; gap:8px; align-items:center;
+  border-right:1px solid var(--dim) }
+.endpoints .ep:last-child{ border-right:none }
+.endpoints .ep b{ font-weight:700 }
+.endpoints .ep .k{ font-size:9px }
+.endpoints .ep code{ cursor:pointer } .endpoints .ep code:hover{ background:var(--ink); color:var(--paper) }
+
+/* ---------------- nav ---------------- */
+nav.tabs{ display:flex; flex-wrap:wrap; gap:0; margin:18px 0 26px; border-bottom:3px solid var(--hair) }
+nav.tabs .tab{
+  font-weight:800; text-transform:uppercase; letter-spacing:.18em; font-size:12px;
+  padding:10px 18px; cursor:pointer; user-select:none; position:relative; color:var(--ink);
+  background:transparent; border:none; font-family:var(--sans);
+}
+nav.tabs .tab:hover{ color:var(--accent) }
+nav.tabs .tab.active{ background:var(--ink); color:var(--paper) }
+nav.tabs .tab .idx{ font-family:var(--mono); font-size:9px; color:var(--muted); margin-right:6px }
+nav.tabs .tab.active .idx{ color:var(--paper); opacity:.6 }
+nav.tabs .spacer{ flex:1 }
+.theme-cmd{
+  font-family:var(--mono); font-size:12px; align-self:center; cursor:pointer;
+  padding:6px 12px; border:1px solid var(--hair); background:transparent; color:var(--ink);
+}
+.theme-cmd:hover{ background:var(--ink); color:var(--paper) }
+.theme-cmd .cur{ display:inline-block; width:7px; height:13px; background:var(--accent);
+  vertical-align:-2px; animation:blink 1s steps(1) infinite }
+@keyframes blink{ 50%{ opacity:0 } }
+
+/* ---------------- structure ---------------- */
+section.view{ display:none } section.view.on{ display:block; animation:in .18s ease }
+@keyframes in{ from{ opacity:0; transform:translateY(4px) } }
+.grid{ display:grid; gap:18px }
+.cols-2{ grid-template-columns:repeat(auto-fit,minmax(340px,1fr)) }
+.cols-3{ grid-template-columns:repeat(auto-fit,minmax(300px,1fr)) }
+.card{
+  background:var(--card); border:1.5px solid var(--hair); padding:16px 18px;
+  position:relative;
+}
+.card>h3{
+  font-size:12px; text-transform:uppercase; letter-spacing:.22em; font-weight:800;
+  margin:-16px -18px 14px; padding:9px 18px; border-bottom:1.5px solid var(--hair);
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+}
+.card>h3 .hint{ font-weight:400; letter-spacing:0; text-transform:none; color:var(--muted); font-size:11px; font-family:var(--mono) }
+.gap{ margin-top:18px }
+
+/* ---------------- big numerals ---------------- */
+.live-strip{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:0;
+  border:1.5px solid var(--hair); background:var(--card) }
+.metric{ padding:18px 20px 14px; border-right:1px solid var(--dim); position:relative; overflow:hidden }
+.metric:last-child{ border-right:none }
+.metric .lab{ font-size:10px; letter-spacing:.28em; text-transform:uppercase; color:var(--muted); font-weight:700 }
+.metric .num{
+  font-family:var(--mono); font-size:clamp(30px,3.4vw,44px); font-weight:700;
+  letter-spacing:-.02em; line-height:1.1; font-variant-numeric:tabular-nums;
+}
+.metric .num.hot{ color:var(--accent) }
+.metric .sub{ font-family:var(--mono); font-size:10px; color:var(--muted) }
+.metric canvas.spark{ position:absolute; right:6px; bottom:6px; width:84px; height:26px; opacity:.8 }
+
+/* active turn bar */
+.turnbar{ border:1.5px solid var(--hair); background:var(--card); padding:14px 18px }
+.turnbar .top{ display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; font-family:var(--mono); font-size:12px }
+.turnbar .phase{ font-weight:800; text-transform:uppercase; letter-spacing:.3em; font-size:13px }
+.turnbar .phase.decode{ color:var(--accent) }
+.turnbar .phase .cur{ display:inline-block; width:8px; height:14px; background:currentColor; vertical-align:-2px; animation:blink .8s steps(1) infinite }
+.turnbar .id{ color:var(--muted) }
+.bar{ height:22px; border:1.5px solid var(--hair); margin-top:10px; position:relative; background:var(--paper-2) }
+.bar .fill{ height:100%; background:var(--ink); transition:width 1.05s linear; position:relative; overflow:hidden }
+.bar .fill.decode{ background:var(--accent) }
+.bar .fill::after{ content:""; position:absolute; inset:0;
+  background:repeating-linear-gradient(-45deg, transparent 0 10px, rgba(255,255,255,.14) 10px 20px);
+  animation:slide 1.2s linear infinite }
+@keyframes slide{ to{ transform:translateX(28px) } }
+@media (prefers-reduced-motion: reduce){ .bar .fill::after{ animation:none } }
+.bar .pct{ position:absolute; right:8px; top:0; line-height:20px; font-family:var(--mono); font-size:11px; mix-blend-mode:difference; color:#fff }
+.turnbar .meta{ display:flex; gap:22px; flex-wrap:wrap; margin-top:10px; font-family:var(--mono); font-size:11px }
+.turnbar .meta .k{ margin-right:6px }
+.idle-note{ color:var(--muted); font-family:var(--mono); font-size:12px; padding:8px 0 2px }
+
+/* chart */
+canvas#chart{ width:100%; height:190px; display:block }
+
+/* machines */
+.machine .mbar{ height:16px; border:1.5px solid var(--hair); background:var(--paper-2); position:relative; margin:8px 0 }
+.machine .mbar .fill{ height:100%; background:var(--ink); transition:width 1.05s linear }
+.machine .mtx{ display:flex; justify-content:space-between; font-family:var(--mono); font-size:11px; color:var(--muted) }
+.kv{ display:grid; grid-template-columns:auto 1fr; gap:4px 16px; font-size:12.5px }
+.kv dt{ color:var(--muted); font-family:var(--mono); font-size:11px; text-transform:uppercase; letter-spacing:.08em; align-self:baseline }
+.kv dd{ font-family:var(--mono); text-align:right; overflow-wrap:anywhere }
+.kv dd.strong{ font-weight:700 }
+
+/* tables */
+table.tbl{ width:100%; border-collapse:collapse; font-family:var(--mono); font-size:11.5px }
+.tbl th{ text-align:left; font-size:9.5px; letter-spacing:.18em; text-transform:uppercase;
+  color:var(--muted); border-bottom:1.5px solid var(--hair); padding:5px 8px 5px 0; font-weight:700 }
+.tbl td{ padding:5px 8px 5px 0; border-bottom:1px solid var(--dim); white-space:nowrap }
+.tbl td.num,.tbl th.num{ text-align:right }
+.tbl tr.new td{ animation:flash 1.6s ease }
+@keyframes flash{ from{ background:var(--dim) } }
+.ok-y{ color:var(--good); font-weight:700 } .ok-n{ color:var(--accent); font-weight:700 }
+.chip{ border:1px solid var(--hair); padding:0 6px; font-size:10px; text-transform:uppercase; letter-spacing:.1em }
+.chip.hot{ background:var(--accent); color:#fff; border-color:var(--accent) }
+.chip.slot{ background:var(--ink); color:var(--paper) }
+.chip.ssd{ border-style:dashed }
+
+/* tiles */
+.tiles{ display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:12px }
+.tile{ border:1.5px solid var(--hair); background:var(--card); padding:12px 14px }
+.tile .lab{ font-size:9.5px; letter-spacing:.24em; text-transform:uppercase; color:var(--muted); font-weight:700 }
+.tile .val{ font-family:var(--mono); font-size:17px; font-weight:700; margin:3px 0 2px; overflow-wrap:anywhere }
+.tile .note{ font-family:var(--mono); font-size:10px; color:var(--muted); overflow-wrap:anywhere }
+
+/* buttons */
+.btn{
+  font-family:var(--sans); font-weight:800; text-transform:uppercase; letter-spacing:.14em;
+  font-size:11px; padding:9px 16px; background:transparent; color:var(--ink);
+  border:1.5px solid var(--hair); cursor:pointer; transition:transform .05s ease;
+}
+.btn:hover{ background:var(--ink); color:var(--paper) }
+.btn:active{ transform:translate(1px,1px) }
+.btn.primary{ background:var(--ink); color:var(--paper) }
+.btn.primary:hover{ background:var(--accent); border-color:var(--accent); color:#fff }
+.btn.danger{ color:var(--accent); border-color:var(--accent) }
+.btn.danger:hover{ background:var(--accent); color:#fff }
+.btn.sm{ padding:5px 10px; font-size:10px }
+.btn[disabled]{ opacity:.45; cursor:default }
+.btnrow{ display:flex; gap:8px; flex-wrap:wrap }
+
+/* forms */
+.field label{ display:block; font-size:10px; text-transform:uppercase; letter-spacing:.16em;
+  color:var(--muted); font-weight:700; margin-bottom:4px }
+.field label code{ text-transform:none; letter-spacing:0; font-size:11px; color:var(--ink) }
+input,select,textarea{
+  width:100%; background:var(--paper); color:var(--ink); border:1.5px solid var(--hair);
+  font-family:var(--mono); font-size:12.5px; padding:7px 9px; border-radius:0;
+}
+input:focus,select:focus,textarea:focus{ outline:2px solid var(--accent); outline-offset:-1px }
+pre{
+  font-family:var(--mono); font-size:11px; background:var(--paper-2); color:var(--ink);
+  border:1.5px solid var(--hair); padding:12px; overflow:auto; white-space:pre-wrap; word-break:break-word;
+}
+.save-state{ font-family:var(--mono); font-size:11px; color:var(--muted) }
+.check{ font-family:var(--mono); font-size:12px; display:flex; gap:8px; align-items:center }
+.check input{ width:auto }
+
+/* settings */
+.settings-group{ margin-bottom:22px }
+.settings-group h4{ font-size:11px; letter-spacing:.3em; text-transform:uppercase;
+  border-bottom:1.5px solid var(--hair); padding-bottom:6px; margin-bottom:12px }
+.settings-grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px 18px }
+.settings-grid .field label{ white-space:normal }
+
+/* chat */
+.chat-layout{ display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:18px }
+@media (max-width:1000px){ .chat-layout{ grid-template-columns:1fr } }
+.thread{ display:flex; flex-direction:column; gap:12px; max-height:56vh; overflow-y:auto; padding:4px 2px }
+.msg{ border:1.5px solid var(--hair); padding:10px 13px; max-width:88% }
+.msg .who{ font-size:9px; letter-spacing:.3em; text-transform:uppercase; font-weight:800; color:var(--muted); margin-bottom:5px }
+.msg.user{ align-self:flex-end; background:var(--ink); color:var(--paper) }
+.msg.user .who{ color:var(--paper); opacity:.55 }
+.msg.assistant{ align-self:flex-start; background:var(--card) }
+.msg.error{ align-self:flex-start; border-color:var(--accent); color:var(--accent) }
+.msg .body{ font-size:13px; white-space:pre-wrap; word-break:break-word; font-family:var(--mono) }
+.msg details{ margin-bottom:6px }
+.msg details summary{ cursor:pointer; font-size:10px; letter-spacing:.2em; text-transform:uppercase; color:var(--muted) }
+.msg details .body{ font-size:11.5px; color:var(--ink-2); border-left:2px solid var(--dim); padding-left:8px; margin-top:5px }
+.composer{ display:flex; gap:10px; margin-top:12px }
+.composer textarea{ min-height:64px; resize:vertical }
+.mode-cards{ display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px }
+.mode-card{ border:1.5px solid var(--hair); padding:10px 12px; cursor:pointer }
+.mode-card:hover{ background:var(--dim) }
+.mode-card.active{ background:var(--ink); color:var(--paper) }
+.mode-card .mc-n{ font-weight:800; text-transform:uppercase; letter-spacing:.1em; font-size:12px }
+.mode-card .mc-s{ font-family:var(--mono); font-size:10px; opacity:.7 }
+
+/* toast + stale */
+#toast{
+  position:fixed; left:50%; bottom:28px; transform:translateX(-50%) translateY(80px);
+  background:var(--ink); color:var(--paper); font-family:var(--mono); font-size:12px;
+  padding:10px 18px; border:1.5px solid var(--paper); z-index:50; transition:transform .25s ease;
+  max-width:80vw; overflow-wrap:anywhere;
+}
+#toast.show{ transform:translateX(-50%) translateY(0) }
+#stale{
+  display:none; position:fixed; top:0; left:0; right:0; z-index:60; text-align:center;
+  background:var(--accent); color:#fff; font-family:var(--mono); font-size:12px; padding:5px;
+  letter-spacing:.2em; text-transform:uppercase;
+}
+footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
+  display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px;
+  font-family:var(--mono); font-size:10px; letter-spacing:.24em; text-transform:uppercase; color:var(--muted) }
+::selection{ background:var(--accent); color:#fff }
+</style>
+</head>
+<body>
+<canvas id="rain"></canvas>
+<div id="stale">SIGNAL LOST — LAST POLL STALE</div>
+<div class="wrap">
+
+<header class="mast">
+  <div class="mast-row">
+    <h1 class="wordmark" title="TYPE IS A LIVING THING. SO IS A CLUSTER.">
+      <span class="g" data-t="THUNDERMLX">THUNDERMLX</span>
+      <small id="tagline">2-MAC MINIMAX-M3 · RDMA PIPELINE · EVERY TOKEN LEAVES A TRACE</small>
+    </h1>
+    <div class="mast-side">
+      <div class="line"><span class="k">status</span><span class="dot" id="hDot"></span><span class="v" id="hTxt">connecting</span></div>
+      <div class="line"><span class="k">backend</span><span class="v" id="hBackend">—</span></div>
+      <div class="line"><span class="k">model</span><span class="v" id="hModel">—</span></div>
+      <div class="line"><span class="k">ranks</span><span class="v" id="hRanks">—</span></div>
+      <div class="line"><span class="k">clock</span><span class="v" id="hClock">—</span></div>
+    </div>
+  </div>
+  <div class="endpoints" id="endpoints">
+    <div class="ep"><span class="k">api</span><code id="epApi" title="click to copy">…</code></div>
+    <div class="ep"><span class="k">gateway</span><code id="epGateway" title="click to copy">…</code></div>
+    <div class="ep"><span class="k">dashboard</span><code id="epDash" title="click to copy">…</code></div>
+    <div class="ep"><span class="k">split</span><b id="epSplit">…</b></div>
+    <div class="ep"><span class="k">rdma</span><b id="epRdma">…</b></div>
+  </div>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-view="overview"><span class="idx">01</span>Overview</button>
+  <button class="tab" data-view="chat"><span class="idx">02</span>Chat</button>
+  <button class="tab" data-view="operations"><span class="idx">03</span>Operations</button>
+  <button class="tab" data-view="models"><span class="idx">04</span>Models</button>
+  <button class="tab" data-view="settings"><span class="idx">05</span>Advanced</button>
+  <button class="tab" data-view="logs"><span class="idx">06</span>Logs</button>
+  <button class="tab" data-view="setup"><span class="idx">07</span>Setup</button>
+  <span class="spacer"></span>
+  <button class="theme-cmd" id="themeBtn">&gt; theme --dark<span class="cur"></span></button>
+</nav>
+
+<!-- ================= OVERVIEW ================= -->
+<section class="view on" id="view-overview">
+
+  <div class="live-strip">
+    <div class="metric"><div class="lab">Decode</div><div class="num hot" id="mDecode">—</div><div class="sub">tok/s live</div><canvas class="spark" id="spDecode"></canvas></div>
+    <div class="metric"><div class="lab">Prefill</div><div class="num" id="mPrefill">—</div><div class="sub" id="mPrefillSub">tok/s · ≥512-tok prompts</div><canvas class="spark" id="spPrefill"></canvas></div>
+    <div class="metric"><div class="lab">TTFT</div><div class="num" id="mTtft">—</div><div class="sub">seconds avg</div><canvas class="spark" id="spTtft"></canvas></div>
+    <div class="metric"><div class="lab">Requests</div><div class="num" id="mReqs">—</div><div class="sub" id="mReqsSub">—</div></div>
+    <div class="metric"><div class="lab">Lifetime tokens</div><div class="num" id="mTokens">—</div><div class="sub" id="mTokensSub">prefill + decode</div></div>
+    <div class="metric"><div class="lab">Queue</div><div class="num" id="mQueue">0</div><div class="sub">waiting on the lock</div></div>
+  </div>
+
+  <div class="gap turnbar" id="turnbar">
+    <div class="top">
+      <span class="phase" id="tbPhase">IDLE</span>
+      <span class="id" id="tbId"></span>
+      <span class="id" id="tbTurn"></span>
+    </div>
+    <div id="tbBody"><div class="idle-note">no active request — the cluster is listening</div></div>
+  </div>
+
+  <div class="gap card">
+    <h3>Decode rate <span class="hint" id="chartNow">idle</span></h3>
+    <canvas id="chart"></canvas>
+  </div>
+
+  <div class="gap grid cols-2">
+    <div class="card machine">
+      <h3><span id="m0Name">Mac Studio · rank 0</span> <span class="hint" id="m0Reach">…</span></h3>
+      <div class="mbar"><div class="fill" id="m0Fill" style="width:0%"></div></div>
+      <div class="mtx"><span id="m0Wired">wired —</span><span id="m0Pct">—</span></div>
+      <dl class="kv" style="margin-top:8px" id="m0Kv"></dl>
+    </div>
+    <div class="card machine">
+      <h3><span id="m1Name">MacBook Pro · rank 1</span> <span class="hint" id="m1Reach">…</span></h3>
+      <div class="mbar"><div class="fill" id="m1Fill" style="width:0%"></div></div>
+      <div class="mtx"><span id="m1Wired">wired —</span><span id="m1Pct">—</span></div>
+      <dl class="kv" style="margin-top:8px" id="m1Kv"></dl>
+    </div>
+  </div>
+
+  <div class="gap tiles">
+    <div class="tile"><div class="lab">Hot cache TTL</div><div class="val" id="tCacheTtl">…</div><div class="note" id="tCacheTtlNote">RAM cache lifetime</div></div>
+    <div class="tile"><div class="lab">SSD cache</div><div class="val" id="tSsd">…</div><div class="note" id="tSsdNote">durable prompt cache</div></div>
+    <div class="tile"><div class="lab">Cache sessions</div><div class="val" id="tCacheMap">…</div><div class="note" id="tCacheMapNote">tracked session caches</div></div>
+    <div class="tile"><div class="lab">Kernel top-k</div><div class="val" id="tKernel">…</div><div class="note" id="tKernelNote">sparse attention kernel</div></div>
+    <div class="tile"><div class="lab">MSA prefill</div><div class="val" id="tMsa">…</div><div class="note" id="tMsaNote">waiting for long prefill</div></div>
+    <div class="tile"><div class="lab">Metal warm</div><div class="val" id="tMetal">…</div><div class="note" id="tMetalNote">not run since start</div></div>
+    <div class="tile"><div class="lab">Completed / failed</div><div class="val" id="tDoneFail">0 / 0</div><div class="note">since server start</div></div>
+    <div class="tile"><div class="lab">Request t/s</div><div class="val" id="tReqTps">…</div><div class="note" id="tReqTpsNote">wall-clock, not decode</div></div>
+  </div>
+
+  <div class="gap card">
+    <h3>Recent requests
+      <span class="hint" id="recentSummary">no completed requests yet</span>
+      <span style="flex:1"></span>
+      <button class="btn sm" data-post="/api/request-history/reset">Reset history</button>
+    </h3>
+    <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead><tr>
+          <th>Model</th><th>Mode</th><th>OK</th><th class="num">TTFT</th>
+          <th class="num" title="prompt tok/s excluding cached tokens">Prompt t/s</th>
+          <th class="num">Decode</th><th class="num">Tokens</th>
+          <th class="num" title="reasoning chars / content chars">R/C</th><th class="num">Cache</th>
+        </tr></thead>
+        <tbody id="reqRows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="gap grid cols-2">
+    <div class="card">
+      <h3>Prompt cache map <span class="hint">RAM, slots, SSD sessions</span></h3>
+      <div style="overflow-x:auto">
+        <table class="tbl">
+          <thead><tr><th>Session</th><th>Source</th><th>State</th>
+            <th class="num">Cache</th><th class="num">Suffix</th><th class="num">Reuse</th><th>Last action</th></tr></thead>
+          <tbody id="cacheMapRows"></tbody>
+        </table>
+      </div>
+      <div class="btnrow" style="margin-top:12px">
+        <button class="btn sm" data-post="/api/cache/reset" title="Drops only the live RAM KV cache">Clear RAM</button>
+        <button class="btn sm" data-post="/api/cache/manifest/clear">Clear map</button>
+        <button class="btn sm" data-post="/api/cache/ssd/save">SSD save</button>
+        <button class="btn sm" data-post="/api/cache/ssd/prune">SSD prune</button>
+        <button class="btn sm danger" data-post="/api/cache/ssd/clear" data-confirm="Delete all durable SSD cache artifacts?">SSD clear</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Active request <span class="hint" id="activeHint">none</span></h3>
+      <pre id="activePre" style="max-height:300px">none</pre>
+    </div>
+  </div>
+
+  <div class="gap card">
+    <h3>Processes &amp; ports</h3>
+    <pre id="procs" style="max-height:260px">…</pre>
+  </div>
+</section>
+
+<!-- ================= CHAT ================= -->
+<section class="view" id="view-chat">
+  <div class="chat-layout">
+    <div class="card">
+      <h3>Chat with the cluster
+        <span class="hint" id="chatStatus">idle</span>
+        <span style="flex:1"></span>
+        <button class="btn sm" onclick="clearChat()">Clear</button>
+        <button class="btn sm danger" onclick="stopGeneration()">Stop generation</button>
+      </h3>
+      <div class="thread" id="thread"></div>
+      <div class="composer">
+        <textarea id="chatInput" placeholder="Message the cluster… (Cmd/Ctrl+Enter to send)"></textarea>
+        <button class="btn primary" style="align-self:flex-end" onclick="sendChat()">Send</button>
+      </div>
+      <div class="btnrow" style="margin-top:10px">
+        <button class="btn sm" onclick="usePreset('thinking')">Thinking</button>
+        <button class="btn sm" onclick="usePreset('coding')">Coding</button>
+        <button class="btn sm" onclick="usePreset('vision')">Vision</button>
+        <button class="btn sm" onclick="usePreset('research')">Research</button>
+        <button class="btn sm" onclick="usePreset('short')">Short check</button>
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:18px">
+      <div class="card">
+        <h3>Controls</h3>
+        <div class="mode-cards">
+          <div class="mode-card active" id="mcThink" onclick="setChatModel('Minimax-M3')">
+            <div class="mc-n">Minimax-M3</div><div class="mc-s">thinking enabled</div></div>
+          <div class="mode-card" id="mcNoThink" onclick="setChatModel('Minimax-M3-No-Think')">
+            <div class="mc-n">No-Think</div><div class="mc-s">direct answers</div></div>
+        </div>
+        <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px">
+          <div class="field"><label>Model</label>
+            <select id="chatModel" onchange="syncModeCards()">
+              <option>Minimax-M3</option><option>Minimax-M3-No-Think</option>
+            </select></div>
+          <div class="field"><label>Max tokens</label><input id="chatMaxTokens" type="number" min="1" max="16384" value="512"></div>
+          <div class="field"><label>Temperature</label><input id="chatTemperature" type="number" min="0" max="2" step="0.05" value="1"></div>
+          <div class="field"><label>Top-p</label><input id="chatTopP" type="number" min="0" max="1" step="0.05" value="1"></div>
+        </div>
+        <div class="field" style="margin-top:10px"><label>Session id (prompt cache key)</label><input id="chatSession" value="dashboard-chat"></div>
+        <div class="field" style="margin-top:10px"><label>System prompt</label><input id="chatSystem" value="You are MiniMax-M3 running on the ThunderMLX cluster. Be direct and useful."></div>
+        <div class="field" style="margin-top:10px"><label>Image URL or data URI (optional)</label><input id="chatImage" placeholder="https://… or data:image/png;base64,…"></div>
+      </div>
+      <div class="card">
+        <h3>Stream metrics</h3>
+        <dl class="kv">
+          <dt>TTFT</dt><dd id="cmTtft">…</dd>
+          <dt>Elapsed</dt><dd id="cmElapsed">…</dd>
+          <dt>Chunks</dt><dd id="cmChunks">0</dd>
+          <dt>Reasoning chars</dt><dd id="cmR">0</dd>
+          <dt>Content chars</dt><dd id="cmC">0</dd>
+          <dt>Session</dt><dd id="cmSession">dashboard-chat</dd>
+        </dl>
+      </div>
+      <div class="card">
+        <h3>Live endpoint</h3>
+        <dl class="kv">
+          <dt>API</dt><dd id="cmEndpoint">…</dd>
+          <dt>Cache</dt><dd id="cmCache">…</dd>
+          <dt>Recent decode</dt><dd id="cmDecode">…</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= OPERATIONS ================= -->
+<section class="view" id="view-operations">
+  <div class="grid cols-3">
+    <div class="card">
+      <h3>Cluster control</h3>
+      <dl class="kv" style="margin-bottom:12px">
+        <dt>Status</dt><dd class="strong" id="opStatus">…</dd>
+        <dt>Queue</dt><dd id="opQueue">0</dd>
+        <dt>Completed / failed</dt><dd id="opDoneFail">0 / 0</dd>
+      </dl>
+      <div class="btnrow">
+        <button class="btn" data-post="/api/sync">Sync worker</button>
+        <button class="btn primary" data-post="/api/start" data-confirm="Start / restart the cluster?">Start</button>
+        <button class="btn danger" data-post="/api/stop" data-confirm="Stop the whole cluster?">Stop</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Inference control</h3>
+      <dl class="kv" style="margin-bottom:12px">
+        <dt>Active</dt><dd id="opActive">none</dd>
+        <dt>Stream mode</dt><dd id="opStream">…</dd>
+        <dt>Concurrency</dt><dd id="opConc">…</dd>
+      </dl>
+      <div class="btnrow">
+        <button class="btn danger" onclick="stopGeneration()">Stop generation</button>
+        <button class="btn" data-post="/api/warmup/metal">Metal warm</button>
+        <button class="btn" data-post="/api/warmup/chat">Full warmup</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Runtime profile</h3>
+      <dl class="kv" style="margin-bottom:12px">
+        <dt>Thinking cadence</dt><dd id="opCadence">…</dd>
+        <dt>Raw-silent limit</dt><dd id="opRawSilent">…</dd>
+        <dt>State</dt><dd id="opProfileState">idle</dd>
+      </dl>
+      <div class="btnrow" style="align-items:center">
+        <select id="runtimeProfile" style="max-width:220px">
+          <option value="thinking-safe">Stable thinking cadence 1</option>
+          <option value="thinking-ab-3">A/B thinking cadence 3</option>
+        </select>
+        <button class="btn primary" onclick="applyRuntimeProfile()">Apply live</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Live performance</h3>
+      <dl class="kv">
+        <dt>Token generation</dt><dd class="strong" id="opDecode">…</dd>
+        <dt>Prompt processing</dt><dd class="strong" id="opPrompt">…</dd>
+        <dt>TTFT</dt><dd class="strong" id="opTtft">…</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h3>Cache control</h3>
+      <dl class="kv" style="margin-bottom:12px">
+        <dt>State</dt><dd id="opCacheState">…</dd>
+        <dt>Resident</dt><dd id="opResident">none</dd>
+        <dt>TTL</dt><dd id="opCacheTtl">…</dd>
+      </dl>
+      <div class="btnrow">
+        <button class="btn" data-post="/api/cache/reset">Clear RAM cache</button>
+        <button class="btn" data-post="/api/cache/manifest/clear">Clear cache map</button>
+        <button class="btn" data-post="/api/cache/ssd/save">Save SSD</button>
+        <button class="btn" data-post="/api/cache/ssd/prune">Prune SSD</button>
+        <button class="btn danger" data-post="/api/cache/ssd/clear" data-confirm="Delete all durable SSD cache artifacts?">Clear SSD</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Regression probes <span class="hint">results land in Logs</span></h3>
+      <div class="btnrow">
+        <button class="btn" data-post="/api/probe/text">Text</button>
+        <button class="btn" data-post="/api/probe/full">Full</button>
+        <button class="btn" data-post="/api/probe/tool-cache">Tool cache</button>
+        <button class="btn" data-post="/api/probe/cache-map">Cache map</button>
+        <button class="btn" data-post="/api/probe/agent-cache">Agent cache</button>
+        <button class="btn" data-post="/api/probe/persistent-cache">Persistent</button>
+        <button class="btn" data-post="/api/probe/prefill-ab">Prefill A/B</button>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Access</h3>
+      <dl class="kv">
+        <dt>API</dt><dd id="opApi">…</dd>
+        <dt>Gateway</dt><dd id="opGateway">…</dd>
+        <dt>Model</dt><dd id="opModel">…</dd>
+      </dl>
+    </div>
+  </div>
+</section>
+
+<!-- ================= MODELS ================= -->
+<section class="view" id="view-models">
+  <div class="grid cols-2">
+    <div class="card">
+      <h3>Model source</h3>
+      <dl class="kv" style="margin-bottom:10px">
+        <dt>Configured</dt><dd id="mdlConfigured" style="white-space:normal">…</dd>
+        <dt>Loaded</dt><dd id="mdlLoaded" style="white-space:normal">…</dd>
+      </dl>
+      <span class="chip" id="mdlHint">…</span>
+    </div>
+    <div class="card">
+      <h3>Download</h3>
+      <p style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:10px">
+        Downloads the configured model id into the configured folder; restart the cluster to load it.</p>
+      <label class="check"><input type="checkbox" id="dlWorker" checked> download on worker too</label>
+      <div class="btnrow" style="margin-top:10px;align-items:center">
+        <button class="btn primary" onclick="downloadModel()">Download configured model</button>
+        <span class="save-state" id="dlState"></span>
+      </div>
+    </div>
+    <div class="card" style="grid-column:1/-1">
+      <h3>Runtime stack <span class="hint">both ranks must match; restart the cluster after updates</span></h3>
+      <div style="overflow-x:auto">
+        <table class="tbl">
+          <thead><tr><th>Package</th><th>Rank 0</th><th>Rank 1</th><th>Latest release</th><th>Role</th><th></th></tr></thead>
+          <tbody id="runtimeRows"><tr><td colspan="6" style="color:var(--muted)">press Check stack</td></tr></tbody>
+        </table>
+      </div>
+      <label class="check" style="margin-top:10px"><input type="checkbox" id="updWorker" checked> update worker too</label>
+      <div class="btnrow" style="margin-top:10px;align-items:center">
+        <button class="btn" onclick="checkRuntimeStack()">Check stack</button>
+        <span class="save-state" id="mlxVlmState">not checked</span>
+      </div>
+      <p style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:10px">
+        mlx / mlx-metal are the core framework (Metal kernels + jaccl/ring
+        distributed) — PINNED custom builds carrying our jaccl fixes, managed by
+        ops/install_mlx_variant.sh; pip "update" would replace them with an older
+        release, so they are check-only here. mlx-vlm is the model runtime
+        (MiniMax-M3-VL, generation loop, tool parsers); mlx-lm is its
+        text-LM dependency.</p>
+    </div>
+  </div>
+  <div class="gap card">
+    <h3>Model launch settings
+      <span style="flex:1"></span>
+      <button class="btn sm primary" onclick="saveSettings()">Save changed + sync</button>
+      <span class="save-state" id="modelSaveState"></span>
+    </h3>
+    <div id="modelSettingsGrid"></div>
+  </div>
+</section>
+
+<!-- ================= ADVANCED ================= -->
+<section class="view" id="view-settings">
+  <div class="card">
+    <h3>Advanced settings
+      <span class="hint">writes .env.local + syncs rank 1; restart to apply launch-time keys</span>
+      <span style="flex:1"></span>
+      <button class="btn sm primary" onclick="saveSettings()">Save changed + sync</button>
+      <span class="save-state" id="saveState"></span>
+    </h3>
+    <div id="settingsGrid" style="margin-top:6px"></div>
+  </div>
+</section>
+
+<!-- ================= LOGS ================= -->
+<section class="view" id="view-logs">
+  <div class="card">
+    <h3>Cluster logs
+      <span class="hint">startup, restart, downloads, probe output · refreshes every 3s while open</span>
+      <span style="flex:1"></span>
+      <button class="btn sm" onclick="logs(true)">Refresh</button>
+    </h3>
+    <pre id="logsPre" style="max-height:70vh">loading…</pre>
+  </div>
+</section>
+
+<!-- ================= SETUP ================= -->
+<section class="view" id="view-setup">
+  <div class="grid cols-2">
+    <div class="card">
+      <h3>Endpoints</h3>
+      <dl class="kv">
+        <dt>OpenAI API</dt><dd id="suApi">…</dd>
+        <dt>Gateway (M3 + oMLX)</dt><dd id="suGateway">…</dd>
+        <dt>Models</dt><dd>Minimax-M3 · Minimax-M3-No-Think</dd>
+        <dt>Anthropic shim</dt><dd>gateway /v1/messages</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h3>Start / stop</h3>
+      <pre>./launch_cluster.sh          # or Start button (screen + auto_restart)
+./stop_cluster.sh            # verified stop, kills stragglers
+./sync_rank1.sh              # push code to the worker (auto on relaunch)</pre>
+    </div>
+    <div class="card">
+      <h3>Cluster shape</h3>
+      <dl class="kv">
+        <dt>rank 0</dt><dd>Mac Studio · layers <span id="suSplit0">38</span> · API + sampling</dd>
+        <dt>rank 1</dt><dd>MacBook Pro · layers <span id="suSplit1">22</span> · mirror decode</dd>
+        <dt>transport</dt><dd id="suTransport">…</dd>
+        <dt>watchdog</dt><dd>self-heal ≈4-5 min on stall; auto-relaunch re-syncs rank 1</dd>
+      </dl>
+    </div>
+    <div class="card">
+      <h3>Notes</h3>
+      <pre>Backend lives in .env.local (M3_MLX_BACKEND=jaccl|ring).
+jaccl = RDMA over TB5 (fast path). ring = TCP fallback on the same cable.
+The ring clone lives in ~/minimax-m3-cluster-ring with its own env.
+Full guide: docs/SETUP.md · review: docs/REVIEW-2026-07-06.md</pre>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <span>THUNDERMLX CONSOLE v3 — INK &amp; CONCRETE</span>
+  <span id="footUrls"></span>
+  <span>EVERY TOKEN LEAVES A TRACE</span>
+</footer>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ============ helpers ============ */
+const el = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = (v, d=1) => Number.isFinite(Number(v)) ? Number(v).toFixed(d) : "—";
+const fmtInt = v => Number.isFinite(Number(v)) ? Math.round(Number(v)).toLocaleString() : "—";
+const fmtBig = v => { v = Number(v); if(!Number.isFinite(v)) return "—";
+  if(v >= 1e9) return (v/1e9).toFixed(2)+"B"; if(v >= 1e6) return (v/1e6).toFixed(2)+"M";
+  if(v >= 1e4) return (v/1e3).toFixed(1)+"k"; return Math.round(v).toLocaleString(); };
+function setText(id, t, title){ const n = el(id); if(!n) return; n.textContent = t ?? "—"; if(title) n.title = title; }
+
+/* number tween — numerals animate, nothing else does */
+const tweens = {};
+function tween(id, target, format){
+  const n = el(id); if(!n) return;
+  target = Number(target);
+  if(!Number.isFinite(target)){ n.textContent = "—"; delete tweens[id]; return; }
+  const from = tweens[id] ?? target;
+  tweens[id] = target;
+  if(Math.abs(target - from) < 0.005){ n.textContent = format(target); return; }
+  const t0 = performance.now(), dur = 420;
+  function step(t){
+    if(tweens[id] !== target) return;
+    const p = Math.min(1, (t - t0)/dur), e = 1-(1-p)*(1-p);
+    n.textContent = format(from + (target-from)*e);
+    if(p < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+}
+
+/* toast */
+let toastTimer;
+function toast(msg){ const t = el("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove("show"), 3400); }
+
+/* ============ theme ============ */
+function setTheme(mode){
+  document.body.classList.toggle("dark", mode === "dark");
+  el("themeBtn").innerHTML = "&gt; theme --" + (mode === "dark" ? "paper" : "dark") + '<span class="cur"></span>';
+  try{ localStorage.setItem("tmlx-theme", mode); }catch(e){}
+  drawChart();
+}
+el("themeBtn").addEventListener("click", () =>
+  setTheme(document.body.classList.contains("dark") ? "paper" : "dark"));
+
+/* ============ tabs ============ */
+let activeView = "overview";
+function switchView(name){
+  activeView = name;
+  document.querySelectorAll("nav .tab").forEach(t => t.classList.toggle("active", t.dataset.view === name));
+  document.querySelectorAll("section.view").forEach(v => v.classList.toggle("on", v.id === "view-"+name));
+  if(name === "logs") logs(true);
+}
+document.querySelectorAll("nav .tab").forEach(t => t.addEventListener("click", () => switchView(t.dataset.view)));
+document.addEventListener("keydown", e => {
+  if(e.target.matches("input,textarea,select") || e.metaKey || e.ctrlKey || e.altKey) return;
+  const order = ["overview","chat","operations","models","settings","logs","setup"];
+  const i = Number(e.key) - 1;
+  if(i >= 0 && i < order.length) switchView(order[i]);
+});
+
+/* ============ glyph drift background (subtle, cheap) ============ */
+(function(){
+  const cv = el("rain"), g = cv.getContext("2d");
+  const GLYPHS = "01{}[]<>/=+*#$&%;:~ΔΣπλμΩ".split("");
+  let W, H, pts = [], mx = -1e4, my = -1e4, last = 0;
+  function size(){
+    W = cv.width = innerWidth * devicePixelRatio; H = cv.height = innerHeight * devicePixelRatio;
+    cv.style.width = innerWidth+"px"; cv.style.height = innerHeight+"px";
+    const n = Math.min(70, Math.floor(innerWidth/22));
+    pts = Array.from({length:n}, () => ({
+      x: Math.random()*W, y: Math.random()*H,
+      v: (0.12 + Math.random()*0.3) * devicePixelRatio,
+      c: GLYPHS[(Math.random()*GLYPHS.length)|0],
+      s: (9 + Math.random()*7) * devicePixelRatio,
+      o: 0.05 + Math.random()*0.08,
+    }));
+  }
+  addEventListener("resize", size); size();
+  addEventListener("pointermove", e => { mx = e.clientX*devicePixelRatio; my = e.clientY*devicePixelRatio; }, {passive:true});
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  function frame(t){
+    requestAnimationFrame(frame);
+    if(reduced || document.hidden || t - last < 50) return;   /* ~20fps cap */
+    last = t;
+    g.clearRect(0,0,W,H);
+    const ink = getComputedStyle(document.body).getPropertyValue("--ink").trim();
+    g.fillStyle = ink;
+    for(const p of pts){
+      p.y += p.v;
+      const dx = p.x-mx, dy = p.y-my, d2 = dx*dx+dy*dy, R = 160*devicePixelRatio;
+      let ox = 0, oy = 0, boost = 0;
+      if(d2 < R*R){ const d = Math.sqrt(d2)||1, f = (1-d/R)*14*devicePixelRatio; ox = dx/d*f; oy = dy/d*f; boost = (1-d/R)*0.22; }
+      if(p.y > H + 20){ p.y = -20; p.x = Math.random()*W; }
+      g.globalAlpha = p.o + boost;
+      g.font = p.s+"px ui-monospace,Menlo,monospace";
+      g.fillText(p.c, p.x+ox, p.y+oy);
+    }
+    g.globalAlpha = 1;
+  }
+  requestAnimationFrame(frame);
+})();
+
+/* ============ endpoint strip (click to copy) ============ */
+["epApi","epGateway","epDash"].forEach(id => el(id).addEventListener("click", async () => {
+  try{ await navigator.clipboard.writeText(el(id).textContent); toast("copied " + el(id).textContent); }
+  catch(e){ toast("copy failed"); }
+}));
+
+/* ============ generic POST buttons ============ */
+document.querySelectorAll("button[data-post]").forEach(btn => {
+  btn.addEventListener("click", async () => {
+    const q = btn.dataset.confirm; if(q && !confirm(q)) return;
+    btn.disabled = true; toast(btn.textContent.trim() + " …");
+    try{
+      const r = await fetch(btn.dataset.post, {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+      const j = await r.json().catch(() => ({}));
+      toast(btn.textContent.trim() + (r.ok && j.ok !== false ? " ✓" : " ✕ " + (j.error || r.status)));
+    }catch(e){ toast(btn.textContent.trim() + " ✕ " + e.message); }
+    btn.disabled = false;
+    refresh();
+  });
+});
+
+async function stopGeneration(){
+  toast("stop generation …");
+  try{
+    const r = await fetch("/api/generation/stop", {method:"POST", headers:{"Content-Type":"application/json"}, body:"{}"});
+    const j = await r.json().catch(() => ({}));
+    toast(j.ok === false ? "stop failed: " + (j.error || "?") : "stop requested ✓ " + (j.mode || ""));
+  }catch(e){ toast("stop failed: " + e.message); }
+}
+
+async function applyRuntimeProfile(){
+  const p = el("runtimeProfile").value;
+  setText("opProfileState", "applying…");
+  try{
+    const r = await fetch("/api/runtime/profile", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({profile:p})});
+    const j = await r.json();
+    setText("opProfileState", j.ok ? "applied " + (j.label || p) : (j.error || "failed"));
+    toast(j.ok ? "profile applied ✓" : "profile failed ✕");
+  }catch(e){ setText("opProfileState", "failed"); toast("profile failed: " + e.message); }
+}
+
+/* ============ charts ============ */
+const samples = [];        /* {t, decode} */
+const MAXS = 150;
+function chartColors(){
+  const cs = getComputedStyle(document.body);
+  return { ink: cs.getPropertyValue("--ink").trim(), accent: cs.getPropertyValue("--accent").trim(),
+           dim: cs.getPropertyValue("--muted").trim() };
+}
+function drawChart(){
+  const cv = el("chart"); if(!cv || !cv.offsetParent) return;
+  const dpr = devicePixelRatio || 1;
+  const w = cv.clientWidth*dpr, h = 190*dpr;
+  if(cv.width !== w) cv.width = w;
+  if(cv.height !== h) cv.height = h;
+  const g = cv.getContext("2d"), C = chartColors();
+  g.clearRect(0,0,w,h);
+  const pad = {l:44*dpr, r:12*dpr, t:10*dpr, b:20*dpr};
+  const iw = w-pad.l-pad.r, ih = h-pad.t-pad.b;
+  const max = Math.max(34, ...samples.map(s => s.decode)) * 1.12;
+  const xs = i => pad.l + iw*(i/(MAXS-1));
+  const ys = v => pad.t + ih*(1 - v/max);
+  /* hairline grid + labels */
+  g.strokeStyle = C.dim; g.globalAlpha = .35; g.lineWidth = 1;
+  g.fillStyle = C.dim; g.font = (10*dpr)+"px ui-monospace,Menlo,monospace";
+  [0, max/2, max].forEach(v => {
+    const y = ys(v);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w-pad.r, y); g.stroke();
+    g.fillText(v.toFixed(0), 8*dpr, y+3*dpr);
+  });
+  /* 26-34 target band */
+  g.globalAlpha = .10; g.fillStyle = C.accent;
+  g.fillRect(pad.l, ys(34), iw, ys(26)-ys(34));
+  g.globalAlpha = 1;
+  if(!samples.length) return;
+  const start = MAXS - samples.length;
+  g.beginPath();
+  samples.forEach((s,i) => { const x = xs(start+i), y = ys(s.decode||0); i ? g.lineTo(x,y) : g.moveTo(x,y); });
+  g.strokeStyle = C.ink; g.lineWidth = 1.6*dpr; g.lineJoin = "round"; g.stroke();
+  const lastS = samples[samples.length-1];
+  if(lastS && lastS.decode){
+    const x = xs(MAXS-1), y = ys(lastS.decode);
+    g.beginPath(); g.arc(x,y,3*dpr,0,7); g.fillStyle = C.accent; g.fill();
+  }
+}
+addEventListener("resize", drawChart);
+
+function spark(id, series, hot){
+  const cv = el(id); if(!cv) return;
+  const dpr = devicePixelRatio || 1;
+  const w = 84*dpr, h = 26*dpr;
+  if(cv.width !== w){ cv.width = w; cv.height = h; }
+  const g = cv.getContext("2d"), C = chartColors();
+  g.clearRect(0,0,w,h);
+  const vals = series.filter(v => Number.isFinite(v)).slice(-30);
+  if(vals.length < 2) return;
+  const max = Math.max(...vals)*1.1 || 1, min = 0;
+  g.beginPath();
+  vals.forEach((v,i) => { const x = w*(i/(vals.length-1)), y = h - h*((v-min)/(max-min || 1)); i ? g.lineTo(x,y) : g.moveTo(x,y); });
+  g.strokeStyle = hot ? C.accent : C.ink; g.globalAlpha = .75; g.lineWidth = 1*dpr; g.stroke(); g.globalAlpha = 1;
+}
+
+/* ============ live decode tps from active_request deltas ============ */
+let prevActive = null;
+function liveDecodeTps(ar, fallback){
+  if(!ar){ prevActive = null; return fallback; }
+  const now = performance.now()/1000;
+  let tps = null;
+  if(prevActive && prevActive.id === ar.id && now > prevActive.time){
+    const dTok = (ar.tokens_emitted||0) - prevActive.tokens, dT = now - prevActive.time;
+    if(dTok >= 0 && dT > 0.4) tps = dTok/dT;
+  }
+  prevActive = {id: ar.id, tokens: ar.tokens_emitted||0, time: now};
+  return tps ?? fallback;
+}
+
+/* ============ settings (curated groups ported from v1) ============ */
+const advancedSettingGroups = [
+  ["Generation Defaults", [
+    ["MLX_M3_DEFAULT_MAX_TOKENS", "Default max tokens for streaming requests"],
+    ["MLX_M3_NONSTREAM_DEFAULT_MAX_TOKENS", "Default max tokens for non-streaming requests"],
+    ["MLX_M3_MAX_TOKENS_CEILING", "Hard ceiling for any request"],
+    ["MLX_M3_DEFAULT_TEMPERATURE", "Default sampling temperature"],
+    ["MLX_M3_DEFAULT_TOP_P", "Default nucleus sampling"],
+    ["MLX_M3_DEFAULT_TOP_K", "Default top-k (0 = off)"],
+    ["MLX_M3_DEFAULT_MIN_P", "Default min-p"],
+    ["MLX_M3_TOOL_DEFAULT_TEMPERATURE", "Temperature when tools are present"],
+    ["MLX_M3_TOOL_DEFAULT_TOP_P", "Top-p when tools are present"],
+    ["MLX_M3_TOOL_DEFAULT_TOP_K", "Top-k when tools are present"],
+    ["MLX_M3_TOOL_DEFAULT_MIN_P", "Min-p when tools are present"],
+    ["MLX_M3_DEFAULT_REPETITION_PENALTY", "Repetition penalty (0 = off)"],
+    ["MLX_M3_DEFAULT_PRESENCE_PENALTY", "Presence penalty"],
+    ["MLX_M3_DEFAULT_FREQUENCY_PENALTY", "Frequency penalty"],
+    ["MLX_M3_THINKING_BUDGET", "Thinking budget tokens (0 = unlimited)"],
+    ["MLX_M3_ALLOW_THINKING_BUDGET", "Allow per-request thinking budget"],
+    ["MLX_M3_IMAGE_DEFAULT_MAX_TOKENS", "Default max tokens for image requests"],
+  ]],
+  ["Performance And Context", [
+    ["MLX_M3_MAX_CONCURRENT_REQUESTS", "Concurrent request slots (1 = single flight)"],
+    ["MLX_M3_REQUEST_HISTORY_MAX", "Recent request history size"],
+    ["MLX_M3_PREFILL_STEP_SIZE", "Prefill chunk size in tokens"],
+    ["MLX_M3_ADAPTIVE_PREFILL_STEP_TOKENS", "Prompt size that triggers the adaptive prefill step"],
+    ["MLX_M3_ADAPTIVE_PREFILL_STEP_SIZE", "Adaptive prefill chunk size"],
+    ["MLX_M3_DECODE_EVAL_EVERY", "Decode eval cadence (tokens)"],
+    ["MLX_M3_DECODE_EVAL_AFTER_TOKENS", "Decode tokens before cadence switch"],
+    ["MLX_M3_DECODE_EVAL_AFTER_EVERY", "Decode eval cadence after switch"],
+    ["MLX_M3_THINKING_DECODE_EVAL_EVERY", "Decode eval cadence for thinking mode"],
+    ["MLX_M3_THINKING_RAW_SILENT_LIMIT", "Launch-time guard for malformed thinking streams"],
+    ["MLX_M3_LONG_CONTEXT_DECODE_EVAL_TOKENS", "Context size where long-context cadence starts"],
+    ["MLX_M3_LONG_CONTEXT_DECODE_EVAL_EVERY", "Long-context decode eval cadence"],
+    ["MLX_M3_ADAPTIVE_LONG_CONTEXT_DECODE_EVAL", "Adapt long-context cadence automatically"],
+    ["MLX_M3_MID_CONTEXT_DECODE_EVAL_TOKENS", "Mid-context threshold"],
+    ["MLX_M3_MID_CONTEXT_DECODE_EVAL_EVERY", "Mid-context decode eval cadence"],
+    ["MLX_M3_HIGH_CONTEXT_DECODE_EVAL_TOKENS", "High-context threshold"],
+    ["MLX_M3_HIGH_CONTEXT_DECODE_EVAL_EVERY", "High-context decode eval cadence"],
+    ["MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING", "Allow live runtime tuning endpoint"],
+    ["MLX_M3_MAX_KV_SIZE", "Max KV cache size in tokens"],
+    ["MLX_M3_KV_QUANT_ENABLED", "Quantize the KV cache"],
+    ["MLX_M3_KV_QUANT_SCHEME", "KV quantization scheme"],
+    ["MLX_M3_KV_BITS", "KV quantization bits"],
+    ["MLX_M3_KV_GROUP_SIZE", "KV quantization group size"],
+    ["MLX_M3_QUANTIZED_KV_START", "Token offset where KV quantization starts"],
+    ["MLX_M3_KV_CACHE_STEP", "KV cache growth step"],
+    ["MLX_MAX_OPS_PER_BUFFER", "Metal ops per command buffer"],
+    ["MLX_MAX_MB_PER_BUFFER", "Metal MB per command buffer"],
+    ["MLX_M3_LAYER_EVAL_EVERY", "Eval every N layers during forward (0 = off)"],
+  ]],
+  ["Prompt Cache", [
+    ["MLX_M3_PROMPT_CACHE", "Enable the RAM prompt/KV cache"],
+    ["MLX_M3_PROMPT_CACHE_THINKING", "Cache thinking-mode sessions"],
+    ["MLX_M3_PROMPT_CACHE_THINKING_MODE", "Thinking cache mode"],
+    ["MLX_M3_PROMPT_CACHE_DIRECT_SUFFIX_IDS", "Trust exact generated ids for suffix decode"],
+    ["MLX_M3_PROMPT_CACHE_MIN_REUSE", "Min reused tokens to keep a cache"],
+    ["MLX_M3_PROMPT_CACHE_MIN_SUFFIX_TOKENS", "Min suffix tokens to process"],
+    ["MLX_M3_PROMPT_CACHE_REUSE_BUCKET_TOKENS", "Reuse bucket size (0 = exact)"],
+    ["MLX_M3_REASONING_RECALL", "Re-inject prior reasoning for follow-ups"],
+    ["MLX_M3_REASONING_RECALL_MAX_SESSIONS", "Reasoning recall session cap"],
+    ["MLX_M3_REASONING_RECALL_MAX_ITEMS", "Reasoning recall item cap"],
+    ["MLX_M3_REASONING_RECALL_MAX_CHARS", "Reasoning recall char cap"],
+    ["MLX_M3_PROMPT_CACHE_TTL_SECONDS", "RAM cache TTL in seconds"],
+    ["MLX_M3_PROMPT_CACHE_MAX_TOKENS", "RAM cache max tokens (0 = unlimited)"],
+    ["MLX_M3_PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS", "Max generated tokens reused across turns"],
+    ["MLX_M3_PROMPT_CACHE_PROTECT_LARGE", "Protect large caches from small requests"],
+    ["MLX_M3_PROMPT_CACHE_PROTECT_MIN_TOKENS", "Large-cache protection threshold"],
+    ["MLX_M3_PROMPT_CACHE_PROTECT_BYPASS_MAX_TOKENS", "Max bypass size for protected caches"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_PROTECT", "Protect session caches from other sessions"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS", "Session protection threshold"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS", "Max bypass size for session protection"],
+    ["MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS", "In-RAM resident cache slots"],
+    ["MLX_M3_PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS", "Total tokens across resident slots"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_MANIFEST", "Persist session metadata manifest"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_MANIFEST_MAX", "Manifest entry cap"],
+    ["MLX_M3_PROMPT_CACHE_SESSION_MANIFEST_PATH", "Manifest file path"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM", "Keep the GPU warm while a cache is resident"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_MODE", "Keepwarm mode"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS", "Keepwarm interval"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS", "Idle seconds before keepwarm starts"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_MATRIX_SIZE", "Keepwarm matrix size"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS", "Large-cache keepwarm threshold"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS", "Large-cache keepwarm interval"],
+    ["MLX_M3_PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS", "Keepwarm backoff when slow"],
+    ["MLX_M3_CLEAR_CACHE_AFTER_REQUEST", "Clear Metal cache after each request"],
+    ["MLX_M3_CLEAR_CACHE_AFTER_ERROR", "Clear Metal cache after errors"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM", "Prewarm visible transcript after thinking turns"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_BLOCKING", "Block next request until prewarm finishes"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED", "Min generated tokens to prewarm"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS", "Max prewarm transcript tokens"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS", "Max prewarm suffix tokens"],
+    ["MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_MAX_GENERATED_TOKENS", "Max prewarm generated tokens"],
+  ]],
+  ["SSD Persistent Cache", [
+    ["MLX_M3_PROMPT_CACHE_SSD", "Enable durable SSD cache artifacts"],
+    ["MLX_M3_PROMPT_CACHE_SSD_RESTORE", "Restore validated SSD artifacts after RAM misses"],
+    ["MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE", "Auto-save validated states (off = manual saves)"],
+    ["MLX_M3_PROMPT_CACHE_SSD_DIR", "SSD cache root (shared default)"],
+    ["MLX_M3_PROMPT_CACHE_SSD_DIR_RANK0", "Rank 0 SSD cache root"],
+    ["MLX_M3_PROMPT_CACHE_SSD_DIR_RANK1", "Rank 1 SSD cache root"],
+    ["MLX_M3_PROMPT_CACHE_SSD_TTL_SECONDS", "SSD artifact TTL"],
+    ["MLX_M3_PROMPT_CACHE_SSD_MAX_BYTES", "SSD cache byte cap"],
+    ["MLX_M3_PROMPT_CACHE_SSD_MIN_TOKENS", "Min tokens to persist a session"],
+    ["MLX_M3_PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS", "Dashboard SSD scan interval"],
+    ["MLX_M3_PROMPT_CACHE_SSD_SAVE_REASONING", "Persist hidden-reasoning KV variants"],
+    ["MLX_M3_PROMPT_CACHE_SSD_PRIVACY", "SSD artifact privacy"],
+  ]],
+  ["Cluster And Network", [
+    ["M3_MLX_BACKEND", "Distributed backend"],
+    ["M3_SHARDING_MODE", "Sharding mode"],
+    ["M3_PIPELINE_LAYERS", "Pipeline layer split (keep 38,22)"],
+    ["MLX_M3_RANK0_ONLY_LOGITS", "Only rank 0 computes logits"],
+    ["MLX_M3_RANK0_DECODE_OWNER", "Rank 0 owns decode sampling"],
+    ["MLX_M3_OMLX_MINIMAX_OVERLAY", "Apply the MiniMax MSA overlay"],
+    ["MLX_M3_DISABLE_SPARSE_INDEX", "Disable the MSA sparse index"],
+    ["MLX_M3_KERNEL_STATS", "Collect kernel statistics"],
+    ["MLX_M3_MSA_K1_IMPL", "MSA K1 kernel implementation"],
+    ["MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN", "Blockwise top-k prefill KV threshold"],
+    ["MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK", "Blockwise top-k prefill chunk"],
+    ["MLX_M3_SPARSE_TOPK_BLOCKS_OVERRIDE", "Sparse top-k block count override"],
+    ["MLX_M3_DECODE_TOPK_REUSE_TOKENS", "Reuse decode top-k selection for N tokens"],
+    ["MLX_M3_COMPACT_DECODE_SORT_TOPK", "Sort compact decode top-k indices"],
+    ["MLX_M3_USE_DIRECT_DECODE_KERNEL", "Use the direct decode kernel"],
+    ["MLX_M3_DIRECT_DECODE_EVAL_MODE", "Direct decode eval mode"],
+  ]],
+  ["Watchdogs And Memory", [
+    ["M3_WATCHDOG_PREFILL_TIMEOUT", "Prefill watchdog timeout (s)"],
+    ["M3_WATCHDOG_DECODE_TIMEOUT", "Decode watchdog timeout (s)"],
+    ["M3_MAX_GENERATION_SECONDS", "Max generation wall time (s)"],
+    ["MLX_M3_WIRED_LIMIT_GB", "Wired memory limit (both ranks)"],
+    ["MLX_M3_WIRED_LIMIT_GB_RANK0", "Rank 0 wired limit"],
+    ["MLX_M3_WIRED_LIMIT_GB_RANK1", "Rank 1 wired limit"],
+    ["MLX_M3_CACHE_LIMIT_GB", "MLX Metal cache limit"],
+  ]],
+];
+const modelSettingGroups = [
+  ["Model Source", [
+    ["MLX_M3_MODEL", "Local model folder or HF id loaded at launch"],
+    ["MLX_M3_MODEL_ID", "Model repo id used for downloads and display"],
+  ]],
+];
+
+const ENUM_INPUTS = {
+  M3_SHARDING_MODE: ["pipeline", "tensor"],
+  M3_MLX_BACKEND: ["jaccl", "jaccl-ring", "ring"],
+  MLX_M3_DIRECT_DECODE_EVAL_MODE: ["small", "all"],
+  MLX_M3_PROMPT_CACHE_KEEPWARM_MODE: ["prewarm", "metal"],
+  MLX_M3_PROMPT_CACHE_SSD_PRIVACY: ["local"],
+  MLX_M3_PROMPT_CACHE_THINKING_MODE: ["off", "visible", "full"],
+  MLX_M3_KV_QUANT_SCHEME: ["uniform", "turboquant"],
+  MLX_M3_KV_BITS: ["4", "3", "2", "1.5", "1"],
+};
+const ONOFF_INPUTS = new Set([
+  "MLX_M3_PROMPT_CACHE_SSD", "MLX_M3_PROMPT_CACHE_SSD_RESTORE", "MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE",
+  "MLX_M3_PROMPT_CACHE_SSD_SAVE_REASONING", "MLX_M3_KV_QUANT_ENABLED", "MLX_M3_PROMPT_CACHE",
+  "MLX_M3_PROMPT_CACHE_DIRECT_SUFFIX_IDS", "MLX_M3_PROMPT_CACHE_PROTECT_LARGE", "MLX_M3_PROMPT_CACHE_KEEPWARM",
+  "MLX_M3_PROMPT_CACHE_THINKING", "MLX_M3_PROMPT_CACHE_SESSION_MANIFEST", "MLX_M3_REASONING_RECALL",
+  "MLX_M3_VISIBLE_TRANSCRIPT_PREWARM", "MLX_M3_VISIBLE_TRANSCRIPT_PREWARM_BLOCKING",
+  "MLX_M3_CLEAR_CACHE_AFTER_REQUEST", "MLX_M3_CLEAR_CACHE_AFTER_ERROR", "MLX_M3_ALLOW_THINKING_BUDGET",
+  "MLX_M3_ADAPTIVE_LONG_CONTEXT_DECODE_EVAL", "MLX_M3_ALLOW_UNSAFE_RUNTIME_TUNING",
+  "MLX_M3_RANK0_ONLY_LOGITS", "MLX_M3_RANK0_DECODE_OWNER", "MLX_M3_OMLX_MINIMAX_OVERLAY",
+  "MLX_M3_DISABLE_SPARSE_INDEX", "MLX_M3_KERNEL_STATS", "MLX_M3_COMPACT_DECODE_SORT_TOPK",
+  "MLX_M3_USE_DIRECT_DECODE_KERNEL", "MLX_M3_PROMPT_CACHE_SESSION_PROTECT",
+]);
+
+function settingInput(key, value){
+  const v = value ?? "";
+  if(ENUM_INPUTS[key]){
+    const opts = ENUM_INPUTS[key].map(o =>
+      '<option value="'+esc(o)+'"'+(String(v)===o ? " selected":"")+">"+esc(o)+"</option>").join("");
+    const extra = ENUM_INPUTS[key].includes(String(v)) || v === "" ? "" :
+      '<option value="'+esc(v)+'" selected>'+esc(v)+"</option>";
+    return '<select id="set_'+esc(key)+'"><option value=""'+(v===""?" selected":"")+'>(default)</option>'+opts+extra+"</select>";
+  }
+  if(ONOFF_INPUTS.has(key)){
+    return '<select id="set_'+esc(key)+'">'
+      + '<option value=""'+(v===""?" selected":"")+'>(default)</option>'
+      + '<option value="1"'+(String(v)==="1"?" selected":"")+'>1 — on</option>'
+      + '<option value="0"'+(String(v)==="0"?" selected":"")+'>0 — off</option></select>';
+  }
+  if(key === "MLX_M3_MAX_CONCURRENT_REQUESTS")
+    return '<input id="set_'+esc(key)+'" type="number" min="1" max="4" value="'+esc(v)+'">';
+  if(key === "MLX_M3_REQUEST_HISTORY_MAX")
+    return '<input id="set_'+esc(key)+'" type="number" min="0" max="256" value="'+esc(v)+'">';
+  const ph = key === "MLX_M3_MODEL" ? "/path/to/model-folder or hf-repo-id"
+    : key === "MLX_M3_MODEL_ID" ? "mlx-community/MiniMax-M3-4bit" : "";
+  return '<input id="set_'+esc(key)+'" value="'+esc(v)+'" placeholder="'+esc(ph)+'">';
+}
+
+let settingsSig = "", originalSettings = {};
+function renderSettingsInto(gridId, groups, s){
+  const grid = el(gridId); if(!grid) return;
+  grid.innerHTML = groups.map(([title, keys]) =>
+    '<div class="settings-group"><h4>'+esc(title)+'</h4><div class="settings-grid">'
+    + keys.map(([key, desc]) =>
+      '<div class="field"><label title="'+esc(desc)+'"><code>'+esc(key)+"</code><br>"+esc(desc)+"</label>"
+      + settingInput(key, s[key]) + "</div>").join("")
+    + "</div></div>").join("");
+}
+function renderSettings(s){
+  const ae = document.activeElement;
+  if(ae && ae.id && ae.id.startsWith("set_")) return;
+  const sig = JSON.stringify(s);
+  if(sig === settingsSig && el("settingsGrid").children.length && el("modelSettingsGrid").children.length) return;
+  settingsSig = sig;
+  originalSettings = Object.assign({}, s);
+  renderSettingsInto("settingsGrid", advancedSettingGroups, s);
+  renderSettingsInto("modelSettingsGrid", modelSettingGroups, s);
+}
+async function saveSettings(){
+  const changed = {};
+  document.querySelectorAll("[id^='set_']").forEach(input => {
+    const key = input.id.slice(4);
+    const value = String(input.value ?? "").trim();
+    if(value !== "" && value !== String(originalSettings[key] ?? "")) changed[key] = value;
+  });
+  const states = [el("saveState"), el("modelSaveState")].filter(Boolean);
+  if(!Object.keys(changed).length){ states.forEach(x => x.textContent = "no changes"); return; }
+  states.forEach(x => x.textContent = "saving…");
+  try{
+    const r = await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(changed)});
+    const j = await r.json();
+    const msg = j.ok ? "saved and synced" : (j.error || "failed");
+    states.forEach(x => x.textContent = msg);
+    toast(j.ok ? "settings saved ✓" : "settings save failed ✕");
+  }catch(e){ states.forEach(x => x.textContent = "failed"); toast("settings error: "+e.message); }
+  settingsSig = ""; refresh();
+}
+
+/* ============ models ============ */
+async function downloadModel(){
+  const target = String((el("set_MLX_M3_MODEL")||{}).value || originalSettings.MLX_M3_MODEL || "").trim();
+  const modelId = String((el("set_MLX_M3_MODEL_ID")||{}).value || originalSettings.MLX_M3_MODEL_ID || "mlx-community/MiniMax-M3-4bit").trim();
+  if(!target){ setText("dlState", "set a model folder first"); return; }
+  setText("dlState", "starting…");
+  try{
+    const r = await fetch("/api/model/download", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({model_id:modelId, target:target, include_worker:el("dlWorker").checked})});
+    const j = await r.json();
+    setText("dlState", j.ok ? "download running in background" : (j.error || "failed"));
+    toast(j.ok ? "model download started ✓" : "download failed ✕");
+  }catch(e){ setText("dlState", "failed"); toast("download error: "+e.message); }
+  settingsSig = ""; refresh(); logs(true);
+}
+async function checkRuntimeStack(){
+  setText("mlxVlmState", "checking both ranks + pypi…");
+  el("runtimeRows").innerHTML = '<tr><td colspan="6" style="color:var(--muted)">checking…</td></tr>';
+  try{
+    const j = await (await fetch("/api/runtime/versions")).json();
+    if(!j.packages){ setText("mlxVlmState", j.error || "check failed"); return; }
+    el("runtimeRows").innerHTML = j.packages.map(p => {
+      const mismatch = p.ranks_match === false;
+      const updAvail = p.updatable && p.latest_release && p.rank0 && p.latest_release !== p.rank0;
+      const action = p.updatable
+        ? '<button class="btn sm'+(updAvail ? " primary" : "")+'" onclick="updateRuntimePackage(\''+p.package+'\')">'
+          + (updAvail ? "Update" : "Reinstall") + "</button>"
+        : '<span class="chip">pinned</span>';
+      return "<tr>"
+        + "<td><b>"+esc(p.package)+"</b></td>"
+        + "<td>"+esc(p.rank0 || "—")+"</td>"
+        + '<td'+(mismatch ? ' style="color:var(--accent);font-weight:700"' : "")+">"+esc(p.rank1 || "—")+(mismatch ? " ✕" : "")+"</td>"
+        + "<td>"+esc(p.latest_release || "—")+(updAvail ? ' <span class="chip hot">new</span>' : "")+"</td>"
+        + '<td style="white-space:normal;max-width:280px">'+esc(p.note || "")+"</td>"
+        + "<td>"+action+"</td>"
+        + "</tr>";
+    }).join("");
+    setText("mlxVlmState", j.worker_error ? "worker check failed: "+j.worker_error : "checked ✓");
+  }catch(e){ setText("mlxVlmState", "check failed: "+e); }
+}
+async function updateRuntimePackage(pkg){
+  if(!confirm("pip install -U "+pkg+" on rank 0"+(el("updWorker").checked ? " + rank 1" : "")+"? Restart the cluster afterwards.")) return;
+  setText("mlxVlmState", "updating "+pkg+"…");
+  try{
+    const r = await fetch("/api/runtime/update", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({package:pkg, include_worker:el("updWorker").checked})});
+    const j = await r.json();
+    setText("mlxVlmState", j.ok ? pkg+" update running (log: "+(j.log||"")+"); restart cluster when done" : (j.error || "failed"));
+    toast(j.ok ? pkg+" update started ✓" : "update failed ✕");
+  }catch(e){ setText("mlxVlmState", "failed"); toast("update error: "+e.message); }
+  logs(true);
+}
+
+/* ============ logs ============ */
+async function logs(force){
+  if(activeView !== "logs" && !force) return;
+  try{
+    const r = await fetch("/api/logs?lines=220");
+    const t = await r.text();
+    const p = el("logsPre"); p.textContent = t || "(empty)";
+    p.scrollTop = p.scrollHeight;
+  }catch(e){ el("logsPre").textContent = String(e); }
+}
+setInterval(() => { if(activeView === "logs") logs(); }, 3000);
+
+/* ============ chat ============ */
+let chatHistory = [], chatAbort = null, chatTimer = null;
+const CHAT_PRESETS = {
+  thinking: {model:"Minimax-M3", text:"Walk me through the tradeoffs of pipeline vs tensor parallelism for a 2-node Apple Silicon cluster. Think it through carefully."},
+  coding:   {text:"Write a Python function that parses an OpenAI-style SSE stream and yields content deltas. Include error handling."},
+  vision:   {text:"Describe this image in detail."},
+  research: {text:"Summarize the key ideas behind sparse attention for long-context transformer inference."},
+  short:    {model:"Minimax-M3-No-Think", text:"Reply with exactly: cluster online"},
+};
+function usePreset(name){
+  const p = CHAT_PRESETS[name]; if(!p) return;
+  if(p.model){ el("chatModel").value = p.model; syncModeCards(); }
+  el("chatInput").value = p.text; el("chatInput").focus();
+}
+function setChatModel(m){ el("chatModel").value = m; syncModeCards(); }
+function syncModeCards(){
+  const m = el("chatModel").value;
+  el("mcThink").classList.toggle("active", m === "Minimax-M3");
+  el("mcNoThink").classList.toggle("active", m === "Minimax-M3-No-Think");
+}
+function clearChat(){ chatHistory = []; renderChat(); setText("chatStatus", "cleared"); }
+function resetChatMetrics(){ setText("cmTtft","…"); setText("cmElapsed","…"); setText("cmChunks","0"); setText("cmR","0"); setText("cmC","0");
+  setText("cmSession", el("chatSession").value.trim() || "dashboard-chat"); }
+function renderChat(streaming){
+  const th = el("thread");
+  th.innerHTML = chatHistory.map(m => {
+    if(m.role === "user") return '<div class="msg user"><div class="who">you</div><div class="body">'+esc(m.content)+"</div></div>";
+    const cls = m.role === "error" ? "error" : "assistant";
+    const reasoning = m.reasoning ? '<details'+(m.content ? "" : " open")+'><summary>thinking · '+m.reasoning.length+' chars</summary><div class="body">'+esc(m.reasoning)+"</div></details>" : "";
+    return '<div class="msg '+cls+'"><div class="who">'+esc(m.model || m.role)+'</div>'+reasoning+'<div class="body">'+esc(m.content)+(streaming && m === chatHistory[chatHistory.length-1] ? "▌" : "")+"</div></div>";
+  }).join("");
+  th.scrollTop = th.scrollHeight;
+}
+function chatMessagesForRequest(text, imageUrl){
+  const msgs = [];
+  const sys = el("chatSystem").value.trim();
+  if(sys) msgs.push({role:"system", content:sys});
+  for(const m of chatHistory){
+    if(m.role === "user") msgs.push({role:"user", content:m.content});
+    else if(m.role === "assistant" && m.content) msgs.push({role:"assistant", content:m.content});
+  }
+  if(imageUrl){
+    msgs.push({role:"user", content:[{type:"text", text:text || "Describe this image."}, {type:"image_url", image_url:{url:imageUrl}}]});
+  }else{
+    msgs.push({role:"user", content:text});
+  }
+  return msgs;
+}
+async function sendChat(){
+  const input = el("chatInput");
+  const text = input.value.trim();
+  const imageUrl = el("chatImage").value.trim();
+  if(!text && !imageUrl) return;
+  if(chatAbort){ try{ chatAbort.abort(); }catch(e){} }
+  const model = el("chatModel").value;
+  const body = {
+    model,
+    messages: chatMessagesForRequest(text, imageUrl),
+    max_tokens: Number(el("chatMaxTokens").value) || 512,
+    temperature: Number(el("chatTemperature").value) || 1,
+    top_p: Number(el("chatTopP").value) || 1,
+    metadata: {session_id: el("chatSession").value.trim() || "dashboard-chat", source: "dashboard-chat"},
+  };
+  chatHistory.push({role:"user", content:text || "(image)"});
+  const assistant = {role:"assistant", content:"", reasoning:"", model};
+  chatHistory.push(assistant);
+  input.value = "";
+  resetChatMetrics();
+  setText("chatStatus", "streaming");
+  renderChat(true);
+  const started = performance.now();
+  let chunks = 0, gotFirst = false, finishReason = "";
+  chatAbort = new AbortController();
+  chatTimer = setInterval(() => setText("cmElapsed", ((performance.now()-started)/1000).toFixed(1)+"s"), 250);
+  try{
+    const r = await fetch("/api/chat/stream", {method:"POST", headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(body), signal:chatAbort.signal});
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "", done = false;
+    const handlePayload = payload => {
+      if(payload === "[DONE]"){ done = true; return; }
+      let obj; try{ obj = JSON.parse(payload); }catch(e){ return; }
+      if(obj && obj.ok === false) throw new Error(obj.error || JSON.stringify(obj));
+      const choice = obj && obj.choices && obj.choices[0]; if(!choice) return;
+      const delta = choice.delta || {};
+      const reasoning = delta.reasoning_content || delta.reasoning || delta.thinking || "";
+      if(reasoning) assistant.reasoning += reasoning;
+      if(delta.content) assistant.content += delta.content;
+      if((reasoning || delta.content) && !gotFirst){
+        gotFirst = true;
+        setText("cmTtft", ((performance.now()-started)/1000).toFixed(2)+"s");
+      }
+      if(choice.finish_reason) finishReason = choice.finish_reason;
+      chunks += 1;
+      setText("cmChunks", String(chunks));
+      setText("cmR", String(assistant.reasoning.length));
+      setText("cmC", String(assistant.content.length));
+      renderChat(true);
+    };
+    const handleEvent = evt => { for(const line of evt.split("\n")) if(line.startsWith("data:")) handlePayload(line.slice(5).trim()); };
+    while(true){
+      const {value, done: eof} = await reader.read();
+      if(eof) break;
+      buffer += decoder.decode(value, {stream:true});
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+      events.forEach(handleEvent);
+    }
+    if(buffer.trim()) handleEvent(buffer);
+    setText("chatStatus", done || finishReason ? ("done" + (finishReason ? ": "+finishReason : "")) : "done");
+  }catch(e){
+    if(e && e.name === "AbortError"){ setText("chatStatus", "aborted locally"); }
+    else{ assistant.role = "error"; assistant.content = String(e); setText("chatStatus", "error"); }
+  }finally{
+    clearInterval(chatTimer); chatTimer = null; chatAbort = null;
+    setText("cmElapsed", ((performance.now()-started)/1000).toFixed(1)+"s");
+    renderChat(false);
+    refresh();
+  }
+}
+el("chatInput").addEventListener("keydown", e => {
+  if((e.metaKey || e.ctrlKey) && e.key === "Enter"){ e.preventDefault(); sendChat(); }
+});
+
+/* ============ cache map ============ */
+function renderCacheMap(entries){
+  const body = el("cacheMapRows");
+  const rows = entries.slice(0, 8);
+  if(!rows.length){ body.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">no tracked sessions</td></tr>'; return; }
+  body.innerHTML = rows.map(row => {
+    const key = row.key || row.session_id || "default";
+    let source = row.session_source || "…";
+    if(source === "auto.conversation_fingerprint") source = "auto";
+    else if(source.startsWith("metadata.")) source = "meta."+source.slice(9);
+    let state = "cold", cls = "";
+    if(row.resident){ state = "hot"; cls = "hot"; }
+    else if(row.resident_slot){ state = "slot"; cls = "slot"; }
+    else if(row.ssd_rehydratable){ state = "ssd"; cls = "ssd"; }
+    else if(row.metadata_only){ state = "meta"; }
+    return "<tr>"
+      + '<td title="'+esc(key)+'">'+esc(key === "__default__" ? "default" : String(key).slice(0,22))+"</td>"
+      + "<td>"+esc(source)+"</td>"
+      + '<td><span class="chip '+cls+'">'+state+"</span></td>"
+      + '<td class="num">'+fmtInt(row.cache_len || row.key_tokens || 0)+"</td>"
+      + '<td class="num">'+(row.last_suffix_tokens ?? "…")+"</td>"
+      + '<td class="num">'+(Number.isFinite(Number(row.last_reuse_ratio)) ? Math.round(Number(row.last_reuse_ratio)*100)+"%" : "…")+"</td>"
+      + '<td title="'+esc(row.last_action || "")+'">'+esc(String(row.last_action || "…").slice(0,26))+"</td>"
+      + "</tr>";
+  }).join("");
+}
+
+/* ============ recent requests ============ */
+let seenReq = new Set();
+function renderRecent(recent, stats){
+  const rows = recent.slice(-14).reverse();
+  if(!rows.length) return;
+  el("reqRows").innerHTML = rows.map(r => {
+    const isNew = !seenReq.has(r.id);
+    const mode = r.thinking_mode || (r.tools_count ? "tools" : "chat");
+    const dt = Number(r.decode_tps);
+    const cacheR = Number(r.cache_reuse_ratio) || 0;
+    return '<tr class="'+(isNew ? "new" : "")+'">'
+      + "<td>"+esc(String(r.model || "—").replace("Minimax-M3","M3"))+"</td>"
+      + "<td>"+esc(mode)+(r.tools_count ? " ·"+r.tools_count+"t" : "")+"</td>"
+      + '<td><span class="'+(r.ok ? "ok-y" : "ok-n")+'">'+(r.ok ? "✓" : "✕")+"</span></td>"
+      + '<td class="num">'+fmt(r.ttft_s, 2)+"s</td>"
+      + '<td class="num">'+fmt(r.prompt_tps_excluding_cache ?? r.prompt_tps, 0)+"</td>"
+      + '<td class="num"'+(dt >= 24 ? ' style="color:var(--good);font-weight:700"' : "")+">"+fmt(dt)+"</td>"
+      + '<td class="num">'+fmtInt(r.tokens)+"</td>"
+      + '<td class="num">'+fmtBig(r.reasoning_chars)+"/"+fmtBig(r.content_chars)+"</td>"
+      + '<td class="num">'+(cacheR ? Math.round(cacheR*100)+"%" : "·")+"</td>"
+      + "</tr>";
+  }).join("");
+  rows.forEach(r => seenReq.add(r.id));
+  if(seenReq.size > 400) seenReq = new Set(rows.map(r => r.id));
+  const s = stats || {};
+  setText("recentSummary", (s.ok_count ?? "—")+"/"+(s.count ?? "—")+" ok · avg decode "+fmt(s.avg_decode_tps)+" t/s · avg reuse "+(s.avg_cache_reuse_ratio != null ? Math.round(100*s.avg_cache_reuse_ratio)+"%" : "—"));
+}
+
+/* ============ machines ============ */
+function renderMachine(prefix, label, m, capGb){
+  setText(prefix+"Name", label);
+  const reach = el(prefix+"Reach");
+  if(!m || m.ok === false){ reach.textContent = "unreachable"; el(prefix+"Fill").style.width = "0%"; el(prefix+"Kv").innerHTML = ""; return; }
+  reach.textContent = "online";
+  const cap = capGb || ((m.wired_gb||0)+(m.available_gb||0)) || 1;
+  const pct = Math.min(100, 100*(m.wired_gb||0)/cap);
+  el(prefix+"Fill").style.width = pct.toFixed(1)+"%";
+  setText(prefix+"Wired", "wired "+fmt(m.wired_gb)+" / "+fmt(cap,0)+" GB");
+  setText(prefix+"Pct", pct.toFixed(0)+"%");
+  el(prefix+"Kv").innerHTML =
+    "<dt>available</dt><dd>"+fmt(m.available_gb)+" GB</dd>"
+    + "<dt>active</dt><dd>"+fmt(m.active_gb)+" GB</dd>"
+    + "<dt>free</dt><dd>"+fmt(m.free_gb)+" GB</dd>";
+}
+
+/* ============ main poll ============ */
+let lastOkPoll = 0;
+async function refresh(){
+  let d;
+  try{
+    d = await (await fetch("/api/status", {cache:"no-store"})).json();
+    lastOkPoll = Date.now();
+  }catch(e){
+    el("hDot").className = "dot bad"; setText("hTxt", "gui unreachable");
+    return;
+  }
+  const h = d.health || {}, cfg = d.config || {}, s = d.settings || {};
+  const ar = h.active_request;
+  const stats = h.recent_request_stats || {};
+  const lt = h.lifetime_tokens || {};
+  const lr = h.last_request || {};
+  const pc = h.prompt_cache || {};
+  const ks = h.kernel_stats || {};
+  const recent = h.recent_requests || [];
+
+  /* masthead */
+  const healthy = h.status === "healthy";
+  el("hDot").className = "dot " + (ar ? "busy" : (healthy ? "ok" : "bad"));
+  setText("hTxt", ar ? "generating" : (h.status || "unknown"));
+  const backend = cfg.backend || s.M3_MLX_BACKEND || "?";
+  setText("hBackend", backend + (backend === "jaccl" ? " · RDMA" : backend === "ring" ? " · TCP" : ""));
+  setText("hModel", String(h.loaded_model || cfg.model_id || "—").split("/").pop());
+  setText("hRanks", (h.ranks ?? "—") + (h.distributed ? " · "+h.distributed : ""));
+  setText("hClock", new Date().toLocaleTimeString());
+  setText("tagline", "2-MAC MINIMAX-M3 · " + (backend === "jaccl" ? "RDMA PIPELINE" : String(backend).toUpperCase()+" PIPELINE") + " · EVERY TOKEN LEAVES A TRACE");
+
+  /* endpoints */
+  const baseUrl = cfg.public_base_url || "http://127.0.0.1:8080/v1";
+  const gwUrl = cfg.gateway_base_url || "—";
+  setText("epApi", baseUrl); setText("epGateway", gwUrl);
+  setText("epDash", cfg.dashboard_url || location.origin);
+  setText("epSplit", cfg.pipeline_layers || s.M3_PIPELINE_LAYERS || "38,22");
+  setText("epRdma", [cfg.rank0_rdma, cfg.rank1_rdma].filter(Boolean).join(" / ") || (backend === "ring" ? "tcp" : "—"));
+  setText("footUrls", baseUrl + " · " + gwUrl);
+  setText("suApi", baseUrl); setText("suGateway", gwUrl);
+  const split = String(cfg.pipeline_layers || s.M3_PIPELINE_LAYERS || "38,22").split(",");
+  setText("suSplit0", split[0] || "38"); setText("suSplit1", split[1] || "22");
+  setText("suTransport", backend === "jaccl" ? "jaccl RDMA over Thunderbolt 5" : backend+" over Thunderbolt 5");
+
+  /* live strip */
+  const liveTps = liveDecodeTps(ar, lr.decode_tps ?? stats.avg_decode_tps);
+  tween("mDecode", liveTps, v => fmt(v));
+  tween("mPrefill", lr.prompt_tps ?? stats.avg_prompt_tps_meaningful ?? stats.avg_prompt_tps, v => fmt(v, 0));
+  tween("mTtft", stats.avg_ttft_s, v => fmt(v, 2));
+  setText("mReqs", fmtInt(lt.requests));
+  setText("mReqsSub", (stats.ok_count ?? "—")+"/"+(stats.count ?? "—")+" recent ok");
+  tween("mTokens", Number(lt.processed_total_live ?? lt.processed_total) || (Number(lt.decode_live ?? lt.decode)||0), v => fmtBig(v));
+  setText("mTokensSub", "prefill "+fmtBig(lt.prompt_processed_live ?? lt.prompt_processed)+" + decode "+fmtBig(lt.decode_live ?? lt.decode));
+  setText("mQueue", fmtInt(h.request_queue_depth ?? 0));
+
+  /* turn bar */
+  if(ar){
+    if(window._turnLastId !== ar.id){ window._turnLastId = ar.id; window._turnCount = (window._turnCount||0)+1; }
+    /* server reports chunked prefill as N-1/N forever; any emitted token = decoding */
+    const prefilling = (ar.prefill_total_tokens||0) > 0 && (ar.prefill_progress||0) < 0.999 && !(ar.tokens_emitted > 0);
+    const frac = prefilling ? (ar.prefill_progress||0) : Math.min(1, (ar.tokens_emitted||0)/(ar.max_tokens||1));
+    const elapsed = d.time && ar.started ? (d.time - ar.started) : 0;
+    el("tbPhase").innerHTML = (prefilling ? "PREFILL" : "DECODE") + ' <span class="cur"></span>';
+    el("tbPhase").className = "phase" + (prefilling ? "" : " decode");
+    setText("tbId", ar.id || "");
+    setText("tbTurn", "turn "+(window._turnCount||1)+" · turns chain per-request by design");
+    el("tbBody").innerHTML =
+      '<div class="bar"><div class="fill'+(prefilling ? "" : " decode")+'" style="width:'+(100*frac).toFixed(1)+'%"></div>'
+      + '<div class="pct">'+(100*frac).toFixed(0)+"%</div></div>"
+      + '<div class="meta">'
+      + '<span><span class="k">tokens</span>'+fmtInt(ar.tokens_emitted)+" / "+fmtInt(ar.max_tokens)+"</span>"
+      + '<span><span class="k">elapsed</span>'+fmt(elapsed,0)+"s</span>"
+      + '<span><span class="k">live</span>'+fmt(liveTps)+" tok/s</span>"
+      + '<span><span class="k">ttft</span>'+fmt(ar.first_token_s,2)+"s</span>"
+      + '<span><span class="k">client</span>'+(ar.client_connected ? "connected" : "gone")+"</span>"
+      + "</div>";
+  }else{
+    el("tbPhase").textContent = "IDLE"; el("tbPhase").className = "phase";
+    setText("tbId",""); setText("tbTurn","");
+    el("tbBody").innerHTML = '<div class="idle-note">no active request — the cluster is listening</div>';
+  }
+  el("activePre").textContent = ar ? JSON.stringify(ar, null, 2) : "none";
+  setText("activeHint", ar ? (ar.id || "active") : "none");
+
+  /* chart + sparks */
+  samples.push({t: Date.now(), decode: (ar ? liveTps : 0) || 0});
+  if(samples.length > MAXS) samples.shift();
+  setText("chartNow", ar ? fmt(liveTps)+" tok/s" : "idle");
+  drawChart();
+  const chrono = recent.slice();
+  spark("spDecode", chrono.map(x => Number(x.decode_tps)||0), true);
+  spark("spPrefill", chrono.filter(x => (Number(x.processed_prompt_tokens ?? x.prompt_tokens)||0) >= 512).map(x => Number(x.prompt_tps)||0), false);
+  spark("spTtft", chrono.map(x => Number(x.ttft_s)||0), false);
+
+  /* machines */
+  const mem = d.memory || {};
+  renderMachine("m0", cfg.rank0_label || "Mac Studio · rank 0", mem.studio, Number(cfg.rank0_total_gb) || 256);
+  renderMachine("m1", cfg.rank1_label || "MacBook Pro · rank 1", mem.macbook, Number(cfg.rank1_total_gb) || 128);
+
+  /* tiles */
+  const ttl = Number(pc.expires_in_seconds);
+  let ttlValue = pc.enabled ? (pc.loaded ? (Number.isFinite(ttl) ? Math.ceil(ttl/60)+"m" : "pinned") : "ready") : "off";
+  const kw = pc.keepwarm || {};
+  setText("tCacheTtl", ttlValue);
+  setText("tCacheTtlNote", pc.enabled ? (pc.loaded ? "cache "+fmtInt(pc.cache_len)+" tok · keepwarm "+(kw.enabled ? "on" : "off") : "no active cache yet") : "prompt cache disabled");
+  setText("opCacheTtl", ttlValue);
+  const ssd = pc.ssd || {};
+  const ssdMode = ssd.mode || (s.MLX_M3_PROMPT_CACHE_SSD === "1" ? "save-only" : "off");
+  setText("tSsd", ssdMode);
+  setText("tSsdNote", ssdMode === "off" ? "disabled; RAM resident cache active"
+    : (Number.isFinite(Number(ssd.entry_count)) ? ssd.entry_count+" entries" : "dir pending")+", "+fmt((Number(ssd.total_bytes)||0)/1073741824, 2)+" GB");
+  const cmap = pc.session_map || {};
+  const entries = Array.isArray(cmap.entries) ? cmap.entries : [];
+  setText("tCacheMap", entries.length ? entries.length+"/"+(cmap.max_entries || entries.length) : (pc.enabled ? "0" : "off"));
+  const slots = Array.isArray(cmap.resident_slots) ? cmap.resident_slots.length : 0;
+  const slotsMax = Math.max(0, (Number(cmap.resident_slots_max)||0)-1);
+  setText("tCacheMapNote", "slots "+slots+"/"+slotsMax+" · resident "+fmtBig(cmap.resident_total_tokens || 0)+" tok");
+  const topkCalls = Number(ks.decode_topk_calls || ks.topk_calls);
+  setText("tKernel", Number.isFinite(topkCalls) && topkCalls > 0 ? fmtBig(topkCalls)+" calls" : "…");
+  setText("tKernelNote", ks.last_prefill_ineligible_reason || "sparse attention kernel calls");
+  const msaCalls = Number(ks.msa_k1_calls || ks.msa_prefill_calls) || 0;
+  setText("tMsa", ks.last_msa_k1_impl || s.MLX_M3_MSA_K1_IMPL || "…");
+  setText("tMsaNote", msaCalls > 0 ? fmtBig(msaCalls)+" prefill calls" : "waiting for long prompt prefill");
+  const metal = h.metal_warmup || {};
+  setText("tMetal", metal.at ? (metal.ok ? fmt(metal.elapsed_ms||0,1)+"ms" : "error") : "…");
+  setText("tMetalNote", metal.at ? (metal.reason||"manual")+" · "+(metal.matrix_size||"?")+"² ×"+(metal.repeats||"?") : "not run since server start");
+  setText("tDoneFail", (h.requests_completed||0)+" / "+(h.requests_failed||0));
+  const requestTps = ar ? Number(ar.request_tps) : (Number(lr.tps) || Number(lr.request_tps));
+  setText("tReqTps", requestTps > 0 ? fmt(requestTps, 1)+" t/s" : "…");
+
+  /* tables */
+  renderRecent(recent, stats);
+  renderCacheMap(entries);
+
+  /* processes */
+  const procs = d.processes || {};
+  el("procs").textContent = ["Local:"].concat(procs.local || [])
+    .concat([""], ["Remote:"], procs.remote || [])
+    .concat([""], ["Ports:"], procs.ports || []).join("\n");
+
+  /* operations view */
+  setText("opStatus", ar ? "generating" : (h.status || "…"));
+  setText("opQueue", fmtInt(h.request_queue_depth ?? 0));
+  setText("opDoneFail", (h.requests_completed||0)+" / "+(h.requests_failed||0));
+  setText("opActive", ar ? (ar.id || "active") : "none");
+  setText("opStream", s.MLX_M3_STREAM_MODE || "buffered");
+  setText("opConc", s.MLX_M3_MAX_CONCURRENT_REQUESTS || "1");
+  setText("opCadence", s.MLX_M3_THINKING_DECODE_EVAL_EVERY || "…");
+  setText("opRawSilent", s.MLX_M3_THINKING_RAW_SILENT_LIMIT || "…");
+  setText("opDecode", fmt(liveTps)+" t/s");
+  setText("opPrompt", fmt(lr.prompt_tps ?? stats.avg_prompt_tps, 0)+" t/s");
+  setText("opTtft", fmt(stats.avg_ttft_s, 2)+"s");
+  setText("opCacheState", pc.enabled ? (pc.loaded ? "hot" : "ready") : "off");
+  setText("opResident", pc.session_id ? String(pc.session_id).slice(0,26)+" · "+fmtInt(pc.cache_len)+" tok" : "none");
+  setText("opApi", baseUrl); setText("opGateway", gwUrl);
+  setText("opModel", String(h.loaded_model || cfg.model_id || "—"));
+
+  /* chat side */
+  setText("cmEndpoint", baseUrl);
+  setText("cmCache", pc.loaded ? "hot · "+fmtInt(pc.cache_len)+" tok" : (pc.enabled ? "ready" : "off"));
+  setText("cmDecode", fmt(lr.decode_tps ?? stats.avg_decode_tps)+" t/s");
+
+  /* models view */
+  setText("mdlConfigured", s.MLX_M3_MODEL || "—");
+  setText("mdlLoaded", h.loaded_model || "—");
+  const same = (h.loaded_model && s.MLX_M3_MODEL) ? String(h.loaded_model) === String(s.MLX_M3_MODEL) : true;
+  el("mdlHint").textContent = same ? "loaded matches configured" : "restart required to load configured path";
+  el("mdlHint").className = "chip" + (same ? "" : " hot");
+
+  /* settings */
+  renderSettings(s);
+}
+
+/* stale banner */
+setInterval(() => {
+  el("stale").style.display = (lastOkPoll && Date.now() - lastOkPoll > 12000) ? "block" : "none";
+}, 3000);
+
+/* boot */
+setTheme((() => { try{ return localStorage.getItem("tmlx-theme") || "paper"; }catch(e){ return "paper"; } })());
+renderChat(); resetChatMetrics();
+refresh();
+// 1s poll: /health is an in-memory dict dump (~zero server cost); paired
+// with ~1s bar transitions so motion bridges the poll gap smoothly.
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>

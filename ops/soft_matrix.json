@@ -1,0 +1,146 @@
+{
+  "created": "2026-07-05 night",
+  "notes": "SOFT overnight trials \u2014 ZERO machine reboots (Jonathan's rule after the 19:09 reboot-loop incident). Process-level restarts only (M3_Stop/M3_Start), halt-with-machines-up on ANY anomaly; a true wedge (rc75) gets live_wedge_capture (spindumps both ranks) then HALT \u2014 no auto-reboot ever. Watch RTR errno failures across restarts as the link-degradation signal. Baselines: evening fresh-boot 8/8 = 25.8-26.6 t/s decode, prefill 366-368 @16k; warm-restart persistcheck round 1 = 25.08 (dashboard tab open, confounded).",
+  "trials": [
+    {
+      "name": "agent-traffic LONG (12 cycles, ~84 tool-call turns)",
+      "env": {},
+      "restart": false,
+      "soak_cmd": "python3 ops/agent_traffic_test.py --cycles 12",
+      "soak": {
+        "rounds": 0,
+        "gap": 0,
+        "max_tokens": 0
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "clean",
+      "why": "Task 9 first full pass: long tool-call agent session on the winning config. The 2026-07-05 morning wedge was a short plain decode \u2014 this is that regime plus tools, context growth, cache reuse.",
+      "started": "2026-07-05T19:41:45.200382",
+      "finished": "2026-07-05T20:01:43.394015",
+      "result": {
+        "clean_rounds": "84",
+        "jsonl": "soak8_soft0_20260705_194228.jsonl",
+        "prefill_tps": "356.53"
+      }
+    },
+    {
+      "name": "pristine, poller OFF (A/B baseline)",
+      "env": {},
+      "restart": false,
+      "soak": {
+        "rounds": 3,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "wedge",
+      "why": "Dashboard-overhead A/B leg 1: no status polling during rounds.",
+      "started": "2026-07-05T20:01:43.421571",
+      "finished": "2026-07-05T20:13:09.649432",
+      "note": "WEDGE \u2014 spindumps captured BEFORE any recovery, machines LEFT UP",
+      "result": {
+        "clean_rounds": "1",
+        "jsonl": "soak8_soft1_20260705_200229.jsonl",
+        "prefill_tps": "356.05"
+      }
+    },
+    {
+      "name": "pristine, poller ON at dashboard rate (A/B)",
+      "env": {},
+      "restart": false,
+      "soak": {
+        "rounds": 3,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "on",
+      "status": "pending",
+      "why": "Dashboard-overhead A/B leg 2: /api/status polled every 2.5s (worst-case active tab). Delta vs leg 1 = true dashboard cost. >0.5 t/s -> make dashboard poll adaptive."
+    },
+    {
+      "name": "iogpu tuned (260096/122880) + restart",
+      "env": {},
+      "restart": true,
+      "soak": {
+        "rounds": 4,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 260096,
+      "iogpu1": 122880,
+      "poller": "off",
+      "status": "pending",
+      "why": "First-ever rank1 OS wired-cap lift (sudo works now). Prefill suspect: rank1 rewires 84GB per 4096-tok chunk under a ~96GB default cap. Watch the prefill probe number especially."
+    },
+    {
+      "name": "FAST_SYNCH=0 + restart",
+      "env": {
+        "MLX_METAL_FAST_SYNCH": "0"
+      },
+      "restart": true,
+      "soak": {
+        "rounds": 4,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "pending",
+      "why": "mlx#3142 fence-stall insurance config: measure its speed cost on our workload. If ~free and stable, it removes the wontfix stall class entirely."
+    },
+    {
+      "name": "back-to-back rounds (gap=0) on pristine + restart",
+      "env": {},
+      "restart": true,
+      "soak": {
+        "rounds": 4,
+        "gap": 0,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "pending",
+      "why": "Idle-gap hypothesis, soft edition: sustained collectives with no idle windows between rounds."
+    },
+    {
+      "name": "ring backend speed anchor + restart",
+      "env": {
+        "M3_MLX_BACKEND": "ring"
+      },
+      "restart": true,
+      "soak": {
+        "rounds": 3,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "pending",
+      "why": "TCP-over-TB control: decode + prefill comparison against jaccl on the same night, same machines, same warm state."
+    },
+    {
+      "name": "FINAL: pristine restore + validation",
+      "env": {},
+      "restart": true,
+      "soak": {
+        "rounds": 2,
+        "gap": 30,
+        "max_tokens": 10000
+      },
+      "iogpu0": 0,
+      "iogpu1": 0,
+      "poller": "off",
+      "status": "pending",
+      "why": "Leave the cluster in the exact production config, freshly validated, prefill-probed. Morning arrives to a green endpoint."
+    }
+  ]
+}

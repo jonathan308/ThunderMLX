@@ -1,0 +1,186 @@
+#!/usr/bin/env python3
+"""OpenAI-compatible tool-call smoke test for MiniMax-M3.
+
+This verifies actual tool invocation, not just prompts that carry tool schemas:
+non-stream and stream requests must both return OpenAI `tool_calls` with
+`finish_reason=tool_calls`, and streaming output must not leak raw MiniMax XML
+tool markers to clients.
+"""
+import argparse
+import json
+import time
+import urllib.request
+
+
+BASE = "http://127.0.0.1:8080"
+
+
+def request_json(method, path, payload=None, timeout=60):
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        BASE + path,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method=method,
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def health(timeout=5):
+    return request_json("GET", "/health", timeout=timeout)
+
+
+def wait_idle(before_completed, timeout=90):
+    deadline = time.time() + timeout
+    last = None
+    while time.time() < deadline:
+        last = health()
+        if (
+            not last.get("active_request")
+            and int(last.get("requests_completed") or 0) > before_completed
+        ):
+            return last
+        time.sleep(0.2)
+    return last or health()
+
+
+def tool_schema():
+    return [{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }]
+
+
+def messages():
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are a tool-calling assistant. When asked for weather, "
+                "call get_weather. Do not answer from memory."
+            ),
+        },
+        {"role": "user", "content": "Use the tool to get the weather in Paris."},
+    ]
+
+
+def payload(model, stream, max_tokens):
+    return {
+        "model": model,
+        "messages": messages(),
+        "tools": tool_schema(),
+        "tool_choice": "auto",
+        "temperature": 0,
+        "max_tokens": max_tokens,
+        "stream": bool(stream),
+    }
+
+
+def run_nonstream(model, max_tokens, timeout):
+    before = int(health().get("requests_completed") or 0)
+    started = time.time()
+    out = request_json(
+        "POST",
+        "/v1/chat/completions",
+        payload(model, False, max_tokens),
+        timeout=timeout,
+    )
+    final = wait_idle(before)
+    choice = (out.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    calls = message.get("tool_calls") or []
+    last = final.get("last_request") or {}
+    row = {
+        "stream": False,
+        "elapsed_s": round(time.time() - started, 3),
+        "finish": choice.get("finish_reason"),
+        "tool_calls": calls,
+        "content": message.get("content"),
+        "failed": final.get("requests_failed"),
+        "decode_tps": last.get("decode_tps"),
+        "ttft": last.get("first_token_s"),
+    }
+    print(json.dumps(row, sort_keys=True), flush=True)
+    if not calls or choice.get("finish_reason") != "tool_calls":
+        raise SystemExit("non-stream tool call missing")
+    return row
+
+
+def run_stream(model, max_tokens, timeout):
+    before = int(health().get("requests_completed") or 0)
+    req = urllib.request.Request(
+        BASE + "/v1/chat/completions",
+        data=json.dumps(payload(model, True, max_tokens)).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.time()
+    calls = []
+    finish = None
+    raw_chunks = []
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or not line.startswith("data: "):
+                continue
+            item = line[6:]
+            if item == "[DONE]":
+                break
+            raw_chunks.append(item)
+            evt = json.loads(item)
+            for choice in evt.get("choices", []):
+                finish = choice.get("finish_reason") or finish
+                delta = choice.get("delta") or {}
+                calls.extend(delta.get("tool_calls") or [])
+    final = wait_idle(before)
+    last = final.get("last_request") or {}
+    leaked = any(
+        marker in chunk
+        for chunk in raw_chunks
+        for marker in ("<tool_call", "<invoke", "]<]minimax")
+    )
+    row = {
+        "stream": True,
+        "elapsed_s": round(time.time() - started, 3),
+        "finish": finish,
+        "tool_calls": calls,
+        "raw_chunks": len(raw_chunks),
+        "raw_marker_leak": leaked,
+        "failed": final.get("requests_failed"),
+        "decode_tps": last.get("decode_tps"),
+        "ttft": last.get("first_token_s"),
+    }
+    print(json.dumps(row, sort_keys=True), flush=True)
+    if not calls or finish != "tool_calls" or leaked:
+        raise SystemExit("stream tool call missing or raw marker leaked")
+    return row
+
+
+def main():
+    global BASE
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base", default=BASE)
+    parser.add_argument("--model", default="Minimax-M3-No-Think")
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--timeout", type=int, default=180)
+    args = parser.parse_args()
+    BASE = args.base.rstrip("/")
+    h = health()
+    if h.get("status") != "healthy":
+        raise SystemExit(f"endpoint unhealthy: {h}")
+    run_nonstream(args.model, args.max_tokens, args.timeout)
+    run_stream(args.model, args.max_tokens, args.timeout)
+    print("PASS", flush=True)
+
+
+if __name__ == "__main__":
+    main()

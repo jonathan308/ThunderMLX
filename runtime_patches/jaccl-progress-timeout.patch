@@ -1,0 +1,372 @@
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+index 6ea1da5..92fde79 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh.cpp
+@@ -46,12 +46,20 @@ void MeshGroup::initialize() {
+       continue;
+     }
+     conn.allocate_protection_domain();
+-    conn.create_completion_queue(MAX_SEND_WR + MAX_RECV_WR);
++    // Overprovision the CQ: sizing it to exactly max outstanding WRs leaves
++    // zero headroom, and providers may drop completions on a full CQ without
++    // reporting an error. A silently lost completion turns the polling
++    // collectives into infinite spins (or, with the progress guard, aborts).
++    conn.create_completion_queue((MAX_SEND_WR + MAX_RECV_WR) * 4);
+     conn.create_queue_pair();
+   }
+ 
+   allocate_buffers();
+ 
++  // Allow the progress-timeout path to cancel outstanding RDMA work before
++  // the process exits; see emergency_teardown() in rdma.cpp.
++  register_emergency_teardown(connections_.data(), connections_.size());
++
+   // First init all connections
+   for (int peer = 0; peer < size_; peer++) {
+     if (peer == rank_) {
+diff --git a/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h b/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
+index 0201f7f..8cc5c30 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
++++ b/mlx/distributed/jaccl/lib/jaccl/mesh_impl.h
+@@ -2,8 +2,15 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
+ #include <memory>
++#include <mutex>
+ #include <span>
++#include <sstream>
++#include <stdexcept>
++#include <string_view>
+ 
+ #include "jaccl/rdma.h"
+ 
+@@ -13,6 +20,95 @@ constexpr int64_t MAX_BUFFER_SIZE = FRAME_SIZE * (1 << (BUFFER_SIZES - 1));
+ 
+ namespace jaccl {
+ 
++// The RDMA driver can lose a completion under sustained load. Every polling
++// loop below used to spin forever in that case, pinning the CPU and keeping
++// Metal/RDMA memory wired until the host was rebooted. Fail the collective
++// with an exception instead once no completion has arrived for a while; the
++// caller can tear down cleanly and a supervisor can restart the job.
++// JACCL_PROGRESS_TIMEOUT_MS tunes the window (default 30000; <=0 restores the
++// legacy spin-forever behavior).
++inline int64_t progress_timeout_ms() {
++  static const int64_t timeout = []() -> int64_t {
++    const char* v = std::getenv("JACCL_PROGRESS_TIMEOUT_MS");
++    return v ? std::atoll(v) : 30000;
++  }();
++  return timeout;
++}
++
++// Collectives may be dispatched from different CPU streams (MLX maps the
++// communication stream to the caller's stream), so two threads can post to
++// and poll the SAME queue pair / completion queue concurrently. ibverbs
++// objects are not thread-safe on typical providers; a concurrent
++// ibv_poll_cq race silently loses completions, which the polling loops then
++// wait on forever. Serialize every collective on the mesh.
++inline std::mutex& collective_mutex() {
++  static std::mutex m;
++  return m;
++}
++
++// The polling loops historically ignored ibv_wc.status entirely, so error
++// completions (flushes, retry-exceeded) were processed as if successful.
++// Surface the first few so failures are diagnosable.
++inline void report_error_completions(const char* where, const ibv_wc* wc, int n) {
++  static int reported = 0;
++  for (int i = 0; i < n; i++) {
++    if (wc[i].status != IBV_WC_SUCCESS && reported < 16) {
++      std::fprintf(
++          stderr,
++          "[jaccl] %s: work completion error status=%d wr_id=0x%llx\n",
++          where,
++          static_cast<int>(wc[i].status),
++          static_cast<unsigned long long>(wc[i].wr_id));
++      std::fflush(stderr);
++      reported++;
++    }
++  }
++}
++
++class ProgressGuard {
++ public:
++  explicit ProgressGuard(const char* where)
++      : where_(where), last_(std::chrono::steady_clock::now()) {}
++
++  void progressed() {
++    last_ = std::chrono::steady_clock::now();
++  }
++
++  void check() const {
++    const int64_t timeout = progress_timeout_ms();
++    if (timeout <= 0) {
++      return;
++    }
++    auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
++                      std::chrono::steady_clock::now() - last_)
++                      .count();
++    if (waited > timeout) {
++      std::ostringstream msg;
++      msg << "[jaccl] " << where_ << " made no progress for " << waited
++          << "ms; an RDMA completion was likely lost. Failing the collective "
++             "instead of spinning forever.";
++      // Collectives may run on threads with no exception boundary, where a
++      // throw becomes std::terminate with RDMA work still outstanding —
++      // which can leave DMA-pinned pages wired until reboot. When
++      // JACCL_TIMEOUT_ACTION=teardown-exit, cancel the RDMA state first and
++      // exit with a distinct status a supervisor can treat as restartable.
++      const char* action = std::getenv("JACCL_TIMEOUT_ACTION");
++      if (action != nullptr &&
++          std::string_view(action) == "teardown-exit") {
++        std::fprintf(stderr, "%s\n", msg.str().c_str());
++        std::fflush(stderr);
++        emergency_teardown();
++        std::_Exit(75); // EX_TEMPFAIL: restartable failure
++      }
++      throw std::runtime_error(msg.str());
++    }
++  }
++
++ private:
++  const char* where_;
++  std::chrono::steady_clock::time_point last_;
++};
++
+ class MeshImpl {
+  public:
+   MeshImpl(
+@@ -31,6 +127,7 @@ class MeshImpl {
+ 
+   template <typename T, typename ReduceOp>
+   void all_reduce(const T* in, T* out, int64_t size, ReduceOp reduce_op) {
++    std::lock_guard<std::mutex> collective_lock(collective_mutex());
+     // Fully connected all reduce with deterministic reduction order.
+     //
+     // We copy rank 0's data to the output buffer and then we reduce every
+@@ -84,6 +181,7 @@ class MeshImpl {
+     }
+ 
+     // Main loop
++    ProgressGuard guard("all_reduce");
+     while (reduce_chunk < total_chunks) {
+       // Poll the hardware for completions.
+       //
+@@ -97,6 +195,12 @@ class MeshImpl {
+       // receives.
+       ibv_wc wc[WC_NUM];
+       int n = poll(connections_, WC_NUM, wc);
++      report_error_completions("mesh", wc, n);
++      if (n > 0) {
++        guard.progressed();
++      } else {
++        guard.check();
++      }
+       for (int i = 0; i < n; i++) {
+         int work_type = wc[i].wr_id >> 16;
+         int buff = (wc[i].wr_id >> 8) & 0xff;
+@@ -185,14 +289,22 @@ class MeshImpl {
+     }
+ 
+     // Drain remaining in-flight completions (outstanding sends).
++    ProgressGuard drain_guard("all_reduce drain");
+     while (in_flight > 0) {
+       ibv_wc wc[WC_NUM];
+       int n = poll(connections_, WC_NUM, wc);
++      report_error_completions("mesh drain", wc, n);
++      if (n > 0) {
++        drain_guard.progressed();
++      } else {
++        drain_guard.check();
++      }
+       in_flight -= n;
+     }
+   }
+ 
+   void all_gather(const char* in_ptr, char* out_ptr, int64_t n_bytes) {
++    std::lock_guard<std::mutex> collective_lock(collective_mutex());
+     // Copy our data to the appropriate place
+     std::memcpy(out_ptr + rank_ * n_bytes, in_ptr, n_bytes);
+ 
+@@ -229,9 +341,16 @@ class MeshImpl {
+     // Main loop
+     //
+     // Keep going until we have no longer data in flight.
++    ProgressGuard guard("all_gather");
+     while (in_flight > 0) {
+       ibv_wc wc[WC_NUM];
+       int n = poll(connections_, WC_NUM, wc);
++      report_error_completions("mesh", wc, n);
++      if (n > 0) {
++        guard.progressed();
++      } else {
++        guard.check();
++      }
+       for (int i = 0; i < n; i++) {
+         int work_type = wc[i].wr_id >> 16;
+         int buff = (wc[i].wr_id >> 8) & 0xff;
+@@ -273,6 +392,7 @@ class MeshImpl {
+   }
+ 
+   void send(const char* in_ptr, int64_t n_bytes, int dst) {
++    std::lock_guard<std::mutex> collective_lock(collective_mutex());
+     constexpr int PIPELINE = 2;
+     constexpr int WC_NUM = PIPELINE;
+     auto [sz, N] = buffer_size_from_message(n_bytes);
+@@ -295,6 +415,7 @@ class MeshImpl {
+     }
+ 
+     // Main loop
++    ProgressGuard guard("send");
+     while (in_flight > 0) {
+       // Poll the hardware for completions.
+       //
+@@ -302,6 +423,12 @@ class MeshImpl {
+       // and send them.
+       ibv_wc wc[WC_NUM];
+       int n = connections_[dst].poll(WC_NUM, wc);
++      report_error_completions("mesh", wc, n);
++      if (n > 0) {
++        guard.progressed();
++      } else {
++        guard.check();
++      }
+       for (int i = 0; i < n; i++) {
+         int buff = (wc[i].wr_id >> 8) & 0xff;
+         int rank = wc[i].wr_id & 0xff;
+@@ -323,6 +450,7 @@ class MeshImpl {
+   }
+ 
+   void recv(char* out_ptr, int64_t n_bytes, int src) {
++    std::lock_guard<std::mutex> collective_lock(collective_mutex());
+     constexpr int PIPELINE = 2;
+     constexpr int WC_NUM = PIPELINE;
+     auto [sz, N] = buffer_size_from_message(n_bytes);
+@@ -340,6 +468,7 @@ class MeshImpl {
+     }
+ 
+     // Main loop
++    ProgressGuard guard("recv");
+     while (in_flight > 0) {
+       // Poll the hardware for completions.
+       //
+@@ -347,6 +476,12 @@ class MeshImpl {
+       // data to fetch post another recv.
+       ibv_wc wc[WC_NUM];
+       int n = connections_[src].poll(WC_NUM, wc);
++      report_error_completions("mesh", wc, n);
++      if (n > 0) {
++        guard.progressed();
++      } else {
++        guard.check();
++      }
+       for (int i = 0; i < n; i++) {
+         int buff = (wc[i].wr_id >> 8) & 0xff;
+         int rank = wc[i].wr_id & 0xff;
+diff --git a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+index 7dc2304..a6eb986 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.cpp
+@@ -138,6 +138,37 @@ Connection::~Connection() {
+   }
+ }
+ 
++namespace {
++Connection* emergency_connections = nullptr;
++size_t emergency_connection_count = 0;
++} // namespace
++
++void register_emergency_teardown(Connection* connections, size_t count) {
++  emergency_connections = connections;
++  emergency_connection_count = count;
++}
++
++void emergency_teardown() {
++  Connection* conns = emergency_connections;
++  size_t count = emergency_connection_count;
++  emergency_connections = nullptr;
++  emergency_connection_count = 0;
++  for (size_t i = 0; i < count; i++) {
++    Connection& c = conns[i];
++    if (c.ctx == nullptr) {
++      continue;
++    }
++    if (c.queue_pair != nullptr) {
++      ibv().destroy_qp(c.queue_pair);
++      c.queue_pair = nullptr;
++    }
++    if (c.completion_queue != nullptr) {
++      ibv().destroy_cq(c.completion_queue);
++      c.completion_queue = nullptr;
++    }
++  }
++}
++
+ void Connection::allocate_protection_domain() {
+   protection_domain = ibv().alloc_pd(ctx);
+   if (protection_domain == nullptr) {
+@@ -226,6 +257,11 @@ void Connection::queue_pair_rtr(const Destination& dst) {
+   attr.path_mtu = IBV_MTU_1024;
+   attr.rq_psn = dst.packet_sequence_number;
+   attr.dest_qp_num = dst.queue_pair_number;
++  // The receiver reposts its buffers from inside the polling loop, so a
++  // sender can legitimately race ahead of the posted receives. Without an
++  // RNR timer the very first receiver-not-ready NAK kills the connection.
++  attr.min_rnr_timer = 12; // ~0.64ms between RNR retries
++  attr.max_dest_rd_atomic = 1;
+   attr.ah_attr.dlid = dst.local_id;
+   attr.ah_attr.sl = 0;
+   attr.ah_attr.src_path_bits = 0;
+@@ -240,7 +276,7 @@ void Connection::queue_pair_rtr(const Destination& dst) {
+   }
+ 
+   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+-      IBV_QP_RQ_PSN;
++      IBV_QP_RQ_PSN | IBV_QP_MIN_RNR_TIMER | IBV_QP_MAX_DEST_RD_ATOMIC;
+ 
+   if (int status = ibv().modify_qp(queue_pair, &attr, mask); status != 0) {
+     std::ostringstream msg;
+@@ -253,8 +289,18 @@ void Connection::queue_pair_rts() {
+   ibv_qp_attr attr = {};
+   attr.qp_state = IBV_QPS_RTS;
+   attr.sq_psn = src.packet_sequence_number;
+-
+-  int mask = IBV_QP_STATE | IBV_QP_SQ_PSN;
++  // A memset-zero attr leaves the QP with zero transport retries: a single
++  // delayed ACK or receiver-not-ready NAK transitions the QP to ERROR and
++  // every collective after that spins on completions that never come.
++  // Standard RC settings: ~67ms ACK timeout, 7 transport retries, infinite
++  // RNR retries (7) for the producer-consumer receive pattern used here.
++  attr.timeout = 14;
++  attr.retry_cnt = 7;
++  attr.rnr_retry = 7;
++  attr.max_rd_atomic = 1;
++
++  int mask = IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
++      IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC;
+ 
+   if (int status = ibv().modify_qp(queue_pair, &attr, mask); status != 0) {
+     std::ostringstream msg;
+diff --git a/mlx/distributed/jaccl/lib/jaccl/rdma.h b/mlx/distributed/jaccl/lib/jaccl/rdma.h
+index b28c4ee..6fed673 100644
+--- a/mlx/distributed/jaccl/lib/jaccl/rdma.h
++++ b/mlx/distributed/jaccl/lib/jaccl/rdma.h
+@@ -220,6 +220,14 @@ struct Connection {
+ std::vector<Connection> create_connections(
+     const std::vector<std::string>& device_names);
+ 
++// Emergency teardown: when a collective times out (see ProgressGuard) the
++// process is about to exit with RDMA operations still outstanding. Killing
++// the process in that state can leave DMA-pinned pages wired in the kernel
++// driver until reboot. Destroying the queue pairs and completion queues
++// first gives the driver its normal cancellation path.
++void register_emergency_teardown(Connection* connections, size_t count);
++void emergency_teardown();
++
+ inline int poll(
+     std::span<const Connection> connections,
+     int num_completions,
