@@ -16,4 +16,6 @@ ops/apply_staged_gateway.sh export-ignore
 ops/restart_vlm064.sh export-ignore
 ops/live_wedge_capture.sh export-ignore
 ops/publish_public.sh export-ignore
-run_with_watchdog.py export-ignore
+# run_with_watchdog.py is exported WITH a sanitized shebang (publish_public.sh
+# rewrites line 1) — the public boot path needs the file, but the local shebang
+# is this machine's absolute venv python.
