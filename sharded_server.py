@@ -7364,9 +7364,16 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
         ):
             return True
         return False
-    safe_text = _strip_raw_tool_blocks(
-        remaining_text or full_output or "", tool_module
-    )
+    raw_source = remaining_text or full_output or ""
+    safe_text = _strip_raw_tool_blocks(raw_source, tool_module)
+    if (safe_text or "").strip() != raw_source.strip():
+        # Tool markup was present but produced ZERO parseable calls: the
+        # model narrated an intent ("let me check the schedule...") and
+        # botched the call. The narration used to count as usable content,
+        # so the turn shipped as innocent text and agent loops silently
+        # stalled (2026-07-09 hermes World Cup drop). Intent + failed call
+        # is NOT usable — force the retry ladder.
+        return False
     _, content = split_thinking_text(
         safe_text,
         assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
@@ -7450,6 +7457,18 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         label, req_id, TOOL_UNUSABLE_RETRY_ATTEMPTS,
         snippet[:200], snippet[-160:],
     )
+    # Forensics: every exhausted ladder means a markup flavor all parse
+    # rungs miss. Persist the raw output so the next flavor is diagnosed
+    # from evidence (the 2026-07-09 pandoc turn burned 3x8k tokens and left
+    # only a 200-char head in the log).
+    try:
+        _fail_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "ops", "logs", "tool_parse_failures")
+        os.makedirs(_fail_dir, exist_ok=True)
+        with open(os.path.join(_fail_dir, f"{req_id}.txt"), "w") as _fh:
+            _fh.write(full_output or "")
+    except Exception:
+        pass
     return full_output
 
 
@@ -8364,6 +8383,12 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
             if allowed and name not in allowed:
                 continue
             raw_body = match.group("body") or ""
+            # Landmine guard (2026-07-09): 'body' is only assigned in the
+            # repair branch below; the empty-args salvage at the bottom of
+            # the loop referenced it after fast-path parses too. On rank0
+            # the UnboundLocalError was caught and stripped; on rank1 it
+            # killed the mirror -> cache divergence -> pipeline wedge.
+            body = None
             # Payload-safe fast path: when the body carries one balanced JSON
             # object, take it verbatim. The repair chain below rewrites tags
             # (_normalize_body) and slices on tag-like boundaries
@@ -8378,7 +8403,17 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                     try:
                         _obj = json.loads(raw_body[_js:_je])
                     except json.JSONDecodeError:
-                        _obj = None
+                        try:
+                            # Big multiline payloads (markdown/code inside a
+                            # JSON string) often carry RAW newlines/tabs —
+                            # illegal in strict JSON but unambiguous. The
+                            # 2026-07-09 zcode pandoc turn failed all rungs
+                            # 3x on exactly this; strict=False accepts the
+                            # control chars and json.dumps re-escapes on the
+                            # way out.
+                            _obj = json.loads(raw_body[_js:_je], strict=False)
+                        except json.JSONDecodeError:
+                            _obj = None
                     if isinstance(_obj, dict) and _obj:
                         _obj = _canonicalize_tool_argument_keys(_obj, tools, name)
                         if _obj or not _tool_schema_expects_arguments(tools, name):
@@ -8442,10 +8477,22 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                     try:
                         arg_obj = json.loads(args)
                     except json.JSONDecodeError:
-                        arg_obj = None
+                        try:
+                            arg_obj = json.loads(args, strict=False)
+                            # Re-serialize so downstream consumers get
+                            # properly escaped strict JSON.
+                            args = json.dumps(arg_obj, ensure_ascii=False)
+                        except json.JSONDecodeError:
+                            arg_obj = None
                 elif isinstance(args, dict):
                     arg_obj = args
                 if isinstance(arg_obj, dict) and not arg_obj and _tool_schema_expects_arguments(tools, item_name):
+                    if body is None:
+                        # Fast-path parse with empty args: the old code raised
+                        # UnboundLocalError here and the outer except dropped
+                        # the parse; drop just this call instead so rank1
+                        # survives. The usable-turn ladder regenerates it.
+                        continue
                     loose_args = _arguments_from_loose_segments(body, ns_token, tools, item_name)
                     if loose_args is None:
                         continue
