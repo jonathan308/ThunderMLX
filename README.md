@@ -45,9 +45,10 @@ M5 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
 | --- | --- |
 | Long-context prefill (MSA overlay) | **384 tok/s @ 21k · 378 @ 36k · 366 @ 57k** (2026-07-09) |
 | Cold serial prefill (short prompts) | 285–317 tok/s (4k–14k prompts) |
-| Short-turn decode | **~32 tok/s** (thinking and no-think) |
-| Sustained long generation | 23.4 tok/s over an 11,000-token completion |
-| Decode at 35k-token context | ~17 tok/s (context scaling; speculative decode in progress) |
+| Short-turn decode | **~30-32 tok/s** (thinking and no-think) |
+| Sustained long generation | **24.5 tok/s** over a 10,000-token completion |
+| Decode at 19k / 35k context (fused sparse decode) | **24.9 / 23.1 tok/s** — near-flat with context (was 20 / 17 dense) |
+| Live agent turns, 6-7k-token tool writes | 26-27 tok/s sustained |
 | Warm-turn TTFT | **0.65–1.2 s** |
 | Hot-cache agent turns | 1,000–36,000 tok/s effective prefill |
 | Cancelled-stream retry (agent timeout) | full cache kept → **0.87 s** TTFT on retry |

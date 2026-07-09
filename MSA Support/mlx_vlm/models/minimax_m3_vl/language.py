@@ -31,6 +31,10 @@ from .msa import (
     build_grouped_msa_topk,
     build_grouped_msa_topk_blockwise,
     msa_sparse_attention_b1,
+    msa_decode_select_topk,
+    msa_sparse_decode_b1,
+    msa_sparse_decode_b1_mma,
+    msa_sparse_decode_b1_mma_eligible,
 )
 
 _MSA_PREFILL_ENABLED = _msa_os.environ.get(
@@ -48,6 +52,34 @@ _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = int(
 _MSA_K1_IMPL = _msa_os.environ.get(
     "MLX_M3_MSA_K1_IMPL", "auto"
 ).strip().lower()
+# Sparse-decode crossover: take the compact top-k decode path when
+# key_length >= selected_length * FACTOR. Upstream hardcoded 64 (no mask) /
+# 16 (masked) — i.e. sparse decode only above 131k context — measured on
+# different hardware; env-tunable here.
+_SPARSE_DECODE_MIN_FACTOR = int(
+    _msa_os.environ.get("MLX_M3_SPARSE_DECODE_MIN_FACTOR", "64") or "64"
+)
+_SPARSE_DECODE_MIN_FACTOR_MASKED = int(
+    _msa_os.environ.get("MLX_M3_SPARSE_DECODE_MIN_FACTOR_MASKED", "16") or "16"
+)
+# Fused sparse decode (ThunderMLX): run Fable's single-kernel
+# select+gather+attend (msa_sparse_decode_b1_mma) for L=1 decode instead of
+# dense SDPA / the gather-compact path. The materialized-gather path
+# measured SLOWER than dense on M-series (17.3 vs 19.9 @19k); the fused
+# kernel is what powered the old overlay's 25-26 t/s @30k. Index selection
+# and cache flow stay 100% native — only the final attention math swaps.
+_FUSED_SPARSE_DECODE = _msa_os.environ.get(
+    "MLX_M3_FUSED_SPARSE_DECODE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_FUSED_SPARSE_DECODE_MIN_KV = int(
+    _msa_os.environ.get("MLX_M3_FUSED_SPARSE_DECODE_MIN_KV", "6144") or "6144"
+)
+# Decode top-k selection reuse: keep the same selected blocks for N tokens
+# (0 = select every token). 48 ran in production on the pre-0.6.4 overlay.
+_DECODE_TOPK_REUSE_TOKENS = max(
+    0,
+    int(_msa_os.environ.get("MLX_M3_DECODE_TOPK_REUSE_TOKENS", "0") or "0"),
+)
 # -----------------------------------------------------------------------------
 
 
@@ -1493,6 +1525,59 @@ class MiniMaxAttention(nn.Module):
         mask: Optional[mx.array],
         q_positions: mx.array,
     ):
+        key_length = keys.shape[2]
+        has_explicit_mask = mask is not None and not isinstance(mask, str)
+
+        # ThunderMLX fused sparse decode: one Metal kernel does gather +
+        # attend over the chosen blocks — no materialized gather (which
+        # measured SLOWER than dense on M-series) and no full-context read
+        # (dense's cost). This is the math that powered the pre-0.6.4
+        # overlay's 25-26 t/s @30k. It accepts PER-INDEX-HEAD selections
+        # (B, index_heads, 1, K) from the fused select kernel as well as
+        # native's head-reduced (B, 1, L, K) — so it must run BEFORE the
+        # head-reduced-only guard below.
+        if (
+            _FUSED_SPARSE_DECODE
+            and not has_explicit_mask
+            and queries.shape[0] == 1
+            and queries.shape[2] == 1
+            and block_indices.ndim == 4
+            and block_indices.shape[1] in (1, keys.shape[1])
+            and block_indices.shape[-1] * self.sparse_block_size < key_length
+            and key_length >= _FUSED_SPARSE_DECODE_MIN_KV
+            and msa_sparse_decode_b1_mma_eligible(
+                queries.shape[1], keys.shape[1], queries.shape[3],
+                self.sparse_block_size,
+            )
+        ):
+            try:
+                topk_idx = block_indices.astype(mx.int32)
+                topk_valid = topk_idx >= 0
+                out = msa_sparse_decode_b1_mma(
+                    queries,
+                    keys,
+                    values,
+                    mx.maximum(topk_idx, 0),
+                    topk_valid,
+                    q_pos=int(key_length - 1),
+                    scale=self.scale,
+                    block_size=self.sparse_block_size,
+                )
+                if out is not None:
+                    _msa_stat("fused_decode_calls")
+                    return out
+            except Exception as e:
+                _msa_stat("fused_decode_error")
+                _msa_stat_value(
+                    "last_fused_decode_error", f"{type(e).__name__}: {e}"[:160]
+                )
+
+        # Native paths below require head-reduced indices; degrade a
+        # per-head selection to its first head rather than crash (only
+        # reachable if the fused kernel above missed at runtime).
+        if block_indices.ndim == 4 and block_indices.shape[1] != 1:
+            block_indices = block_indices[:, :1]
+
         if (
             queries.shape[2] != 1
             or block_indices.shape[1] != 1
@@ -1502,11 +1587,17 @@ class MiniMaxAttention(nn.Module):
             return None
 
         B, _, _, _ = queries.shape
-        key_length = keys.shape[2]
         selected_length = block_indices.shape[-1] * self.sparse_block_size
-        has_explicit_mask = mask is not None and not isinstance(mask, str)
-        # Dense SDPA is still faster before these measured crossover points.
-        min_sparse_length = selected_length * (16 if has_explicit_mask else 64)
+
+        # Dense SDPA is still faster before these crossover points — but the
+        # upstream defaults (64x selected = 131k tokens of context!) were
+        # measured against the materialized-gather path below. Env-tunable
+        # (MLX_M3_SPARSE_DECODE_MIN_FACTOR[_MASKED]).
+        min_sparse_length = selected_length * (
+            _SPARSE_DECODE_MIN_FACTOR_MASKED
+            if has_explicit_mask
+            else _SPARSE_DECODE_MIN_FACTOR
+        )
         if selected_length >= key_length or key_length < min_sparse_length:
             return None
 
@@ -1736,10 +1827,95 @@ class MiniMaxM3Indexer:
         if cache is not None and hasattr(cache, "update_index_and_fetch"):
             idx_keys = cache.update_index_and_fetch(idx_keys)
 
+        explicit_positions = q_positions is not None
         q_positions = attention._sparse_query_positions(B, L, q_start, q_positions)
         total_len = idx_keys.shape[2]
         if total_len <= self.block_size * self.topk_blocks:
             return None, total_len, q_positions
+
+        # ThunderMLX fused decode selection + top-k reuse: per-token block
+        # selection scores the ENTIRE index history (O(ctx) per token per
+        # layer) and was the remaining context-scaling decode cost after the
+        # fused-attention port (fused attn alone: 16.85 @35k ~= dense). The
+        # old overlay shipped both a fused select kernel AND reuse of the
+        # selection for MLX_M3_DECODE_TOPK_REUSE_TOKENS tokens (48 in
+        # production for days) — selection cost /48.
+        if (
+            _FUSED_SPARSE_DECODE
+            and B == 1
+            and L == 1
+            and not explicit_positions
+            and (mask is None or isinstance(mask, str))
+            and self.score_type == "max"
+            # Per-head selections are ONLY consumable by the fused decode
+            # attention — emit them solely when that path is guaranteed to
+            # take them (same conditions it checks), so head-reduced-only
+            # native consumers (build_block_mask) never see 4-head indices.
+            and total_len >= _FUSED_SPARSE_DECODE_MIN_KV
+            and msa_sparse_decode_b1_mma_eligible(
+                attention.num_attention_heads,
+                attention.num_key_value_heads,
+                attention.head_dim,
+                self.block_size,
+            )
+        ):
+            num_blocks = (total_len + self.block_size - 1) // self.block_size
+            cur_block = int(q_start) // self.block_size
+            reuse_n = _DECODE_TOPK_REUSE_TOKENS
+            if reuse_n > 0:
+                cached = getattr(attention, "_m3_decode_topk_cache", None)
+                if (
+                    cached is not None
+                    and cached.get("remaining", 0) > 0
+                    and cached.get("total_len", -2) + 1 == total_len
+                    and cached.get("num_blocks") == num_blocks
+                    and cached.get("cur_block") == cur_block
+                    and cached.get("topk") == self.topk_blocks
+                ):
+                    cached["remaining"] -= 1
+                    cached["total_len"] = total_len
+                    _msa_stat("decode_topk_reuse_hits")
+                    return cached["block_indices"], total_len, q_positions
+                _msa_stat("decode_topk_reuse_misses")
+            if num_blocks >= self.topk_blocks:
+                try:
+                    fused_idx = msa_decode_select_topk(
+                        idx_queries,
+                        idx_keys,
+                        q_pos=int(q_start),
+                        block_size=self.block_size,
+                        topk=self.topk_blocks,
+                        init_blocks=self.init_blocks,
+                        local_blocks=self.local_blocks,
+                    )
+                except Exception as e:
+                    fused_idx = None
+                    _msa_stat_value(
+                        "last_select_kernel_error",
+                        f"{type(e).__name__}: {e}"[:160],
+                    )
+                if fused_idx is not None:
+                    _msa_stat("decode_select_kernel_calls")
+                    while fused_idx.ndim < 4:
+                        fused_idx = (
+                            fused_idx[:, :, None]
+                            if fused_idx.ndim == 3
+                            else fused_idx[None]
+                        )
+                    if reuse_n > 0:
+                        object.__setattr__(
+                            attention,
+                            "_m3_decode_topk_cache",
+                            {
+                                "block_indices": fused_idx,
+                                "total_len": total_len,
+                                "num_blocks": num_blocks,
+                                "cur_block": cur_block,
+                                "topk": self.topk_blocks,
+                                "remaining": reuse_n - 1,
+                            },
+                        )
+                    return fused_idx, total_len, q_positions
 
         block_indices = self.select_blocks(
             idx_queries,
