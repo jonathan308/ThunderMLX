@@ -761,6 +761,14 @@ PROMPT_CACHE_MAX_TOKENS = int(os.environ.get("MLX_M3_PROMPT_CACHE_MAX_TOKENS", "
 PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS = int(
     os.environ.get("MLX_M3_PROMPT_CACHE_GENERATED_REUSE_MAX_TOKENS", "4096") or "4096"
 )
+# 2026-07-09: keep the INPUT-prefix KV when a stream is cancelled instead of
+# dropping the whole cache. Agent clients (codex goals) retry the same
+# conversation after a client-side timeout; the old reset forced a full
+# re-prefill of the entire context on every retry (145s at 41k = the codex
+# "looping, no output" death spiral).
+PROMPT_CACHE_KEEP_ON_CANCEL = os.environ.get(
+    "MLX_M3_KEEP_CACHE_ON_CANCEL", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 PROMPT_CACHE_PROTECT_LARGE_ENABLED = os.environ.get(
     "MLX_M3_PROMPT_CACHE_PROTECT_LARGE", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -4667,6 +4675,69 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
                 reason=save_reason,
             )
     _enforce_prompt_cache_size_limit()
+
+
+def _keep_prompt_prefix_after_cancel(token_ids, reason="cancelled"):
+    """Trim the cache to the request's INPUT prefix and keep it (2026-07-09).
+
+    Cancelled streams used to _reset_prompt_cache, but agent clients retry
+    the SAME conversation after a client-side timeout, and the reset forced
+    a full re-prefill of the whole context on every retry. The generated
+    tail past the input is exactly what the next turn's prepare would trim
+    anyway; dropping it eagerly is symmetric across ranks WITHOUT any new
+    collective (each rank trims its own physical KV to len(token_ids) —
+    the lockstep drain guarantees both physicals sit at the same length),
+    and _prefix_plan_consensus re-verifies agreement on the next request
+    regardless. Returns True when the prefix was kept; callers fall back
+    to the old full reset on False."""
+    if (
+        not PROMPT_CACHE_KEEP_ON_CANCEL
+        or not PROMPT_CACHE_ENABLED
+        or not token_ids
+    ):
+        return False
+    # A bypassed request never touched the holder cache — trimming it to
+    # THIS request's input would corrupt the preserved session.
+    try:
+        if _prompt_cache_prepare_preserves_existing_cache():
+            return False
+    except Exception:
+        return False
+    n_input = len(token_ids)
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        cache = holder.get("cache")
+        if cache is None:
+            return False
+        try:
+            phys = int(cache[0].offset)
+        except Exception:
+            return False
+        if phys < n_input:
+            return False
+        trim_n = phys - n_input
+        if trim_n > 0 and not _trim_prompt_cache_in_place(cache, trim_n):
+            return False
+        holder["token_ids"] = list(token_ids)
+        holder["prompt"] = None
+        holder["cache_len"] = n_input
+        holder["last_suffix_ids"] = None
+        holder["last_input_tokens"] = n_input
+        holder["last_generated_tokens"] = 0
+        holder["last_exact_generated_ids"] = False
+        _set_prompt_cache_event(
+            "cancel_kept_prefix",
+            phase="update",
+            reason=reason,
+            prompt_tokens=n_input,
+            trimmed_generated_tokens=trim_n,
+            cache_len=n_input,
+        )
+    logger.info(
+        "prompt-cache: kept %d-token input prefix after %s (trimmed %d generated)",
+        n_input, reason, trim_n,
+    )
+    return True
 
 
 def _reset_prompt_cache(reason="reset", *, clear_manifest=False,
@@ -9060,12 +9131,14 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         elif preserve_existing_cache:
             logger.info("prompt-cache: preserved existing cache after bypassed request")
         if stopped:
-            _reset_prompt_cache("reset after stop", clear_resident=False)
+            if not _keep_prompt_prefix_after_cancel(token_ids, "stop"):
+                _reset_prompt_cache("reset after stop", clear_resident=False)
         return text if rank == 0 else None
     except GenerationCancelled as e:
         stopped = True
         logger.info("rank %s: %s; generation cancelled", rank, e)
-        _reset_prompt_cache("reset after stop", clear_resident=False)
+        if not _keep_prompt_prefix_after_cancel(token_ids, "cancel"):
+            _reset_prompt_cache("reset after stop", clear_resident=False)
         return text if rank == 0 else None
     except Exception as e:
         logger.error(f"rank {rank}: generation error at token {n}: {e}")
@@ -9421,7 +9494,8 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 and _thinking_generation_hit_limit(thinking_mode, n, max_tokens)
             )
             if stopped:
-                _reset_prompt_cache("reset after stop", clear_resident=False)
+                if not _keep_prompt_prefix_after_cancel(token_ids, "stream stop"):
+                    _reset_prompt_cache("reset after stop", clear_resident=False)
             elif malformed_thinking:
                 _reset_prompt_cache("reset after no-visible generation stream")
             elif incomplete_thinking:
@@ -9451,7 +9525,8 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     except GenerationCancelled as e:
         stopped = True
         logger.info("rank %s: %s; stream generation cancelled", rank, e)
-        _reset_prompt_cache("reset after stop", clear_resident=False)
+        if not _keep_prompt_prefix_after_cancel(token_ids, "stream cancel"):
+            _reset_prompt_cache("reset after stop", clear_resident=False)
         if rank == 0:
             yield {
                 "_cancelled": True,
@@ -11807,13 +11882,23 @@ def run_http_server(model, processor, rank):
 
                         # Generation complete. Parse tool calls from full output.
                         if generation_cancelled or _user_stop_requested():
-                            _reset_prompt_cache_on_all_ranks(
-                                rank,
-                                "reset after cancelled stream",
-                                clear_memory=False,
-                                clear_manifest=False,
-                                clear_resident=False,
-                            )
+                            # Keep the input-prefix KV so a client retry of the
+                            # same conversation reuses it (rank 1's own cancel
+                            # handler performs the identical local trim — the
+                            # lockstep drain leaves both physicals equal, and
+                            # the prefix-plan consensus verifies next request).
+                            # Only on keep-failure fall back to the old
+                            # broadcast reset.
+                            if not _keep_prompt_prefix_after_cancel(
+                                request_token_ids, "cancelled stream"
+                            ):
+                                _reset_prompt_cache_on_all_ranks(
+                                    rank,
+                                    "reset after cancelled stream",
+                                    clear_memory=False,
+                                    clear_manifest=False,
+                                    clear_resident=False,
+                                )
                             logger.info(
                                 "[rank 0] stream %s cancelled before final "
                                 "tool/content parse; finishing without retry text",
