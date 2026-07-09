@@ -729,6 +729,7 @@ GEN_PARAM_KEYS = (
 )
 _SHUTTING_DOWN = False
 _WATCHDOG_TICK = None
+_WATCHDOG_PREFILL_BUDGET = None  # set by run_with_watchdog; sizes prefill stall window (fix A)
 _METAL_LIMITS = {}
 _DECODE_EVAL_CONTEXT = threading.local()
 
@@ -3622,39 +3623,109 @@ def _metal_warmup_status():
 
 def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
                            cached_suffix_ids):
-    """Rank-coherence gate for the prefill plan (2026-07-07).
+    """Rank-coherence gate for the prefill plan (2026-07-07; hardened 2026-07-08).
 
     Both ranks compute cache reuse independently and are ASSUMED to agree.
     After retries/stops their holder states can drift, and a mismatched plan
     sends different-shaped pipeline messages (rank1 suffix=64 vs rank0 full
     7974 re-prefill) -> IBV_WC_LOC_LEN_ERR (status=1 wr_id=0x20001, five
-    captures) -> frozen step. One all_sum exchanges the planned prefix
-    length; ANY mismatch makes BOTH ranks drop to an identical full prefill
-    (fresh cache) — correctness over the rare re-prefill.
+    captures) -> frozen step. 2026-07-08 (goals-crash 19:16:24 photograph):
+    comparing the PHYSICAL offset alone missed a divergence where both ranks
+    drained to the same lockstep boundary (physicals equal at 18344) while
+    the cache_len counters that drive suffix planning differed (rank0 kept
+    375 generated tokens, rank1's consumer closed at 290) — plans 254 vs 339
+    sailed through and froze the pipeline with zero progress. So exchange
+    the physical offset, the planned counter, AND the suffix size; ANY
+    mismatch (or a local counter/physical split) makes BOTH ranks drop to an
+    identical full prefill (fresh cache) — correctness over the rare
+    re-prefill. The all_sum runs UNCONDITIONALLY on both ranks before any
+    decision: a one-rank early return would leave the peer's collective
+    unpaired, which is the same freeze this gate exists to prevent.
     Runs in the sequential prepare phase: no model collectives in flight.
     """
     try:
-        my_len = int(cached_prompt_cache[0].offset) if cached_prompt_cache else 0
+        my_phys = int(cached_prompt_cache[0].offset) if cached_prompt_cache else 0
     except Exception:
-        my_len = 0
+        my_phys = -1
+    my_counter = 0
+    my_incoherent = 0
+    if cached_prompt_cache is not None:
+        try:
+            with _prompt_cache_lock:
+                my_counter = int(_prompt_cache_holder.get("cache_len") or 0)
+        except Exception:
+            my_counter = -1
+        if my_counter != my_phys:
+            my_incoherent = 1
+    if cached_suffix_ids:
+        my_suffix = len(cached_suffix_ids)
+    else:
+        my_suffix = len(prompt_to_send or "")
     try:
         group = mx.distributed.init()
         if group.size() <= 1:
             return prompt_to_send, cached_prompt_cache, cached_suffix_ids
-        total = mx.distributed.all_sum(mx.array(my_len, dtype=mx.int32))
+        logger.info(
+            "prefix-plan consensus: phys=%d plan_len=%d suffix=%d incoherent=%d",
+            my_phys, my_counter, my_suffix, my_incoherent,
+        )
+        mine = (my_phys, my_counter, my_suffix, my_incoherent)
+        total = mx.distributed.all_sum(mx.array(mine, dtype=mx.int32))
         mx.eval(total)
-        other_len = int(total.item()) - my_len
+        peer = [int(t) - m for t, m in zip(total.tolist(), mine)]
     except Exception as e:
         logger.warning("prefix-plan consensus unavailable (%s); keeping local plan", e)
         return prompt_to_send, cached_prompt_cache, cached_suffix_ids
-    if other_len == my_len:
+    if (
+        peer[0] == my_phys
+        and peer[1] == my_counter
+        and peer[2] == my_suffix
+        and my_incoherent == 0
+        and peer[3] == 0
+    ):
         return prompt_to_send, cached_prompt_cache, cached_suffix_ids
     logger.warning(
-        "rank %s: PREFIX PLAN DIVERGENCE (mine=%d peer=%d) — both ranks "
-        "rebuilding with a full identical prefill", rank, my_len, other_len,
+        "rank %s: PREFIX PLAN DIVERGENCE (phys mine=%d peer=%d | plan_len "
+        "mine=%d peer=%d | suffix mine=%d peer=%d | incoherent mine=%d "
+        "peer=%d) — both ranks rebuilding with a full identical prefill",
+        rank, my_phys, peer[0], my_counter, peer[1], my_suffix, peer[2],
+        my_incoherent, peer[3],
     )
     _reset_prompt_cache("prefix plan divergence", clear_resident=False)
     return prompt, None, None
+
+
+def _prewarm_plan_consensus(my_skip, prompt_to_send, cached_prompt_cache):
+    """Symmetric go/no-go gate for the prewarm's 1-token pipeline generation.
+
+    The prewarm runs full pipeline collectives, so a rank-local skip (or a
+    diverged reuse plan) leaves the peer rank alone in prefill send/recv —
+    the freeze class photographed adjacent to prewarms. One all_sum runs
+    UNCONDITIONALLY on both ranks; returns "ok" | "skip" | "diverged" with
+    the same verdict on every rank: any rank skipping means all skip.
+    """
+    try:
+        my_phys = int(cached_prompt_cache[0].offset) if cached_prompt_cache else 0
+    except Exception:
+        my_phys = -1
+    my_suffix = len(prompt_to_send or "")
+    try:
+        group = mx.distributed.init()
+        if group.size() <= 1:
+            return "skip" if my_skip else "ok"
+        size = group.size()
+        mine = (1 if my_skip else 0, my_phys, my_suffix)
+        total = mx.distributed.all_sum(mx.array(mine, dtype=mx.int32))
+        mx.eval(total)
+        skip_total, phys_total, suffix_total = [int(v) for v in total.tolist()]
+    except Exception as e:
+        logger.warning("prewarm consensus unavailable (%s); skipping prewarm", e)
+        return "skip"
+    if skip_total > 0:
+        return "skip"
+    if phys_total != size * my_phys or suffix_total != size * my_suffix:
+        return "diverged"
+    return "ok"
 
 
 def _prepare_cached_prompt(model, processor, prompt, token_ids,
@@ -4533,7 +4604,31 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
             if isinstance(prompt, str) and len(key_ids) == len(token_ids)
             else None
         )
-        _prompt_cache_holder["cache_len"] = int(len(token_ids) + generated_count)
+        counted_len = int(len(token_ids) + generated_count)
+        cache_len = counted_len
+        cache_obj = _prompt_cache_holder.get("cache")
+        try:
+            physical_len = int(cache_obj[0].offset) if cache_obj else None
+        except Exception:
+            physical_len = None
+        if physical_len is not None and physical_len != counted_len:
+            # 2026-07-08 goals-crash fix: per-rank token accounting under-
+            # counts when a synchronized stop drains past the consumer's exit
+            # (rank1 kept 290 of 375 lockstep-drained tokens), splitting this
+            # counter from the physical KV and making the next turn's suffix
+            # plans diverge across ranks into a pipeline freeze. The KV cache
+            # itself is the ground truth both ranks share through the
+            # lockstep drain, so record ITS length and clamp the reuse key.
+            logger.warning(
+                "prompt-cache: generation accounting (%d) != physical KV "
+                "length (%d); trusting the physical cache",
+                counted_len, physical_len,
+            )
+            cache_len = physical_len
+            if len(key_ids) > cache_len:
+                key_ids = key_ids[:cache_len]
+                _prompt_cache_holder["token_ids"] = key_ids
+        _prompt_cache_holder["cache_len"] = cache_len
         _prompt_cache_holder["last_input_tokens"] = int(len(token_ids))
         _prompt_cache_holder["last_generated_tokens"] = int(generated_count)
         _prompt_cache_holder["last_exact_generated_ids"] = exact_generated_ids
@@ -4635,6 +4730,7 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
     if existing_ids:
         existing_reuse = _common_prefix_len(existing_ids, token_ids)
         existing_suffix = max(0, len(token_ids) - existing_reuse)
+    my_skip_too_large = False
     if (
         VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS > 0
         and len(token_ids) > VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS
@@ -4652,7 +4748,11 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
             max_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS,
             max_suffix_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_SUFFIX_TOKENS,
         )
-        return False
+        # 2026-07-08: do NOT return yet — the too-large decision reads the
+        # rank-LOCAL holder (existing_reuse), so ranks can disagree; a lone
+        # early return here strands the peer in the prewarm's pipeline
+        # collectives. Carry the skip into the consensus below instead.
+        my_skip_too_large = True
 
     from mlx_vlm.generate import stream_generate
 
@@ -4662,22 +4762,36 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
     cache = None
     prompt_to_send = prompt
     try:
-        prompt_to_send, cache = _prepare_cached_prompt(
-            model, processor, prompt, token_ids,
-            session_id=session_id,
-            session_source=session_source,
-        )
-        prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
-        if (
-            cache is None
-            and _prompt_cache_prepare_preserves_existing_cache(
-                prepare_event.get("action")
+        my_skip = my_skip_too_large
+        prepare_event = {}
+        if not my_skip_too_large:
+            prompt_to_send, cache = _prepare_cached_prompt(
+                model, processor, prompt, token_ids,
+                session_id=session_id,
+                session_source=session_source,
             )
-        ):
-            logger.info(
-                "prompt-cache visible prewarm skipped to preserve %s-token cache",
-                prepare_event.get("protected_cache_tokens"),
+            prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
+            my_skip = bool(
+                cache is None
+                and _prompt_cache_prepare_preserves_existing_cache(
+                    prepare_event.get("action")
+                )
             )
+        verdict = _prewarm_plan_consensus(my_skip, prompt_to_send, cache)
+        if verdict == "skip":
+            if not my_skip_too_large:
+                logger.info(
+                    "prompt-cache visible prewarm skipped to preserve %s-token cache",
+                    prepare_event.get("protected_cache_tokens"),
+                )
+            return False
+        if verdict == "diverged":
+            logger.warning(
+                "prompt-cache prewarm plan diverged across ranks; resetting "
+                "cache and skipping prewarm"
+            )
+            if reset_on_failure:
+                _reset_prompt_cache("prewarm plan divergence")
             return False
         _set_prompt_cache_event(
             "prewarm_start",
@@ -5080,6 +5194,18 @@ def _watchdog_tick(progress=True):
     if tick is not None:
         try:
             tick(progress=progress)
+        except Exception:
+            pass
+
+
+def _watchdog_note_prefill(tokens):
+    """Tell the watchdog how many tokens this turn will prefill so it can size
+    the stall window to the work — a large prefill blocks in the jaccl recv for
+    the whole chunk and would otherwise trip the fixed 240s window (fix A)."""
+    hook = _WATCHDOG_PREFILL_BUDGET
+    if hook is not None:
+        try:
+            hook(tokens)
         except Exception:
             pass
 
@@ -8770,6 +8896,10 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
 
         gen_kwargs["prefill_progress_callback"] = _prefill_progress
 
+    # Size the watchdog's prefill stall window to this prompt (fix A): a large
+    # prefill legitimately blocks in the jaccl recv longer than the fixed 240s.
+    _watchdog_note_prefill(len(token_ids))
+
     text = ""
     n = 0
     generated_token_ids = []
@@ -9041,6 +9171,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 _check_prefill_stop(rank, processed_tokens, total_tokens)
 
         gen_kwargs["prefill_progress_callback"] = _prefill_progress
+
+    # Size the watchdog's prefill stall window to this prompt (fix A): a large
+    # prefill legitimately blocks in the jaccl recv longer than the fixed 240s.
+    _watchdog_note_prefill(len(token_ids))
 
     # Routing state (mirrors mlx_vlm/server/openai.py:1493-1497)
     in_thinking = bool(enable_thinking)

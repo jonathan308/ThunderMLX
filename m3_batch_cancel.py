@@ -61,6 +61,19 @@ _OVERLAP_NATIVE_ENABLED = os.environ.get(
     "MLX_M3_PREFILL_OVERLAP_NATIVE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
+# Prefill cancel-check cadence. _ctrl_prefill() is a BLOCKING all_sum + host
+# sync at every chunk boundary; on the 2-node jaccl pipeline that extra
+# collective (and its cross-stream contention with the pipeline send/recv)
+# costs ~20-25% of prefill wall time versus stream_generate, which has no such
+# check. Running it every Nth chunk instead keeps /v1/stop responsive
+# (worst-case cancel latency = N prefill chunks) while recovering the speed.
+# MUST be read identically on both ranks (forwarded env) so the collective
+# count stays matched -- a per-rank mismatch would desync the ring and wedge.
+# 1 = every chunk (original), N = every Nth chunk, 0 = never (no prefill cancel).
+_PREFILL_CANCEL_EVERY = max(
+    0, int(os.environ.get("MLX_M3_PREFILL_CANCEL_EVERY", "1") or "1")
+)
+
 
 class Unsupported(Exception):
     """Request shape the batch-cancel path does not handle; use stream_generate."""
@@ -89,9 +102,20 @@ def _cancel_pending_rank0():
         return True
     try:
         sp = srv._read_prefill_stop_file()
-        nonce = srv._STOP_NONCE.get("value")
-        if sp and nonce and sp.get("nonce") == nonce:
-            return True
+        if sp and sp.get("reason"):
+            file_nonce = sp.get("nonce")
+            cur_nonce = srv._STOP_NONCE.get("value")
+            # The prefill stop file is cleared at every request start on BOTH
+            # ranks, so a stop file present during prefill was written for THIS
+            # request. Accept it unless it carries a DIFFERENT nonce (a
+            # distinguishably-stale file). A missing file nonce is treated as
+            # current: /v1/stop writes the file with nonce=_STOP_NONCE.value,
+            # but that is None for request paths that never populate the nonce
+            # (e.g. non-stream), and the strict `nonce and ==` test then silently
+            # failed to abort prefill. Existence + reason + non-conflicting nonce
+            # is the robust signal.
+            if file_nonce is None or file_nonce == cur_nonce:
+                return True
     except Exception:
         pass
     return False
@@ -480,16 +504,46 @@ def _run(rank, model, processor, tokenizer, input_ids, max_tokens, sampler,
         finally:
             _set_pipeline_overlap_flag(False)
     else:
+        _chunk_i = 0
+        pending_cancel = None  # all_sum launched last chunk, read this chunk
         while pb.needs_processing():
-            if _ctrl_prefill(rank, _cancel_pending_rank0()):
-                cancelled_in_prefill = True
-                break
+            _chunk_i += 1
+            # Act on the PREVIOUS chunk's cancel all_sum. It was launched last
+            # iteration and its ring round-trip overlapped last iteration's
+            # prompt_step, so reading it now does not stall the pipeline. Both
+            # ranks read the same collective result and break together. Cancel
+            # latency is one prefill chunk.
+            if pending_cancel is not None:
+                hit = int(pending_cancel.item()) > 0
+                pending_cancel = None
+                if hit:
+                    cancelled_in_prefill = True
+                    break
+            # Launch THIS chunk's cancel all_sum WITHOUT blocking, then compute
+            # the chunk. Deferring the read (above) is what removes the ~23%
+            # per-chunk blocking-collective cost that the batch path used to pay
+            # versus stream_generate. The predicate is identical on both ranks
+            # (deterministic _chunk_i + forwarded _PREFILL_CANCEL_EVERY), so the
+            # all_sum count/order stays matched -- a mismatch would desync/wedge.
+            if _PREFILL_CANCEL_EVERY > 0 and (_chunk_i % _PREFILL_CANCEL_EVERY == 0):
+                pending_cancel = mx.distributed.all_sum(
+                    mx.array(
+                        1 if (rank == 0 and _cancel_pending_rank0()) else 0,
+                        dtype=mx.int32,
+                    )
+                )
+                mx.async_eval(pending_cancel)
             processed += pb.prompt_step()
             if progress_cb is not None:
                 try:
                     progress_cb(processed, total)
                 except Exception:
                     pass
+        # Catch a cancel that landed on the final launched chunk before we fall
+        # through to decode (where the EOS-swap decode-stop takes over).
+        if not cancelled_in_prefill and pending_cancel is not None:
+            if int(pending_cancel.item()) > 0:
+                cancelled_in_prefill = True
 
     if cancelled_in_prefill:
         del pb
