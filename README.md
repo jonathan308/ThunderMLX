@@ -43,14 +43,17 @@ M4 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
 
 | Metric | Result |
 | --- | --- |
+| Long-context prefill (MSA overlay) | **384 tok/s @ 21k · 378 @ 36k · 366 @ 57k** (2026-07-09) |
+| Cold serial prefill (short prompts) | 285–317 tok/s (4k–14k prompts) |
 | Short-turn decode | **~32 tok/s** (thinking and no-think) |
-| Decode at 36k-token context | ~19 tok/s (stability-tuned eval cadence) |
-| Cold serial prefill | **285–317 tok/s** (4k–14k prompts) |
+| Sustained long generation | 23.4 tok/s over an 11,000-token completion |
+| Decode at 35k-token context | ~17 tok/s (context scaling; speculative decode in progress) |
 | Warm-turn TTFT | **0.65–1.2 s** |
 | Hot-cache agent turns | 1,000–36,000 tok/s effective prefill |
+| Cancelled-stream retry (agent timeout) | full cache kept → **0.87 s** TTFT on retry |
 | 36k-token session, cold vs hot | 170 s → **5.9 s** TTFT (~29× from KV reuse) |
 | Restart recovery (SSD tier) | 38 s re-prefill → **3.5 s** restore (~11×) |
-| In-flight stop → slot released | **< 1–8 s**, from any client, zero orphans |
+| In-flight stop → slot released | **< 1–8 s**, from any client, zero orphans; prefill aborts within one 4k chunk |
 | Model swap (M3 ⇄ oMLX) | ~45 s round trip, guarded |
 | Output budget / KV ceiling | 32k tokens / 1M-token KV |
 
