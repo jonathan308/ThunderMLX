@@ -39,7 +39,7 @@ flowchart LR
 ## Measured performance
 
 All numbers measured on the reference pair (M3 Ultra Studio 256GB +
-M4 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
+M5 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
 
 | Metric | Result |
 | --- | --- |
