@@ -16,3 +16,4 @@ ops/apply_staged_gateway.sh export-ignore
 ops/restart_vlm064.sh export-ignore
 ops/live_wedge_capture.sh export-ignore
 ops/publish_public.sh export-ignore
+run_with_watchdog.py export-ignore

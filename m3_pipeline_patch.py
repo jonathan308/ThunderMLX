@@ -44,6 +44,27 @@ def set_prefill_overlap_active(active):
     _M3_PREFILL_OVERLAP_ACTIVE = bool(active)
 
 
+def _unpadded_single_stream(h, cache) -> bool:
+    """True when this forward is a single (B==1) sequence with no left padding
+    -- the cluster's only generation mode. In that case a batch cache's causal
+    make_mask ARRAY is identical in effect to the "causal" string, so it can be
+    swapped back to keep the MSA sparse-prefill gate eligible (the gate only
+    accepts None/str; a dense causal array forces the O(n^2) fallback and was
+    the cause of the ~6x long-context prefill regression). Real padded batches
+    (B>1 or nonzero left padding) return False and keep their explicit array."""
+    if h.shape[0] != 1:
+        return False
+    left_padding = getattr(cache, "left_padding", None)
+    if left_padding is None:
+        return True
+    try:
+        if left_padding.size == 0:
+            return True
+        return int(mx.max(mx.abs(left_padding)).item()) == 0
+    except Exception:
+        return False
+
+
 class _PipelineMixin:
     """Layer-splitting for pipeline parallelism (from mlx_lm/models/pipeline.py)."""
     pipeline_rank = 0
@@ -175,7 +196,19 @@ def apply_pipeline_patch():
 
         if mask is None:
             cache0 = cache[0] if cache and cache[0] is not None else None
-            mask = create_attention_mask(h, cache0)
+            # A single unpadded stream's causal mask is fully described by the
+            # "causal" string. BatchKVCache.make_mask returns a dense causal
+            # array instead, which fails the MSA sparse-prefill eligibility gate
+            # (only None/"causal" pass) and forces the dense O(n^2) fallback --
+            # the root cause of the long-context prefill regression. The array
+            # is a pure causal mask for B==1/no-padding, and the sparse path
+            # handles causality via q_start (never consuming the mask), so emit
+            # the string form to keep blockwise-sparse prefill engaged. Both
+            # ranks run this identically (B==1), so the mask stays consistent.
+            if _unpadded_single_stream(h, cache0):
+                mask = "causal" if h.shape[1] > 1 else None
+            else:
+                mask = create_attention_mask(h, cache0)
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
 
