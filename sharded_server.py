@@ -172,7 +172,10 @@ TOOL_SYSTEM_HINT_TEXT = os.environ.get(
         "modifying files, work in sections: create the file skeleton first, "
         "then add one section per tool call, keeping any single call's file "
         "content under roughly 100 lines. Prefer targeted edits over "
-        "rewriting whole files."
+        "rewriting whole files. Use file paths exactly as returned by "
+        "search, list, or read tools (copy them verbatim); if you have not "
+        "seen a file's path in a tool result this session, find it with a "
+        "search tool first instead of guessing an absolute path."
     ),
 )
 TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS = int(
