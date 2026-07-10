@@ -169,13 +169,13 @@ TOOL_SYSTEM_HINT_TEXT = os.environ.get(
         "the final answer now instead of calling another tool just to list "
         "files or re-read already seen context. Only call tool names that are "
         "present in the current request's tool list. When creating or "
-        "modifying files, work in sections: create the file skeleton first, "
-        "then add one section per tool call, keeping any single call's file "
-        "content under roughly 100 lines. Prefer targeted edits over "
-        "rewriting whole files. Use file paths exactly as returned by "
-        "search, list, or read tools (copy them verbatim); if you have not "
-        "seen a file's path in a tool result this session, find it with a "
-        "search tool first instead of guessing an absolute path."
+        "modifying files, never write a whole large file in one tool call: "
+        "create a skeleton first, then add one section per call (about 80 "
+        "lines each at most). Prefer targeted edits over full-file "
+        "rewrites. Use file paths exactly as returned by search, list, or "
+        "read tools (copy them verbatim); if you have not seen a file's "
+        "path in a tool result this session, find it with a search tool "
+        "first instead of guessing an absolute path."
     ),
 )
 TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS = int(
