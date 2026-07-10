@@ -1131,6 +1131,15 @@ THINKING_RAW_SILENT_LIMIT = int(
 THINKING_RUNAWAY_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "8192") or "8192"
 )
+# Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
+# the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
+# hundreds of times — a bare-marker+shell-command shape no tag/JSON detector
+# catches, and token-level repetition_penalty=1.05 doesn't break a whole-
+# phrase loop). This guard doesn't care WHAT repeats: when the decode tail is
+# a tight cycle (a short substring repeated many times), force-stop. 0 = off.
+DECODE_REPETITION_GUARD_TOKENS = int(
+    os.environ.get("MLX_M3_DECODE_REPETITION_GUARD_TOKENS", "12") or "12"
+)
 
 # In-flight generation stop. Set via POST /v1/stop or client disconnect.
 _STOP_FLAG = threading.Event()
@@ -6697,6 +6706,26 @@ _DISPLAY_TOOL_CALL_RE = re.compile(
 
 def _strip_raw_tool_blocks(text, tool_module):
     """Remove raw MiniMax tool markup so invalid blocks never leak as content."""
+    result = _strip_raw_tool_blocks_inner(text, tool_module)
+    # 2026-07-10 ca0f2748: BARE namespace markers (no <tool_call> after them)
+    # survived both branches below and 3.8k tokens of marker spam shipped as
+    # visible content alongside a recovered call. Two or more bare markers is
+    # never prose (single occurrences stay: prose legitimately quoting the
+    # syntax once was the 2026-07-06 truncation regression) — cut at the
+    # first marker.
+    if result and text:
+        start, _ = _tool_call_markers(tool_module)
+        ns_token = start.removesuffix("<tool_call>") if start else ""
+        if ns_token and result.count(ns_token) >= 2:
+            logger.warning(
+                "stripping %d bare tool markers from visible content",
+                result.count(ns_token),
+            )
+            result = result[:result.find(ns_token)].strip()
+    return result
+
+
+def _strip_raw_tool_blocks_inner(text, tool_module):
     if not text:
         return text
     start, end = _tool_call_markers(tool_module)
@@ -6751,6 +6780,36 @@ def _looks_like_raw_tool_fragment(text, tool_module):
     # identifier optional: 2026-07-10 second flavor is marker + self-describing
     # JSON directly: ]<]minimax[>[ {"name": "Write", "arguments": {...}}
     return bool(re.match(r"\s*(<?[A-Za-z_][\w.-]{0,40}>?\s*)?\{", rest))
+
+
+def _looks_like_degenerate_repetition(text, min_cycles=10):
+    """Flavor-agnostic copy-spiral detector on the decode tail.
+
+    True when the last stretch of output is a short unit repeated many times
+    back-to-back — the quantized-decode loop shape, whatever the unit is
+    (marker spam, a repeated shell command, a word, a phrase). Cheap: only
+    the last ~600 chars, only a handful of candidate periods. Deliberately
+    conservative (>=6 tight repeats) so legitimately repetitive content
+    (numbered lists, code with repeated lines) doesn't trip it — real text
+    varies within the period; a spiral is byte-identical.
+    """
+    if not text:
+        return False
+    tail = text[-600:]
+    n = len(tail)
+    # Try small-to-medium cycle periods; a genuine loop repeats an identical
+    # block, so check the last `period*min_cycles` chars are `period`-periodic.
+    for period in range(3, 121):
+        span = period * min_cycles
+        if span > n:
+            break
+        window = tail[-span:]
+        unit = window[:period]
+        if unit.strip() and all(
+            window[i:i + period] == unit for i in range(0, span, period)
+        ):
+            return True
+    return False
 
 
 def _tool_fragment_looks_degenerate(text, tool_module):
@@ -8345,6 +8404,90 @@ def _looks_like_codex_pseudo_tool_call(text):
     )
 
 
+def _recover_attr_invoke_tool_calls(text, tool_module, tools):
+    """Recover the attribute-invoke flavor (2026-07-10 zcode todo_write):
+
+        <invoke id="todo_write" todos="[{...}]" />
+
+    The tool name rides an `id=`/`name=` attribute and the arguments are raw
+    XML attributes (not a JSON body / not <parameter> tags), often
+    self-closing. Every rung keyed on name= + a JSON/tag body missed it and
+    the call was dropped. Parse attributes generically; the arg-carrying
+    attribute value is JSON (todos="[...]") or a scalar, matched to the
+    declared schema.
+    """
+    if not text or tool_module is None:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token or "<invoke" not in text:
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    # Strip the namespace tokens so a plain XML-ish attribute scan works.
+    flat = text.replace(ns_token, " ")
+    calls = []
+    # Match the invoke OPENER only; attribute values may contain '>' and
+    # unescaped quotes (the model emits JSON inside XML attrs), so scan
+    # attributes manually rather than bounding on the first '>'.
+    attr_key_re = re.compile(r'([A-Za-z_][\w:.-]*)\s*=\s*"')
+    for om in re.finditer(r"<invoke\b", flat):
+        seg = flat[om.end():om.end() + 20000]
+        attrs = {}
+        pos = 0
+        while True:
+            km = attr_key_re.search(seg, pos)
+            if not km:
+                break
+            tag_close = seg.find(">", 0)
+            if 0 <= tag_close < km.start():
+                break  # past this invoke's opening tag
+            key = km.group(1)
+            vstart = km.end()  # just past the opening quote
+            if seg[vstart:vstart + 1] in "[{":
+                # JSON-valued attribute: balanced end ignores the XML quote
+                # AND the unescaped inner quotes that make it invalid XML.
+                vend = _json_balanced_end(seg, vstart)
+                if vend > vstart:
+                    attrs[key] = seg[vstart:vend]
+                    close = seg.find('"', vend)
+                    pos = (close + 1) if close >= 0 else vend
+                    continue
+            qm = re.compile(r'(?:\\.|[^"])*"').match(seg, vstart)
+            if not qm:
+                break
+            attrs[key] = seg[vstart:qm.end() - 1]
+            pos = qm.end()
+        if not attrs:
+            continue
+        raw_name = attrs.pop("name", None) or attrs.pop("id", None)
+        name = _canonical_tool_name(raw_name, name_map)
+        if not name or (allowed and name not in allowed):
+            continue
+        args = {}
+        for k, v in attrs.items():
+            vs = (v or "").strip()
+            parsed = None
+            if vs[:1] in "[{":
+                for strict in (True, False):
+                    try:
+                        parsed = json.loads(vs, strict=strict)
+                        break
+                    except json.JSONDecodeError:
+                        parsed = None
+            args[k] = parsed if parsed is not None else v
+        args = _canonicalize_tool_argument_keys(args, tools, name)
+        if args or not _tool_schema_expects_arguments(tools, name):
+            calls.append(_openai_tool_call(
+                name, json.dumps(args, ensure_ascii=False), len(calls)))
+    if calls:
+        logger.warning(
+            "recovered %d attribute-invoke tool call(s) (id=/name= + attr args)",
+            len(calls),
+        )
+    return calls
+
+
 def _recover_bare_name_tool_calls(text, tool_module, tools):
     """Recover the bare-name flavor: ns_marker + ToolName + {json args}.
 
@@ -8823,6 +8966,8 @@ def _parse_tool_calls(text, tool_module, tools):
             recovered = _recover_jsonish_tool_calls(text, tool_module, tools)
             if not recovered:
                 recovered = _recover_bare_name_tool_calls(text, tool_module, tools)
+            if not recovered:
+                recovered = _recover_attr_invoke_tool_calls(text, tool_module, tools)
             if not recovered:
                 recovered = _recover_codex_pseudo_tool_calls(text, tools)
             if not recovered:
@@ -9469,6 +9614,21 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
+                # Degenerate-repetition guard: force EOS on a tight copy-spiral
+                # (any repeating unit), checked cheaply every 12 tokens.
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and DECODE_REPETITION_GUARD_TOKENS > 0
+                        and n % DECODE_REPETITION_GUARD_TOKENS == 0
+                        and n >= 48
+                        and _looks_like_degenerate_repetition(text)):
+                    logger.warning(
+                        "rank 0: degenerate-repetition guard at token %d "
+                        "(decode tail is a tight copy-spiral) — forcing EOS",
+                        n,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"] and n % 8 == 0):
                     _sp = _read_prefill_stop_file()
@@ -9692,6 +9852,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     # Routing state (mirrors mlx_vlm/server/openai.py:1493-1497)
     in_thinking = bool(enable_thinking)
     accumulated = ""
+    raw_tail = ""  # rolling raw-text tail for the repetition guard
     at_response_start = True
     n = 0
     generated_token_ids = []
@@ -9739,6 +9900,12 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     stopped = True  # bookkeeping only; generator ends itself
                 token_text = getattr(response, "text", None) or ""
                 n += 1
+                # Rolling raw-text tail: `accumulated` is CONSUMED by
+                # split_stream_thinking_delta each token (it is a pending
+                # buffer, near-empty most steps), so guards must not read it
+                # for history. 2026-07-10 ca0f2748: a retry spiraled 3.8k
+                # tokens of bare markers past a guard checking `accumulated`.
+                raw_tail = (raw_tail + token_text)[-600:]
                 _watchdog_tick(progress=True)
                 # Safe decode-phase stop: rank 0 watches the coordinated stop
                 # file every 8 tokens and, when the boundary is reached, ARMS
@@ -9750,21 +9917,32 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # Thinking-runaway guard: still inside <mm:think> well past
                 # the budget => the model is looping in reasoning and will
                 # burn to the ceiling. Arm the SAME proven EOS stop, gated on
-                # visible content still being empty (thinking not yet closed)
-                # so a turn writing a long answer is never clipped.
-                # (This loop's accumulator is `accumulated`, NOT `text` — the
-                # 2026-07-09 "name 'text' is not defined" generation error.)
+                # the splitter's authoritative in_thinking state (substring
+                # checks on the consumed `accumulated` buffer never matched).
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
                         and THINKING_RUNAWAY_TOKEN_BUDGET > 0
                         and thinking_mode == "enabled"
                         and n >= THINKING_RUNAWAY_TOKEN_BUDGET
-                        and "</mm:think>" not in accumulated
-                        and "</think>" not in accumulated):
+                        and in_thinking):
                     logger.warning(
                         "rank 0: thinking-runaway guard at token %d "
                         "(still in <mm:think>, no visible answer) — forcing "
                         "EOS to release the slot",
+                        n,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
+                # Degenerate-repetition guard on the raw tail.
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and DECODE_REPETITION_GUARD_TOKENS > 0
+                        and n % DECODE_REPETITION_GUARD_TOKENS == 0
+                        and n >= 48
+                        and _looks_like_degenerate_repetition(raw_tail)):
+                    logger.warning(
+                        "rank 0: degenerate-repetition guard at token %d "
+                        "(decode tail is a tight copy-spiral) — forcing EOS",
                         n,
                     )
                     _FORCE_EOS["active"] = True

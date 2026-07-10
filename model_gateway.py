@@ -2323,17 +2323,23 @@ def _responses_tools_to_openai(tools: Any) -> list[dict[str, Any]]:
     for tool in tools:
         if not isinstance(tool, dict) or tool.get("type") != "function":
             continue
-        name = str(tool.get("name") or "").strip()
+        # Accept BOTH the flat Responses shape ({"type","name","parameters"})
+        # and the chat-style nested shape ({"type","function":{...}}) that
+        # many clients send inside Responses payloads. The flat-only check
+        # silently dropped every nested tool -> model saw tools=0 and
+        # narrated "I don't see a write tool" (2026-07-10 zcode).
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        name = str(fn.get("name") or "").strip()
         if not name:
             continue
-        parameters = tool.get("parameters")
+        parameters = fn.get("parameters")
         if not isinstance(parameters, dict):
             parameters = {"type": "object", "properties": {}}
         out.append({
             "type": "function",
             "function": {
                 "name": name,
-                "description": str(tool.get("description") or ""),
+                "description": str(fn.get("description") or tool.get("description") or ""),
                 "parameters": parameters,
             },
         })
@@ -2409,7 +2415,9 @@ def _responses_chat_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "model": str(payload.get("model") or "Minimax-M3-No-Think"),
         "messages": _responses_input_to_openai_messages(payload),
         "stream": False,
-        "max_tokens": int(payload.get("max_output_tokens") or payload.get("max_tokens") or 16384),
+        # 32768 (was 16384): a legit long-form zcode turn hit the 16k default
+        # mid-answer (2026-07-10); backend ceiling is 32768, use it.
+        "max_tokens": int(payload.get("max_output_tokens") or payload.get("max_tokens") or 32768),
     }
     tools = _responses_tools_to_openai(payload.get("tools"))
     if tools:
@@ -2667,6 +2675,36 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
 
         shell = {"id": response_id, "object": "response", "created_at": created,
                  "status": "in_progress", "model": model, "output": []}
+
+        def _heartbeat_events():
+            """Keepalive the client COUNTS (2026-07-10): zcode's stream_idle_
+            timeout ignores response.in_progress pulses, so silent buffered
+            tails (giant tool authoring) died at its 10-min timer even though
+            our 10s heartbeats flowed. Emit an EMPTY output_text.delta on a
+            real open message item instead — protocol-legal, renders nothing,
+            resets client idle timers. The item is opened on first need and
+            real content later reuses it (message_id logic below)."""
+            nonlocal message_id, out_index
+            events = []
+            if message_id is None:
+                out_index += 1
+                message_id = f"msg_{uuid.uuid4().hex[:16]}"
+                events.append(emit("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": out_index,
+                    "item": {"id": message_id, "type": "message",
+                             "status": "in_progress",
+                             "role": "assistant", "content": []}}))
+                events.append(emit("response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": message_id, "output_index": out_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "",
+                             "annotations": []}}))
+            events.append(emit("response.output_text.delta", {
+                "type": "response.output_text.delta", "item_id": message_id,
+                "output_index": out_index, "content_index": 0, "delta": ""}))
+            return events
         yield emit("response.created", {"type": "response.created", "response": dict(shell)})
         yield emit("response.in_progress", {"type": "response.in_progress", "response": dict(shell)})
 
@@ -2782,9 +2820,8 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     except asyncio.TimeoutError:
                         if await request.is_disconnected():
                             raise _ResponsesClientGone()
-                        yield emit("response.in_progress", {
-                            "type": "response.in_progress",
-                            "response": dict(shell)})
+                        for _ev in _heartbeat_events():
+                            yield _ev
                         continue
                     if _item is _eos:
                         break
@@ -2794,9 +2831,8 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     if await request.is_disconnected():
                         raise _ResponsesClientGone()
                     if _hb_seconds > 0 and time.time() - last_event_ts > _hb_seconds:
-                        yield emit("response.in_progress", {
-                            "type": "response.in_progress",
-                            "response": dict(shell)})
+                        for _ev in _heartbeat_events():
+                            yield _ev
                     buffer += raw
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
