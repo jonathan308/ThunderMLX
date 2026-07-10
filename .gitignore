@@ -44,3 +44,4 @@ dashboard_legacy.html
 dashboard_v2.html
 ops/logs/
 runtime_patches/variants/
+ops/.last_published_sha

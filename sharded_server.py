@@ -222,6 +222,14 @@ TOOL_UNUSABLE_RETRY_TEMPERATURES = [
 TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
     os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "4096") or "0"
 )
+# Retry unusable tool turns in NO-THINK. A thinking-mode retry regenerates
+# another multi-minute reasoning turn that often re-botches the same marker
+# (2026-07-10 hermes: retry 1/2 ran 7+ min and the client had long since
+# timed out). No-Think is the reliable, fast tool modality — the retry's job
+# is to EMIT a valid call, not reason again. 0 keeps the original mode.
+TOOL_RETRY_NO_THINK = os.environ.get(
+    "MLX_M3_TOOL_RETRY_NO_THINK", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
 )
@@ -7527,6 +7535,20 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
         ):
             return True
         return False
+    # An UNTERMINATED tool marker — the model closes thinking, emits the
+    # opening `]<]minimax[>[<tool_call>` (or `<invoke`), then stops (EOS) with
+    # no body and no close — is NOT removed by _strip_raw_tool_blocks (it
+    # needs a start..end pair), so the leftover marker leaks as "content" and
+    # slips past the strip-diff check below. Any raw tool fragment with zero
+    # parsed calls is a botched call, never usable content — force the retry
+    # ladder. (2026-07-10 hermes: "Let me make targeted edits" then a bare
+    # <tool_call>; the turn shipped "could not produce a valid tool call" and
+    # the agent stalled.)
+    if _looks_like_raw_tool_fragment(full_output or "", tool_module):
+        return False
+    start_marker, _ = _tool_call_markers(tool_module)
+    if start_marker and start_marker in (full_output or ""):
+        return False
     raw_source = remaining_text or full_output or ""
     safe_text = _strip_raw_tool_blocks(raw_source, tool_module)
     if (safe_text or "").strip() != raw_source.strip():
@@ -7587,16 +7609,22 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             retry_params.get("temperature"), retry_max_tokens,
             snippet[:200], snippet[-160:],
         )
+        # No-Think retry (set on BOTH the broadcast request and the local
+        # call so rank 1 mirrors the same mode — a mismatch desyncs the
+        # pipeline). Fast + reliable: goes straight to the call instead of
+        # re-entering the reasoning ramble that botched it.
+        retry_thinking_mode = "disabled" if TOOL_RETRY_NO_THINK else thinking_mode
         retry_request = dict(rank_request)
         retry_request["gen_params"] = retry_params
         retry_request["max_tokens"] = retry_max_tokens
+        retry_request["thinking_mode"] = retry_thinking_mode
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 tool retry")
         _bcast(retry_request, rank)
         try:
             full_output = run_generation(
                 model, processor, prompt, retry_max_tokens, rank,
-                image=image_path, thinking_mode=thinking_mode,
+                image=image_path, thinking_mode=retry_thinking_mode,
                 gen_params=retry_params, progress_cb=progress_cb,
                 token_ids=token_ids,
                 session_id=session_id, session_source=session_source,
@@ -7610,11 +7638,13 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             )
             return full_output
         if _usable_tool_turn(full_output, tool_module, tools,
-                             processed_messages, thinking_mode,
+                             processed_messages, retry_thinking_mode,
                              require_call=require_call):
             logger.warning(
-                "[rank 0] %s %s tool retry %d/%d recovered a usable tool turn",
+                "[rank 0] %s %s tool retry %d/%d recovered a usable tool turn "
+                "(mode=%s)",
                 label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+                retry_thinking_mode,
             )
             return full_output
     snippet = re.sub(r"\s+", " ", full_output or "")
