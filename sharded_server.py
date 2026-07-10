@@ -6785,24 +6785,31 @@ def _looks_like_raw_tool_fragment(text, tool_module):
 def _looks_like_degenerate_repetition(text, min_cycles=10):
     """Flavor-agnostic copy-spiral detector on the decode tail.
 
-    True when the last stretch of output is a short unit repeated many times
+    True when the last stretch of output is a unit repeated many times
     back-to-back — the quantized-decode loop shape, whatever the unit is
-    (marker spam, a repeated shell command, a word, a phrase). Cheap: only
-    the last ~600 chars, only a handful of candidate periods. Deliberately
-    conservative (>=6 tight repeats) so legitimately repetitive content
-    (numbered lists, code with repeated lines) doesn't trip it — real text
-    varies within the period; a spiral is byte-identical.
+    (marker spam, a repeated shell command, a word, a whole paragraph).
+    Two bands:
+      * short periods (3-120 chars): >=10 tight repeats — conservative so
+        numbered lists / a few repeated code lines never trip; real text
+        varies within the period, a spiral is byte-identical.
+      * long periods (121-1200 chars): >=5 verbatim repeats. 2026-07-10
+        zcode: a No-Think retry looped a ~300-char analysis paragraph
+        ("Wait, I see at line 367... Hmm, I don't see this...") ~30 times
+        and sailed under the old 120-char cap. Five byte-identical copies
+        of a >120-char block back-to-back does not occur in real prose.
+    Early-exit slicing keeps the common (non-looping) case ~free.
     """
     if not text:
         return False
-    tail = text[-600:]
+    tail = text[-4800:]
     n = len(tail)
-    # Try small-to-medium cycle periods; a genuine loop repeats an identical
-    # block, so check the last `period*min_cycles` chars are `period`-periodic.
-    for period in range(3, 121):
-        span = period * min_cycles
+    for period in range(3, 1201):
+        cycles = min_cycles if period <= 120 else 5
+        span = period * cycles
         if span > n:
-            break
+            if period > 120:
+                break
+            continue
         window = tail[-span:]
         unit = window[:period]
         if unit.strip() and all(
@@ -7634,6 +7641,11 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
         assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
     )
     content = _scrub_goal_state_echo((content or "").strip())
+    # A turn whose visible content is itself a copy-spiral (2026-07-10: a
+    # No-Think retry looped a ~300-char analysis paragraph to its 4096 cap
+    # and shipped as the answer) is never usable — force the ladder onward.
+    if _looks_like_degenerate_repetition(content):
+        return False
     return bool(content) and not _looks_like_leaked_reasoning_content(content)
 
 
@@ -9442,6 +9454,40 @@ def _generation_iter(rank, gen_kwargs):
     return _maybe_capture_wrap(rank, gen_kwargs, stream_generate(**gen_kwargs))
 
 
+# ---------------------------------------------------------------------------
+# Constrained tool decoding (MLX_M3_CONSTRAINED_TOOLS, default OFF).
+# The rank0 sampler hook (_synced_sample_with_positions) consults the module
+# global constrained_tools.active(); these helpers arm/disarm it per request
+# around the decode loop. Single-owner and generation_lock-serialized, mirroring
+# the _FORCE_EOS pattern. Any failure falls back to unconstrained decode.
+# ---------------------------------------------------------------------------
+def _arm_constrained_tools(processor, tools, rank):
+    try:
+        import constrained_tools as _ctools
+    except Exception:
+        return
+    _ctools.clear_active()          # never inherit a prior request's grammar
+    if rank != 0 or not tools or not _ctools.env_enabled():
+        return
+    try:
+        tk = getattr(processor, "tokenizer", processor)
+        con = _ctools.build_from_request(tk, tools)
+        if con is not None:
+            _ctools.set_active(con)
+            logger.info("constrained-tools armed (%d advertised tool(s))",
+                        len(getattr(con, "tool_names", []) or []))
+    except Exception as e:
+        logger.warning("constrained-tools arm failed; decoding unconstrained: %s", e)
+
+
+def _disarm_constrained_tools():
+    try:
+        import constrained_tools as _ctools
+        _ctools.clear_active()
+    except Exception:
+        pass
+
+
 def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    thinking_mode="adaptive", gen_params=None, progress_cb=None,
                    token_ids=None, session_id=None, session_source=None,
@@ -9542,6 +9588,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     tool_accumulated = ""
     raw_tool_fragment_tokens = 0
     stopped = False
+    _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
         with _tokenizer_runtime_lock, _decode_eval_context(force_eval):
@@ -9745,6 +9792,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         _reset_prompt_cache("reset after error", clear_resident=False)
         raise
     finally:
+        _disarm_constrained_tools()
         if cache_marked_in_use:
             _mark_prompt_cache_in_use(False)
 
@@ -9860,6 +9908,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     malformed_thinking = False
     raw_silent_tokens = 0
     thinking_active = _enable_thinking_for_generation(thinking_mode)
+    _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
         timing["stream_generate_started_at"] = time.time()
@@ -10179,6 +10228,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         _reset_prompt_cache("reset after error", clear_resident=False)
         raise
     finally:
+        _disarm_constrained_tools()
         if cache_marked_in_use:
             _mark_prompt_cache_in_use(False)
 
@@ -10259,8 +10309,26 @@ def _install_rank0_token_sync(group):
         return
 
     sync_rank = group.rank()
+    try:
+        import constrained_tools as _ctools
+    except Exception:
+        _ctools = None
+    _ct_on = _ctools is not None and _ctools.env_enabled()
 
     def _synced_sample_with_positions(*args, **kwargs):
+        # Constrained tool decoding (rank0 only): mask the logits BEFORE the
+        # sampler draws so malformed tool-markup tokens are unsamplable, then
+        # fold the sampled token into the automaton. No-op unless the env flag
+        # is on AND a per-request grammar is armed. rank>0 never masks — it
+        # consumes rank0's token via the all_gather below.
+        con = _ctools.active() if (_ct_on and sync_rank == 0) else None
+        if con is not None and len(args) >= 2:
+            try:
+                masked = con.mask_logits(args[1])
+                if masked is not args[1]:
+                    args = (args[0], masked) + tuple(args[2:])
+            except Exception:
+                con = None
         y = orig(*args, **kwargs)
         # Decode stop = rank 0 forces EOS as its sampled token; every rank
         # receives it through this same all_gather and the generation ends
@@ -10272,6 +10340,12 @@ def _install_rank0_token_sync(group):
             and _FORCE_EOS["eos_id"] is not None
         ):
             y = mx.full(y.shape, _FORCE_EOS["eos_id"], dtype=y.dtype)
+        if con is not None:
+            # fold the actually-sampled token (post force-eos) into the automaton
+            try:
+                con.observe(int(y.reshape(-1)[0]))
+            except Exception:
+                pass
         gathered = mx.distributed.all_gather(y, group=group)
         return gathered[: y.shape[0]]
 
