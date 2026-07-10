@@ -6732,14 +6732,25 @@ def _looks_like_raw_tool_fragment(text, tool_module):
     if not text or not ns_token or ns_token not in text:
         return False
     fragment = text[text.find(ns_token):]
-    return any(marker in fragment for marker in (
+    if any(marker in fragment for marker in (
         "<tool_call",
         "</tool_call",
         "<invoke",
         "invoke name",
         "</invoke",
         "[Tool call:",
-    ))
+    )):
+        return True
+    # Bare-name flavor (2026-07-10 zcode): the model emits the namespace
+    # marker + tool name + JSON args with NO <tool_call>/<invoke> structure:
+    #   ]<]minimax[>[ Bash {"command": "...", "description": "..."}
+    # Every rung above keys on the tag markers, so this shipped verbatim as
+    # visible content. Marker followed by an identifier and an opening brace
+    # is tool intent, never prose.
+    rest = fragment[len(ns_token):]
+    # identifier optional: 2026-07-10 second flavor is marker + self-describing
+    # JSON directly: ]<]minimax[>[ {"name": "Write", "arguments": {...}}
+    return bool(re.match(r"\s*(<?[A-Za-z_][\w.-]{0,40}>?\s*)?\{", rest))
 
 
 def _tool_fragment_looks_degenerate(text, tool_module):
@@ -8334,6 +8345,85 @@ def _looks_like_codex_pseudo_tool_call(text):
     )
 
 
+def _recover_bare_name_tool_calls(text, tool_module, tools):
+    """Recover the bare-name flavor: ns_marker + ToolName + {json args}.
+
+    2026-07-10 zcode: `]<]minimax[>[ Bash {"command": ...}` — no
+    <tool_call>/<invoke> tags at all, so every block-based rung misses it and
+    it leaked verbatim into visible content. The intended call is
+    unambiguous: identifier right after the namespace marker + one balanced
+    JSON object. Only declared tools are accepted; tolerant JSON (raw
+    newlines) handled like the other rungs.
+    """
+    if not text or tool_module is None:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if not ns_token or ns_token not in text:
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    calls = []
+    pos = 0
+    head_re = re.compile(r"\s*<?(?P<name>[A-Za-z_][\w.-]{0,40})>?\s*\{")
+    while True:
+        idx = text.find(ns_token, pos)
+        if idx < 0:
+            break
+        rest = text[idx + len(ns_token):]
+        m = head_re.match(rest)
+        name = _canonical_tool_name(m.group("name"), name_map) if m else None
+        if m:
+            obj_start = idx + len(ns_token) + m.end() - 1  # the '{'
+        else:
+            brace = re.match(r"\s*\{", rest)
+            if not brace:
+                pos = idx + len(ns_token)
+                continue
+            obj_start = idx + len(ns_token) + brace.end() - 1
+        obj_end = _json_balanced_end(text, obj_start)
+        if obj_end <= obj_start:
+            pos = idx + len(ns_token)
+            continue
+        payload = text[obj_start:obj_end]
+        obj = None
+        for strict in (True, False):
+            try:
+                obj = json.loads(payload, strict=strict)
+                break
+            except json.JSONDecodeError:
+                continue
+        # Self-describing flavor: {"name": "Write", "arguments": {...}} (also
+        # accepts input/parameters as the args key). Overrides a missing or
+        # unknown leading identifier.
+        if isinstance(obj, dict) and isinstance(obj.get("name"), str):
+            inner_name = _canonical_tool_name(obj["name"], name_map)
+            if inner_name:
+                name = inner_name
+                inner_args = None
+                for key in ("arguments", "input", "parameters", "args"):
+                    if isinstance(obj.get(key), dict):
+                        inner_args = obj[key]
+                        break
+                obj = inner_args if inner_args is not None else {
+                    k: v for k, v in obj.items() if k != "name"}
+        if not name or (allowed and name not in allowed):
+            pos = obj_end
+            continue
+        if isinstance(obj, dict) and obj:
+            obj = _canonicalize_tool_argument_keys(obj, tools, name)
+            if obj or not _tool_schema_expects_arguments(tools, name):
+                calls.append(_openai_tool_call(
+                    name, json.dumps(obj, ensure_ascii=False), len(calls)))
+        pos = obj_end
+    if calls:
+        logger.warning(
+            "recovered %d bare-name tool call(s) (marker + name + JSON, no tags)",
+            len(calls),
+        )
+    return calls
+
+
 def _recover_jsonish_tool_calls(text, tool_module, tools):
     """Recover common MiniMax/ZCode JSON-ish tool calls after official parse fails.
 
@@ -8731,6 +8821,8 @@ def _parse_tool_calls(text, tool_module, tools):
             or "[Tool call:" in text
         ):
             recovered = _recover_jsonish_tool_calls(text, tool_module, tools)
+            if not recovered:
+                recovered = _recover_bare_name_tool_calls(text, tool_module, tools)
             if not recovered:
                 recovered = _recover_codex_pseudo_tool_calls(text, tools)
             if not recovered:
