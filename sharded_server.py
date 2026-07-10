@@ -231,6 +231,19 @@ DEFAULT_REPETITION_PENALTY = float(
 TOOL_DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_TOOL_DEFAULT_REPETITION_PENALTY", "0") or "0"
 )
+# Thinking turns: a reasoning loop is a repetition spiral inside <mm:think>
+# (2026-07-09 hermes: 12.5k tokens of the same reasoning, never closing).
+# The same mild penalty that fixes tool spirals attacks the CAUSE, not just
+# the runaway-guard aftermath; plus a small temperature floor so a
+# near-greedy path (the classic 4-bit-quant loop attractor) has enough
+# entropy to escape. Both apply ONLY when thinking is enabled and the client
+# didn't set the value. 0 / negative disables each.
+THINKING_DEFAULT_REPETITION_PENALTY = float(
+    os.environ.get("MLX_M3_THINKING_DEFAULT_REPETITION_PENALTY", "1.05") or "1.05"
+)
+THINKING_MIN_TEMPERATURE = float(
+    os.environ.get("MLX_M3_THINKING_MIN_TEMPERATURE", "0.5") or "0.5"
+)
 # Tools to hide from the model (comma-separated). MiniMax-4bit reliably
 # invents its own patch dialects for apply_patch while its exec_command
 # shell writes are dependable; hiding the patch tool routes file work
@@ -1097,6 +1110,18 @@ PREFILL_STOP_FILE = os.path.expanduser(
 RANK1_SSH = os.environ.get("MLX_M3_RANK1_SSH", "").strip()
 THINKING_RAW_SILENT_LIMIT = int(
     os.environ.get("MLX_M3_THINKING_RAW_SILENT_LIMIT", "64") or "64"
+)
+
+# Thinking-runaway guard (2026-07-09 hermes 486s/12.5k-token pure-think
+# runaway): a Think turn deep in a long conversation can loop inside
+# <mm:think> and never emit </mm:think>, decoding to the 32k ceiling with
+# zero visible content. When a turn is STILL in thinking past this many
+# generated tokens, arm the proven EOS-injection stop (same path /v1/stop
+# uses, batch-cancel certified). Only pure-think runaways trip it — once
+# thinking closes and the answer starts, the guard disengages, so legit
+# long answers are never clipped. 0 disables.
+THINKING_RUNAWAY_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "8192") or "8192"
 )
 
 # In-flight generation stop. Set via POST /v1/stop or client disconnect.
@@ -5770,6 +5795,17 @@ def _request_generation_params(request, tools=None):
         params.setdefault("repetition_penalty", TOOL_DEFAULT_REPETITION_PENALTY)
     if DEFAULT_REPETITION_PENALTY > 0:
         params.setdefault("repetition_penalty", DEFAULT_REPETITION_PENALTY)
+    # Anti-loop sampling for thinking turns (breaks reasoning spirals at the
+    # source). setdefault => an explicit client value always wins.
+    if _resolve_thinking_mode(request) == "enabled":
+        if THINKING_DEFAULT_REPETITION_PENALTY > 0:
+            params.setdefault("repetition_penalty",
+                              THINKING_DEFAULT_REPETITION_PENALTY)
+        if (THINKING_MIN_TEMPERATURE > 0
+                and "temperature" not in request  # client didn't ask
+                and float(params.get("temperature", 0.0) or 0.0)
+                < THINKING_MIN_TEMPERATURE):
+            params["temperature"] = THINKING_MIN_TEMPERATURE
     if DEFAULT_PRESENCE_PENALTY != 0:
         params.setdefault("presence_penalty", DEFAULT_PRESENCE_PENALTY)
     if DEFAULT_FREQUENCY_PENALTY != 0:
@@ -6149,7 +6185,8 @@ def _request_shape_summary(request, processed_messages, prompt, token_ids, *,
         "tool_default_sampling": bool(tools),
         "effective_sampling": {
             k: gen_params.get(k)
-            for k in ("temperature", "top_p", "top_k", "min_p", "seed")
+            for k in ("temperature", "top_p", "top_k", "min_p", "seed",
+                      "repetition_penalty")
             if isinstance(gen_params, dict) and k in gen_params
         },
         "prompt_chars": len(prompt or ""),
@@ -6270,6 +6307,24 @@ def _normalize_tool_calls(tool_calls):
     return normalized
 
 
+def _tool_choice_required_name(request):
+    """OpenAI tool_choice forcing: 'required' or a named function.
+
+    Returns (required: bool, name: str|None). Accepts the OpenAI shapes
+    {"type": "function", "function": {"name": N}} and legacy
+    function_call={"name": N}; "auto"/"none"/absent -> (False, None).
+    """
+    choice = request.get("tool_choice", request.get("function_call"))
+    if isinstance(choice, str):
+        return (choice == "required", None)
+    if isinstance(choice, dict):
+        fn = choice.get("function") if isinstance(choice.get("function"), dict) else choice
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if name:
+            return (True, str(name))
+    return (False, None)
+
+
 def _tools_from_request(request):
     """Return OpenAI tool schemas, accepting legacy `functions` clients too."""
     if _tool_choice_disables_tools(request):
@@ -6278,6 +6333,16 @@ def _tools_from_request(request):
         request["_tool_source"] = "tool_choice_none"
         return None
     tools = request.get("tools")
+    # OpenAI named forcing: advertise ONLY the requested function so the
+    # model cannot pick another; the required flag then drives the ladder.
+    _req, _name = _tool_choice_required_name(request)
+    if _req:
+        request["_tool_choice_required"] = True
+    if _name and tools:
+        named = [t for t in tools if _tool_function_name(t) == _name]
+        if named:
+            request["_tool_source"] = "tool_choice_named"
+            return named
     if tools and TOOL_HIDE_NAMES:
         filtered = [
             tool for tool in tools
@@ -7432,16 +7497,20 @@ def _tool_retry_gen_params(gen_params, attempt):
 
 
 def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
-                      thinking_mode):
+                      thinking_mode, require_call=False):
     """True when a buffered tool-mode generation can be returned as-is.
 
     Mirrors the response-path checks: a validated tool call, a synthesizable
     simple write, or real visible content all count; empty/malformed tool
-    markup and leaked reasoning do not.
+    markup and leaked reasoning do not. With require_call (OpenAI
+    tool_choice "required"/named), ONLY a validated call counts — prose is
+    unusable and the retry ladder regenerates.
     """
     tool_calls, remaining_text = _parse_tool_calls(
         full_output or "", tool_module, tools
     )
+    if require_call and not tool_calls:
+        return False
     if tool_calls:
         validated, dropped, dropped_names = _validate_outgoing_tool_calls(
             tool_calls,
@@ -7495,8 +7564,11 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         return full_output
     if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
         return full_output
+    # tool_choice rides the rank broadcast; custom keys do not. Derive
+    # the OpenAI required/named-forcing flag from it directly.
+    require_call = _tool_choice_required_name(rank_request or {})[0]
     if _usable_tool_turn(full_output, tool_module, tools, processed_messages,
-                         thinking_mode):
+                         thinking_mode, require_call=require_call):
         return full_output
     label = "stream" if stream else "non-stream"
     ceiling = MAX_TOKENS_CEILING if MAX_TOKENS_CEILING > 0 else 16384
@@ -7538,7 +7610,8 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             )
             return full_output
         if _usable_tool_turn(full_output, tool_module, tools,
-                             processed_messages, thinking_mode):
+                             processed_messages, thinking_mode,
+                             require_call=require_call):
             logger.warning(
                 "[rank 0] %s %s tool retry %d/%d recovered a usable tool turn",
                 label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
@@ -9254,6 +9327,26 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 # for cache handling once the loop ends naturally.
                 # BATCH PATH ONLY: the stream generator pre-builds the next
                 # step, so an injected EOS deadlocks it (rig 0/5 history).
+                # Thinking-runaway guard: still inside <mm:think> well past
+                # the budget => the model is looping in reasoning and will
+                # burn to the ceiling. Arm the SAME proven EOS stop, gated on
+                # visible content still being empty (thinking not yet closed)
+                # so a turn writing a long answer is never clipped.
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and thinking_mode == "enabled"
+                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and "</mm:think>" not in text
+                        and "</think>" not in text):
+                    logger.warning(
+                        "rank 0: thinking-runaway guard at token %d "
+                        "(still in <mm:think>, no visible answer) — forcing "
+                        "EOS to release the slot",
+                        n,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"] and n % 8 == 0):
                     _sp = _read_prefill_stop_file()
@@ -9532,6 +9625,28 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # and the unconditional EOS break above ends both identically.
                 # BATCH PATH ONLY: the stream generator pre-builds the next
                 # step, so an injected EOS deadlocks it (rig 0/5 history).
+                # Thinking-runaway guard: still inside <mm:think> well past
+                # the budget => the model is looping in reasoning and will
+                # burn to the ceiling. Arm the SAME proven EOS stop, gated on
+                # visible content still being empty (thinking not yet closed)
+                # so a turn writing a long answer is never clipped.
+                # (This loop's accumulator is `accumulated`, NOT `text` — the
+                # 2026-07-09 "name 'text' is not defined" generation error.)
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and thinking_mode == "enabled"
+                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and "</mm:think>" not in accumulated
+                        and "</think>" not in accumulated):
+                    logger.warning(
+                        "rank 0: thinking-runaway guard at token %d "
+                        "(still in <mm:think>, no visible answer) — forcing "
+                        "EOS to release the slot",
+                        n,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"] and n % 8 == 0):
                     _sp = _read_prefill_stop_file()
@@ -11525,6 +11640,22 @@ def run_http_server(model, processor, rank):
         response_model = _response_model_id(request.get("model"))
         cache_session_id, cache_session_source = _request_cache_session(request)
         tools = _tools_from_request(request)
+        # OpenAI tool_choice "required"/named forcing: resampling alone
+        # cannot make the model WANT to call a tool on prompts it would
+        # answer in prose, so inject an explicit instruction; the usable-
+        # turn ladder then backstops any turn that still skips the call.
+        if tools and _tool_choice_required_name(request)[0]:
+            _forced = _tool_choice_required_name(request)[1]
+            msgs = list(msgs or [])
+            msgs.append({
+                "role": "system",
+                "content": (
+                    "Tool use is REQUIRED for this turn: respond with a "
+                    + (f"call to the function `{_forced}`" if _forced
+                       else "call to exactly one of the available functions")
+                    + ". Do not reply with plain text."
+                ),
+            })
         if (
             tools
             and TOOL_THINKING_MODE != "request"
@@ -11828,6 +11959,11 @@ def run_http_server(model, processor, rank):
                         "session_source": cache_session_source,
                         "eagle3": _eagle3_on,
                         "tools": tools,
+                        # OpenAI tool_choice forcing: the usable-turn ladder
+                        # reads this to treat call-less turns as unusable
+                        # when 'required'/named (2026-07-09).
+                        "tool_choice": request.get(
+                            "tool_choice", request.get("function_call")),
                         # Tool-bearing requests are buffered and parsed after
                         # decode, so reaching max_tokens can leave no visible
                         # content even when the stable tool/template prefix is
