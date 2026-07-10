@@ -2353,6 +2353,10 @@ def _responses_input_to_openai_messages(payload: dict[str, Any]) -> list[dict[st
         if not isinstance(item, dict):
             continue
         kind = str(item.get("type") or "")
+        if not kind and item.get("role") and "content" in item:
+            # OpenAI accepts untyped chat-style {role, content} input items;
+            # dropping them silently hands the model a task-less prompt.
+            kind = "message"
         if kind == "message":
             role = str(item.get("role") or "user")
             if role == "developer":
@@ -2650,11 +2654,13 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
 
     async def iterator():
         seq = 0
+        last_event_ts = time.time()
 
         def emit(event: str, data: dict[str, Any]) -> str:
-            nonlocal seq
+            nonlocal seq, last_event_ts
             data["sequence_number"] = seq
             seq += 1
+            last_event_ts = time.time()
             return _responses_sse(event, data)
 
         shell = {"id": response_id, "object": "response", "created_at": created,
@@ -2723,6 +2729,7 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
             return events
 
         client = httpx.AsyncClient(timeout=None)
+        _pump_task = None
         try:
             async with client.stream("POST", f"{base}/v1/chat/completions",
                                      json=chat_payload) as upstream:
@@ -2738,9 +2745,56 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     return
                 buffer = ""
                 done = False
-                async for raw in upstream.aiter_text():
+                # Buffered tool turns (No-Think especially) emit NO deltas for
+                # minutes while the model authors a big call; codex then shows
+                # a frozen response and its client timeout kills + retries the
+                # turn (the 2026-07-08 loop). The chat stream is fully silent
+                # during that window (no keepalives reach this loop), so a
+                # data-driven check can never fire in time. Pump upstream
+                # chunks through a queue from a side task and drive a
+                # time-based heartbeat off get() timeouts: re-emit
+                # response.in_progress after M3_GATEWAY_RESPONSES_
+                # HEARTBEAT_SECONDS of silence (default 10, 0 disables).
+                # Protocol-legal, no fabricated content.
+                _hb_seconds = float(os.environ.get(
+                    "M3_GATEWAY_RESPONSES_HEARTBEAT_SECONDS", "10") or "10")
+                _eos = object()
+                _chunks: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+                async def _pump() -> None:
+                    try:
+                        async for chunk in upstream.aiter_text():
+                            await _chunks.put(chunk)
+                        await _chunks.put(_eos)
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as exc:
+                        await _chunks.put(exc)
+
+                _pump_task = asyncio.create_task(_pump())
+                while True:
+                    try:
+                        _item = await asyncio.wait_for(
+                            _chunks.get(),
+                            timeout=_hb_seconds if _hb_seconds > 0 else None)
+                    except asyncio.TimeoutError:
+                        if await request.is_disconnected():
+                            raise _ResponsesClientGone()
+                        yield emit("response.in_progress", {
+                            "type": "response.in_progress",
+                            "response": dict(shell)})
+                        continue
+                    if _item is _eos:
+                        break
+                    if isinstance(_item, BaseException):
+                        raise _item
+                    raw = _item
                     if await request.is_disconnected():
                         raise _ResponsesClientGone()
+                    if _hb_seconds > 0 and time.time() - last_event_ts > _hb_seconds:
+                        yield emit("response.in_progress", {
+                            "type": "response.in_progress",
+                            "response": dict(shell)})
                     buffer += raw
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
@@ -2875,6 +2929,12 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
             except Exception:
                 pass
         finally:
+            if _pump_task is not None:
+                _pump_task.cancel()
+                try:
+                    await _pump_task
+                except BaseException:
+                    pass
             await client.aclose()
 
     return StreamingResponse(iterator(), media_type="text/event-stream")

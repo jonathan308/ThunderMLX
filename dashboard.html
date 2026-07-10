@@ -557,6 +557,23 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
         <button class="btn danger" data-post="/api/cache/ssd/clear" data-confirm="Delete all durable SSD cache artifacts?">Clear SSD</button>
       </div>
     </div>
+    <div class="card machine">
+      <h3>Storage <span class="hint">live caps · rank 0 · GB = GiB</span></h3>
+      <div class="mtx"><span>SSD prompt-KV cache</span><span id="stSsd">…</span></div>
+      <div class="mbar"><div class="fill" id="stSsdFill" style="width:0%"></div></div>
+      <div class="mtx"><span>Capture corpus</span><span id="stCorpus">…</span></div>
+      <div class="mbar"><div class="fill" id="stCorpusFill" style="width:0%"></div></div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;gap:10px;margin-top:10px">
+        <div class="field"><label>SSD cap · GB (50-400)</label>
+          <input id="stSsdCap" type="number" min="50" max="400" step="1" placeholder="…"></div>
+        <div class="field"><label>Corpus cap · GB (10-200)</label>
+          <input id="stCorpusCap" type="number" min="10" max="200" step="1" placeholder="…"></div>
+      </div>
+      <div class="btnrow" style="margin-top:10px;align-items:center">
+        <button class="btn primary" onclick="applyStorageLimits()">Apply</button>
+        <span class="save-state" id="stState">rank 1 SSD cap stays env-seeded</span>
+      </div>
+    </div>
     <div class="card">
       <h3>Regression probes <span class="hint">results land in Logs</span></h3>
       <div class="btnrow">
@@ -847,6 +864,39 @@ async function applyRuntimeProfile(){
     setText("opProfileState", j.ok ? "applied " + (j.label || p) : (j.error || "failed"));
     toast(j.ok ? "profile applied ✓" : "profile failed ✕");
   }catch(e){ setText("opProfileState", "failed"); toast("profile failed: " + e.message); }
+}
+
+/* ============ storage limits (live caps, rank0) ============ */
+const GIB = 1073741824;
+let apiPort = "8080";   /* refreshed from /api/status config */
+async function applyStorageLimits(){
+  const values = {};
+  const ssdGb = Number(el("stSsdCap").value);
+  const corpusGb = Number(el("stCorpusCap").value);
+  if(el("stSsdCap").value.trim() !== "" && Number.isFinite(ssdGb)) values.prompt_cache_ssd_max_bytes = Math.round(ssdGb*GIB);
+  if(el("stCorpusCap").value.trim() !== "" && Number.isFinite(corpusGb)) values.capture_max_total_bytes = Math.round(corpusGb*GIB);
+  if(!Object.keys(values).length){ setText("stState", "enter a new cap in GB first"); return; }
+  setText("stState", "applying…");
+  try{
+    /* /admin/runtime-tuning is localhost-only on the API server, so this
+       posts to 127.0.0.1 directly (works when the browser runs on the
+       rank0 Mac; elsewhere the server answers 403 by design). */
+    const r = await fetch("http://127.0.0.1:"+apiPort+"/admin/runtime-tuning",
+      {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({values})});
+    const j = await r.json().catch(() => ({}));
+    if(!r.ok){ setText("stState", "✕ "+(j.error || "HTTP "+r.status)); toast("storage caps ✕"); return; }
+    const bits = Object.keys(values).map(k => {
+      const name = k === "prompt_cache_ssd_max_bytes" ? "ssd" : "corpus";
+      const c = (j.clamped || {})[k];
+      if(c) return name+" clamped → "+Math.round(c.applied/GIB)+" GB";
+      if(j.changed && k in j.changed) return name+" applied ✓";
+      return name+" unchanged";
+    });
+    setText("stState", bits.join(" · ")+(j.storage_note ? " · rank 1 stays env-seeded" : ""));
+    toast("storage caps ✓");
+    el("stSsdCap").value = ""; el("stCorpusCap").value = "";
+    refresh();
+  }catch(e){ setText("stState", "✕ "+e.message); toast("storage caps ✕ "+e.message); }
 }
 
 /* ============ charts ============ */
@@ -1527,6 +1577,24 @@ async function refresh(){
   setText("tSsd", ssdMode);
   setText("tSsdNote", ssdMode === "off" ? "disabled; RAM resident cache active"
     : (Number.isFinite(Number(ssd.entry_count)) ? ssd.entry_count+" entries" : "dir pending")+", "+fmt((Number(ssd.total_bytes)||0)/1073741824, 2)+" GB");
+
+  /* storage card (operations) — usage vs live caps */
+  apiPort = cfg.api_port || "8080";
+  const cap = h.capture || {};
+  const ssdUsed = Number(ssd.total_bytes), ssdCap = Number(ssd.max_bytes);
+  el("stSsdFill").style.width = (ssdCap > 0 ? Math.min(100, 100*(ssdUsed||0)/ssdCap) : 0).toFixed(1)+"%";
+  setText("stSsd", Number.isFinite(ssdCap) && ssdCap > 0
+    ? fmt((ssdUsed||0)/GIB, 1)+" / "+fmt(ssdCap/GIB, 0)+" GB" : "—");
+  const corpusUsed = Number(cap.total_bytes), corpusCap = Number(cap.max_total_bytes);
+  el("stCorpusFill").style.width = (corpusCap > 0 ? Math.min(100, 100*(corpusUsed||0)/corpusCap) : 0).toFixed(1)+"%";
+  setText("stCorpus", cap.deployed === false ? "not deployed"
+    : (Number.isFinite(corpusCap) && corpusCap > 0
+      ? fmt((corpusUsed||0)/GIB, 1)+" / "+fmt(corpusCap/GIB, 0)+" GB"
+        +(cap.armed === false ? " · off" : "")
+        +(Number.isFinite(Number(cap.max_request_bytes)) ? " · req "+Math.round(cap.max_request_bytes/1048576)+" MB" : "")
+      : "—"));
+  el("stSsdCap").placeholder = Number.isFinite(ssdCap) && ssdCap > 0 ? String(Math.round(ssdCap/GIB)) : "…";
+  el("stCorpusCap").placeholder = Number.isFinite(corpusCap) && corpusCap > 0 ? String(Math.round(corpusCap/GIB)) : "…";
   const cmap = pc.session_map || {};
   const entries = Array.isArray(cmap.entries) ? cmap.entries : [];
   setText("tCacheMap", entries.length ? entries.length+"/"+(cmap.max_entries || entries.length) : (pc.enabled ? "0" : "off"));

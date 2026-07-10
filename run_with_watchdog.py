@@ -40,6 +40,16 @@ import sys
 import threading
 import time
 
+# EAGLE3-window diagnostic (this dev tree only): `kill -USR2 <worker pid>`
+# dumps every python thread's stack to stderr -> startup.log. This is the
+# python-level view `sample` cannot give (hardened runtime blocks py-spy),
+# and the tool the 2026-07-09 verify-forward deadlock hunt was missing.
+try:
+    import faulthandler
+    faulthandler.register(signal.SIGUSR2, all_threads=True, chain=False)
+except Exception:
+    pass
+
 HEARTBEAT_TIMEOUT = int(os.environ.get("M3_WATCHDOG_TIMEOUT", "240"))
 PREFILL_TIMEOUT = int(os.environ.get("M3_WATCHDOG_PREFILL_TIMEOUT", str(HEARTBEAT_TIMEOUT)))
 # A LIVE prefill ticks the heartbeat every chunk (~13s at 4096); total

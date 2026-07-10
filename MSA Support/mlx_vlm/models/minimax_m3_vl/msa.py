@@ -2515,3 +2515,342 @@ def msa_sparse_decode_b1_mma(
         output_dtypes=[q.dtype],
     )[0]
     return out
+
+
+def _msa_decode_b1_mma_partials(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    topk_idx: mx.array,
+    topk_valid: mx.array,
+    *,
+    q_pos: int,
+    scale: float,
+    block_size: int,
+):
+    """Run the fused MSA sparse-decode SPLIT kernel and return its raw
+    per-(block-split) partials ``(o_partial, lse_partial)``.
+
+    This is the split half of ``msa_sparse_decode_b1_mma`` factored out so the
+    combine step can be swapped: the standard decode path normalizes and drops
+    the LSE, while split-verify needs the per-head log-sum-exp to merge the
+    history region with a separately-computed tail region. The existing
+    ``msa_sparse_decode_b1_mma`` is deliberately left untouched (it is the live
+    L=1 decode hot path); this helper mirrors its validation and dispatch.
+
+    ``o_partial`` has shape ``[topk*SPLITS, H_q, D]`` (softmax-normalized within
+    each part), ``lse_partial`` shape ``[topk*SPLITS, H_q]`` (natural-log units,
+    ``-inf`` for empty/invalid parts).
+    """
+    if _MSA_DECODE_B1_MMA is None:
+        raise RuntimeError("MiniMax MSA decode MMA kernel is unavailable.")
+    if q.ndim != 4:
+        raise ValueError("q must have shape [1, H_q, 1, D].")
+    if k.ndim != 4 or v.ndim != 4:
+        raise ValueError("k and v must have shape [1, H_kv, total_k, D].")
+    if topk_idx.ndim != 4 or topk_valid.ndim != 4:
+        raise ValueError("topk_idx/topk_valid must have shape [1, H_meta, 1, topK].")
+
+    bq, h_q, lq, dim = q.shape
+    bk, h_kv, total_k, k_dim = k.shape
+    bv, v_h_kv, v_total_k, v_dim = v.shape
+    bt, topk_heads, lt, topk = topk_idx.shape
+    if (bq, lq, bk, bv, bt, lt) != (1, 1, 1, 1, 1, 1):
+        raise ValueError("MSA decode MMA partials support only B=1 and L=1.")
+    if (v_h_kv, v_total_k, k_dim, v_dim) != (h_kv, total_k, dim, dim):
+        raise ValueError("K/V shapes must match q head dimension.")
+    if topk_valid.shape != topk_idx.shape:
+        raise ValueError("topk_valid shape must match topk_idx.")
+    if topk_heads not in (1, h_kv):
+        raise ValueError("topk metadata heads must be 1 or H_kv.")
+    if not msa_sparse_decode_b1_mma_eligible(h_q, h_kv, dim, block_size):
+        raise RuntimeError("MSA decode MMA kernel requires D=128 and block_size=128.")
+
+    qhead_per_kv = h_q // h_kv
+    if topk_idx.dtype != mx.int32:
+        topk_idx = topk_idx.astype(mx.int32)
+    if topk_valid.dtype != mx.bool_:
+        topk_valid = topk_valid.astype(mx.bool_)
+    params = mx.array([int(total_k), int(q_pos)], dtype=mx.int32)
+
+    splits = _DECODE_MMA_SPLITS
+    parts = topk * splits
+    threadgroup_size = (qhead_per_kv // 8) * 32
+    work_items = h_kv * parts
+    o_partial, lse_partial = _MSA_DECODE_B1_MMA(
+        inputs=[q, k, v, topk_idx, topk_valid, params, float(scale)],
+        template=[
+            ("T", q.dtype),
+            ("H_Q", h_q),
+            ("H_KV", h_kv),
+            ("D", dim),
+            ("TOPK", topk),
+            ("TOPK_HEADS", topk_heads),
+            ("BLOCK_SIZE", int(block_size)),
+            ("QHEAD_PER_KV", qhead_per_kv),
+            ("SPLITS", splits),
+        ],
+        grid=(work_items * threadgroup_size, 1, 1),
+        threadgroup=(threadgroup_size, 1, 1),
+        output_shapes=[(parts, h_q, dim), (parts, h_q)],
+        output_dtypes=[q.dtype, mx.float32],
+    )
+    return o_partial, lse_partial
+
+
+def msa_sparse_decode_b1_mma_lse(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    topk_idx: mx.array,
+    topk_valid: mx.array,
+    *,
+    q_pos: int,
+    scale: float,
+    block_size: int,
+):
+    """Like :func:`msa_sparse_decode_b1_mma` but also returns the per-head
+    log-sum-exp of the attention scores over the selected blocks.
+
+    Returns ``(out, lse)`` where ``out`` has shape ``[1, H_q, 1, D]`` (identical
+    to ``msa_sparse_decode_b1_mma``) and ``lse`` has shape ``[H_q]`` (float32,
+    natural-log units). The aggregate LSE is exactly the log-sum-exp of the
+    split kernel's per-part LSEs, so no extra Metal kernel is required: the
+    combine kernel already produces the normalized output and the merged
+    normalizer is ``logsumexp(lse_partial, axis=0)``.
+    """
+    o_partial, lse_partial = _msa_decode_b1_mma_partials(
+        q, k, v, topk_idx, topk_valid,
+        q_pos=q_pos, scale=scale, block_size=block_size,
+    )
+    h_q = q.shape[1]
+    dim = q.shape[3]
+    parts = o_partial.shape[0]
+    out = _MSA_DECODE_B1_COMBINE(
+        inputs=[o_partial, lse_partial],
+        template=[
+            ("T", q.dtype),
+            ("H_Q", h_q),
+            ("D", dim),
+            ("PARTS", parts),
+        ],
+        grid=(h_q * dim, 1, 1),
+        threadgroup=(min(256, h_q * dim), 1, 1),
+        output_shapes=[q.shape],
+        output_dtypes=[q.dtype],
+    )[0]
+    lse = mx.logsumexp(lse_partial, axis=0)
+    return out, lse
+
+
+def _split_verify_tail_dense(q, tail_k, tail_v, scale, want_lse):
+    """Dense causal attention over the L-token speculative tail (f32).
+
+    ``q`` is ``[1, H_q, L, D]``; ``tail_k/tail_v`` are ``[1, H_kv, L, D]``.
+    Returns ``out [1, H_q, L, D]`` (f32) and, when ``want_lse``, ``lse
+    [1, H_q, L]`` (natural-log units) for a log-sum-exp merge.
+    """
+    _, h_q, L, dim = q.shape
+    h_kv = tail_k.shape[1]
+    gqa = h_q // h_kv
+    qf = q.astype(mx.float32).reshape(1, h_kv, gqa, L, dim)
+    kf = tail_k.astype(mx.float32).reshape(1, h_kv, 1, L, dim)
+    vf = tail_v.astype(mx.float32).reshape(1, h_kv, 1, L, dim)
+    scores = mx.matmul(qf, kf.swapaxes(-1, -2)) * scale   # [1, H_kv, gqa, L, L]
+    rows = mx.arange(L)[:, None]
+    cols = mx.arange(L)[None, :]
+    causal = cols <= rows                                 # lower-tri incl diag
+    scores = mx.where(causal, scores, mx.array(-float("inf"), mx.float32))
+    probs = mx.softmax(scores, axis=-1)
+    out_t = mx.matmul(probs, vf).reshape(1, h_q, L, dim)
+    if not want_lse:
+        return out_t, None
+    lse_t = mx.logsumexp(scores, axis=-1).reshape(1, h_q, L)
+    return out_t, lse_t
+
+
+def _split_verify_fused(
+    q, k, v, topk_idx, topk_valid, base, scale, block_size,
+    per_query_idx, per_query_valid,
+):
+    """History = per-query fused sparse-decode MMA (keeps LSE); tail = dense
+    causal; merged with a log-sum-exp weighted combine. No KV materialization;
+    cost is ~L x the L=1 decode path (L kernel dispatches)."""
+    _, h_q, L, dim = q.shape
+    history_k = mx.contiguous(k[:, :, :base, :])
+    history_v = mx.contiguous(v[:, :, :base, :])
+
+    out_h_parts = []
+    lse_h_parts = []
+    for i in range(L):
+        q_i = mx.contiguous(q[:, :, i : i + 1, :])
+        if per_query_idx is not None:
+            idx_i = per_query_idx[i]
+            val_i = (
+                per_query_valid[i]
+                if per_query_valid is not None
+                else (idx_i >= 0)
+            )
+        else:
+            idx_i = topk_idx
+            val_i = topk_valid
+        out_i, lse_i = msa_sparse_decode_b1_mma_lse(
+            q_i, history_k, history_v, idx_i, val_i,
+            q_pos=base + i, scale=scale, block_size=block_size,
+        )
+        out_h_parts.append(out_i[:, :, 0, :])  # [1, H_q, D]
+        lse_h_parts.append(lse_i)              # [H_q]
+    out_h = mx.stack(out_h_parts, axis=2)                 # [1, H_q, L, D]
+    lse_h = mx.stack(lse_h_parts, axis=-1)[None]          # [1, H_q, L]
+
+    out_t, lse_t = _split_verify_tail_dense(
+        q, k[:, :, base:, :], v[:, :, base:, :], scale, want_lse=True
+    )
+
+    m = mx.maximum(lse_h, lse_t)                          # [1, H_q, L]
+    w_h = mx.exp(lse_h - m)
+    w_t = mx.exp(lse_t - m)
+    denom = w_h + w_t
+    out = (
+        w_h[..., None] * out_h.astype(mx.float32) + w_t[..., None] * out_t
+    ) / denom[..., None]
+    return out.astype(q.dtype)
+
+
+def _split_verify_gather(
+    q, k, v, topk_idx, topk_valid, base, scale, block_size,
+):
+    """History = gather the shared selected KV blocks (per KV head) ONCE, then
+    a single batched masked SDPA over (selected-history ++ causal-tail) for all
+    L queries. One dispatch instead of L, at the cost of materializing the
+    compact KV; measured faster than the fused loop for verify blocks because
+    the gather amortizes across the L queries. Shared selection only."""
+    _, h_q, L, dim = q.shape
+    h_kv = k.shape[1]
+    gqa = h_q // h_kv
+    topk = topk_idx.shape[-1]
+    topk_heads = topk_idx.shape[1]
+    sel_len = topk * block_size
+
+    # Per-KV-head selected block ids -> token positions. Metadata may be shared
+    # (1 head) or per KV head; broadcast to H_kv either way.
+    idx_hkv = topk_idx[0, :, 0, :]                        # [topk_heads, topk]
+    val_hkv = topk_valid[0, :, 0, :]
+    if topk_heads == 1:
+        idx_hkv = mx.broadcast_to(idx_hkv, (h_kv, topk))
+        val_hkv = mx.broadcast_to(val_hkv, (h_kv, topk))
+    off = mx.arange(block_size, dtype=mx.int32)
+    tok = (
+        mx.maximum(idx_hkv, 0).astype(mx.int32)[:, :, None] * block_size
+        + off[None, None, :]
+    )                                                    # [H_kv, topk, block]
+    slot_ok = (val_hkv[:, :, None] & (tok < base)).reshape(h_kv, sel_len)
+    tok = mx.clip(tok.reshape(h_kv, sel_len), 0, base - 1)
+
+    ck_parts, cv_parts = [], []
+    for h in range(h_kv):
+        g = mx.broadcast_to(tok[h][:, None], (sel_len, dim))
+        ck_parts.append(mx.take_along_axis(k[0, h], g, axis=0))
+        cv_parts.append(mx.take_along_axis(v[0, h], g, axis=0))
+    ck = mx.stack(ck_parts, axis=0)[None]                # [1, H_kv, sel_len, D]
+    cv = mx.stack(cv_parts, axis=0)[None]
+    ck = mx.concatenate([ck, k[:, :, base:, :]], axis=2)  # ++ tail
+    cv = mx.concatenate([cv, v[:, :, base:, :]], axis=2)
+
+    # Additive mask [1, H_q, L, sel_len+L]: history slots valid per KV head
+    # (invalid/out-of-range gathered slots masked out), tail causal.
+    ti = mx.arange(L)[:, None]
+    tj = mx.arange(L)[None, :]
+    tail_ok = mx.broadcast_to((tj <= ti)[None], (h_kv, L, L))
+    hist_ok = mx.broadcast_to(slot_ok[:, None, :], (h_kv, L, sel_len))
+    allowed = mx.concatenate([hist_ok, tail_ok], axis=2)  # [H_kv, L, sel_len+L]
+    bias = mx.where(
+        allowed, mx.array(0.0, mx.float32), mx.array(-float("inf"), mx.float32)
+    )
+    bias = mx.repeat(bias[None], gqa, axis=1).astype(q.dtype)  # -> [1, H_q, L, S]
+    return mx.fast.scaled_dot_product_attention(
+        q, ck, cv, scale=scale, mask=bias
+    )
+
+
+def msa_split_verify_attention(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    topk_idx: mx.array,
+    topk_valid: mx.array,
+    *,
+    base: int,
+    scale: float,
+    block_size: int,
+    impl: str = "fused",
+    per_query_idx: Optional[mx.array] = None,
+    per_query_valid: Optional[mx.array] = None,
+) -> mx.array:
+    """Split-KV verify attention for a short block of ``L`` query tokens.
+
+    Each verify query attends over the full cache ``[0, base+L)``. Rather than
+    a dense masked attention over the whole context (the fallback that
+    dominates EAGLE3 verify cost), the attention is restricted to two regions
+    whose union softmax equals the sparse attention the model uses at decode:
+
+    * HISTORY ``[0, base)`` — the top-k selected blocks (shared across the L
+      queries, or per-query). All history positions precede every query, so no
+      causal masking is needed here; the selection reproduces the model's L=1
+      decode block-sparsity.
+    * TAIL ``[base, base+L)`` — the speculative tokens themselves, attended
+      DENSELY with causal masking (query ``i`` sees tail positions ``<= i``).
+
+    Two implementations, selectable with ``impl``:
+
+    * ``"fused"`` (default) — history via the fused sparse-decode MMA kernel,
+      one call per query keeping per-head LSE, merged with the tail by a
+      log-sum-exp weighted combine (flash-decoding split-KV). No KV
+      materialization; ~L x the L=1 decode cost.
+    * ``"gather"`` — gather the (shared) selected KV blocks once and run a
+      single batched masked SDPA over history++tail for all L queries. One
+      dispatch; materializes compact KV. Measured faster for verify blocks;
+      shared selection only.
+
+    Args:
+        q: ``[1, H_q, L, D]`` RoPE'd queries for the verify block.
+        k, v: ``[1, H_kv, base+L, D]`` full cache (history ++ speculative tail).
+        topk_idx, topk_valid: ``[1, H_meta, 1, topk]`` block selection over the
+            history (``H_meta`` in ``{1, H_kv}``). Ignored for the fused path
+            when ``per_query_idx`` is provided.
+        base: history length (cache offset before the speculative block).
+        impl: ``"fused"`` or ``"gather"``.
+        per_query_idx, per_query_valid: optional length-``L`` per-query
+            selections (fused path only); when ``None`` selection is shared.
+
+    Returns:
+        ``[1, H_q, L, D]`` attention output (same dtype as ``q``).
+    """
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("q/k/v must be 4-D [1, H, *, D].")
+    B, h_q, L, dim = q.shape
+    _, h_kv, total_k, _ = k.shape
+    if B != 1:
+        raise ValueError("split-verify supports only B=1.")
+    if base < 0 or base > total_k:
+        raise ValueError("base must lie within the cache length.")
+    if total_k - base != L:
+        raise ValueError("k/v must hold exactly base+L positions (history++tail).")
+    if h_q % h_kv != 0:
+        raise ValueError("H_q must be divisible by H_kv.")
+
+    _stat("split_verify_calls")
+    if impl == "gather":
+        if per_query_idx is not None:
+            raise ValueError("gather impl supports shared selection only.")
+        _stat("split_verify_gather_calls")
+        return _split_verify_gather(
+            q, k, v, topk_idx, topk_valid, base, scale, block_size
+        )
+    if impl != "fused":
+        raise ValueError(f"unknown split-verify impl {impl!r} (fused|gather).")
+    _stat("split_verify_fused_calls")
+    return _split_verify_fused(
+        q, k, v, topk_idx, topk_valid, base, scale, block_size,
+        per_query_idx, per_query_valid,
+    )

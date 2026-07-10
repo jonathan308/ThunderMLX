@@ -41,6 +41,8 @@ FILES=(
   dashboard.html
   launch_cluster.sh
   m3_batch_cancel.py
+  m3_capture.py
+  m3_eagle3.py
   m3_pipeline_patch.py
   m3_warmup.py
   run_with_watchdog.py

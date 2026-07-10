@@ -462,7 +462,7 @@ def _runtime_prompt_cache_reuse_bucket_tokens():
         return int(value)
 
 
-def _set_runtime_tuning(values):
+def _set_runtime_tuning(values, clamped_out=None):
     allowed = {
         "prefill_step_size": (128, 16384),
         "long_context_decode_eval_tokens": (0, 1_000_000),
@@ -483,6 +483,16 @@ def _set_runtime_tuning(values):
         "decode_topk_reuse_tokens": (0, 64),
         "compact_decode_sort_topk": (0, 1),
     }
+    # Storage caps: same pattern, except out-of-range integers CLAMP to the
+    # guard rails (reported via clamped_out) instead of erroring; garbage
+    # still raises -> 400. See the _STORAGE_TUNING_KEYS notes.
+    allowed.update(_STORAGE_TUNING_RANGES)
+    capture = _capture_module()
+    for key in ("capture_max_request_bytes", "capture_max_total_bytes"):
+        if key in values and capture is None:
+            raise ValueError(
+                f"{key} requires the m3_capture module, which is not deployed"
+            )
     changed = {}
     with _runtime_tuning_lock:
         proposed = dict(_runtime_tuning)
@@ -494,7 +504,12 @@ def _set_runtime_tuning(values):
                 intval = int(value)
             except Exception as exc:
                 raise ValueError(f"{key} must be an integer") from exc
-            if intval < lo or intval > hi:
+            if key in _STORAGE_TUNING_KEYS:
+                clamped = max(lo, min(hi, intval))
+                if clamped != intval and clamped_out is not None:
+                    clamped_out[key] = {"requested": intval, "applied": clamped}
+                intval = clamped
+            elif intval < lo or intval > hi:
                 suffix = ""
                 if key == "long_context_decode_eval_every" and not ALLOW_UNSAFE_RUNTIME_TUNING:
                     suffix = (
@@ -537,6 +552,15 @@ def _set_runtime_tuning(values):
             )
         for key, intval in changed.items():
             _runtime_tuning[key] = intval
+    # Push capture caps into m3_capture so its per-flush/finalize checks see
+    # them (capture can only be non-None here: absent module raised above).
+    if capture is not None and (
+        "capture_max_request_bytes" in changed or "capture_max_total_bytes" in changed
+    ):
+        capture.set_limits(
+            max_request_bytes=changed.get("capture_max_request_bytes"),
+            max_total_bytes=changed.get("capture_max_total_bytes"),
+        )
     return changed
 
 
@@ -933,6 +957,70 @@ PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS = float(
     os.environ.get("MLX_M3_PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS", "10")
     or "10"
 )
+
+# ---- Live-tunable storage caps (dashboard "Storage" card) ------------------
+# rank0's /admin/runtime-tuning adjusts these without a restart. Boot seeds
+# from the env vars; the ENFORCEMENT sites re-read the mutables every time
+# (_prompt_cache_ssd_prune_unlocked here; m3_capture re-reads its settings
+# dict per flush/finalize). Out-of-range integers CLAMP to these guard rails
+# instead of erroring; garbage still 400s. Intentionally rank0-local: the
+# tuning broadcast skips these keys, so rank1's SSD prune keeps its
+# env-seeded cap (its disk budget differs) and capture-corpus writes only
+# ever happen on rank0.
+_STORAGE_TUNING_KEYS = frozenset({
+    "prompt_cache_ssd_max_bytes",
+    "capture_max_request_bytes",
+    "capture_max_total_bytes",
+})
+_STORAGE_TUNING_RANGES = {
+    "prompt_cache_ssd_max_bytes": (50 << 30, 400 << 30),  # 50-400 GiB
+    "capture_max_request_bytes": (50 << 20, 1 << 30),     # 50 MiB-1 GiB
+    "capture_max_total_bytes": (10 << 30, 200 << 30),     # 10-200 GiB
+}
+
+
+def _capture_module():
+    """m3_capture is optional (the golden tree does not ship it); resolve it
+    lazily so the capture tunables cleanly report "not deployed" without it."""
+    try:
+        import m3_capture
+        return m3_capture
+    except ImportError:
+        return None
+
+
+_capture_boot = _capture_module()
+with _runtime_tuning_lock:
+    _runtime_tuning["prompt_cache_ssd_max_bytes"] = int(PROMPT_CACHE_SSD_MAX_BYTES)
+    if _capture_boot is not None:
+        for _tuning_key, _cap_key in (
+            ("capture_max_request_bytes", "max_request_bytes"),
+            ("capture_max_total_bytes", "max_total_bytes"),
+        ):
+            _runtime_tuning[_tuning_key] = int(_capture_boot.settings()[_cap_key])
+del _capture_boot
+
+
+def _runtime_prompt_cache_ssd_max_bytes():
+    with _runtime_tuning_lock:
+        value = _runtime_tuning.get("prompt_cache_ssd_max_bytes")
+        if value is None:
+            return int(PROMPT_CACHE_SSD_MAX_BYTES)
+        return int(value)
+
+
+def _capture_corpus_status():
+    """Capture-corpus usage + caps for /health (same role as the SSD stats,
+    sourced from m3_capture's module state). Absent module => not deployed."""
+    capture = _capture_module()
+    if capture is None:
+        return {"deployed": False}
+    try:
+        return {"deployed": True, **capture.status()}
+    except Exception as e:
+        return {"deployed": True, "error": str(e)}
+
+
 VISIBLE_TRANSCRIPT_PREWARM_ENABLED = os.environ.get(
     "MLX_M3_VISIBLE_TRANSCRIPT_PREWARM", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -2055,9 +2143,12 @@ def _prompt_cache_ssd_prune_unlocked(reason="prune"):
             remove_hashes.add(row["session_hash"])
     remaining = [row for row in entries if row["session_hash"] not in remove_hashes]
     total = sum(int(row.get("bytes") or 0) for row in remaining)
-    if PROMPT_CACHE_SSD_MAX_BYTES > 0 and total > PROMPT_CACHE_SSD_MAX_BYTES:
+    # Re-read the live-tunable cap on every prune (env-seeded at boot; rank0's
+    # runtime-tuning endpoint can move it, rank1 keeps the env default).
+    ssd_max_bytes = _runtime_prompt_cache_ssd_max_bytes()
+    if ssd_max_bytes > 0 and total > ssd_max_bytes:
         for row in sorted(remaining, key=lambda r: float(r.get("last_access_at") or 0.0)):
-            if total <= PROMPT_CACHE_SSD_MAX_BYTES:
+            if total <= ssd_max_bytes:
                 break
             remove_hashes.add(row["session_hash"])
             total -= int(row.get("bytes") or 0)
@@ -2646,7 +2737,7 @@ def _prompt_cache_ssd_status_unlocked(force_scan=False):
         "total_bytes": scan.get("total_bytes"),
         "entries": (scan.get("entries") or [])[:PROMPT_CACHE_SSD_RECENT_ENTRIES],
         "ttl_seconds": PROMPT_CACHE_SSD_TTL_SECONDS,
-        "max_bytes": PROMPT_CACHE_SSD_MAX_BYTES,
+        "max_bytes": _runtime_prompt_cache_ssd_max_bytes(),
         "min_tokens": PROMPT_CACHE_SSD_MIN_TOKENS,
         "status_scan_interval_seconds": PROMPT_CACHE_SSD_STATUS_SCAN_INTERVAL_SECONDS,
         "save_reasoning": PROMPT_CACHE_SSD_SAVE_REASONING,
@@ -5816,6 +5907,9 @@ def _generation_defaults_status():
         ),
         "prompt_cache_ssd_ttl_seconds": PROMPT_CACHE_SSD_TTL_SECONDS,
         "prompt_cache_ssd_max_bytes": PROMPT_CACHE_SSD_MAX_BYTES,
+        "effective_prompt_cache_ssd_max_bytes": runtime_tuning.get(
+            "prompt_cache_ssd_max_bytes", PROMPT_CACHE_SSD_MAX_BYTES
+        ),
         "prompt_cache_ssd_min_tokens": PROMPT_CACHE_SSD_MIN_TOKENS,
     }
 
@@ -8383,12 +8477,11 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
             if allowed and name not in allowed:
                 continue
             raw_body = match.group("body") or ""
-            # Landmine guard (2026-07-09): 'body' is only assigned in the
-            # repair branch below; the empty-args salvage at the bottom of
-            # the loop referenced it after fast-path parses too. On rank0
-            # the UnboundLocalError was caught and stripped; on rank1 it
-            # killed the mirror -> cache divergence -> pipeline wedge.
-            body = None
+            # Bound for the empty-args salvage at the bottom of the loop: the
+            # fast paths skip the repair branch that otherwise assigns it
+            # (UnboundLocalError wedge, 2026-07-09 — rank1 died, cache
+            # diverged, next request deadlocked).
+            body = raw_body
             # Payload-safe fast path: when the body carries one balanced JSON
             # object, take it verbatim. The repair chain below rewrites tags
             # (_normalize_body) and slices on tag-like boundaries
@@ -8494,7 +8587,12 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                         # survives. The usable-turn ladder regenerates it.
                         continue
                     loose_args = _arguments_from_loose_segments(body, ns_token, tools, item_name)
-                    if loose_args is None:
+                    # Empty/None salvage -> skip the call entirely so the
+                    # usable-turn retry ladder regenerates it, matching the
+                    # pre-2026-07-09 behavior (this branch used to crash and
+                    # the whole parse was retried; emitting a degraded call
+                    # here would skip that ladder).
+                    if not loose_args:
                         continue
                     args = json.dumps(loose_args, ensure_ascii=False)
                 calls.append(_openai_tool_call(item_name, args, len(calls)))
@@ -8898,6 +8996,74 @@ def _has_model_facing_reasoning(content):
 _BATCH_PATH_ACTIVE = {"value": False}
 
 
+def _capture_prompt_ids(gen_kwargs):
+    """The ids fed during prefill: the suffix ids under prompt caching, else the
+    tokenized prompt. Length must equal the captured prompt positions for the
+    prompt_*.npz file to be written (m3_capture guards a mismatch)."""
+    iid = gen_kwargs.get("input_ids")
+    if iid is not None:
+        try:
+            return [int(x) for x in iid.reshape(-1).tolist()]
+        except Exception:
+            return None
+    try:
+        processor = gen_kwargs.get("processor")
+        prompt = gen_kwargs.get("prompt")
+        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        return list(tok.encode(prompt))
+    except Exception:
+        return None
+
+
+def _capture_only_iter(m3_capture, gen_kwargs, it):
+    """rank0 capture-only tee: pass every GenerationResult through untouched
+    while recording the sampled token stream, then write the request's corpus
+    files on completion. Token counting mirrors run_generation (dedup by
+    generation_tokens) so K == the number of decode captures; m3_capture
+    recovers the prompt/decode split as n_prompt = N_captured - K.
+
+    Exit discipline: a clean finish or an early consumer stop (GeneratorExit,
+    e.g. client disconnect/stop — the last forward already completed) both
+    finalize the on-distribution sequence; a genuine generation error abandons
+    the partial (possibly misaligned) accumulator."""
+    prompt_ids = _capture_prompt_ids(gen_kwargs)
+    m3_capture.begin_request()
+    tokens = []
+    seen = 0
+    try:
+        for response in it:
+            gtoks = int(getattr(response, "generation_tokens", 0) or 0)
+            tok = getattr(response, "token", None)
+            if tok is not None and gtoks > seen:
+                tokens.append(int(tok))
+                seen = gtoks
+            yield response
+    except GeneratorExit:
+        m3_capture.finalize_request(prompt_ids, tokens)
+        raise
+    except BaseException:
+        m3_capture.abort_request()
+        raise
+    else:
+        m3_capture.finalize_request(prompt_ids, tokens)
+
+
+def _maybe_capture_wrap(rank, gen_kwargs, it):
+    """Wrap the non-eagle generator with the capture-only tee when armed. Only
+    rank0 accumulates/writes; rank1 rides the pipeline piggyback (env-gated in
+    m3_pipeline_patch) but returns the raw iterator. Default OFF => returns `it`
+    unchanged, zero behavioral change."""
+    if rank != 0:
+        return it
+    try:
+        import m3_capture
+    except Exception:
+        return it
+    if not m3_capture.armed():
+        return it
+    return _capture_only_iter(m3_capture, gen_kwargs, it)
+
+
 def _generation_iter(rank, gen_kwargs):
     """The request's token generator: upstream stream_generate, or the
     step-synchronous batch-cancel mirror loop when MLX_M3_BATCH_CANCEL=1.
@@ -8909,19 +9075,31 @@ def _generation_iter(rank, gen_kwargs):
     """
     from mlx_vlm.generate import stream_generate
     import m3_batch_cancel
+    import m3_eagle3
 
     _BATCH_PATH_ACTIVE["value"] = False
+    # EAGLE3 speculative path (2026-07-09): per-request decision travels in
+    # the broadcast request op (REQUEST_ACTIVE is set from it on BOTH ranks
+    # before run_generation), so the generator choice is always symmetric.
+    if m3_eagle3.enabled() and m3_eagle3.REQUEST_ACTIVE.get("value"):
+        try:
+            it = m3_eagle3.eagle3_stream_generate(rank=rank, **gen_kwargs)
+            logger.info("rank %s: eagle3 speculative path active", rank)
+            return it
+        except m3_eagle3.Unsupported as e:
+            logger.info("rank %s: eagle3 unsupported for request (%s); "
+                        "falling through", rank, e)
     if m3_batch_cancel.enabled():
         try:
             it = m3_batch_cancel.batch_cancel_stream_generate(
                 rank=rank, **gen_kwargs
             )
             _BATCH_PATH_ACTIVE["value"] = True
-            return it
+            return _maybe_capture_wrap(rank, gen_kwargs, it)
         except m3_batch_cancel.Unsupported as e:
             logger.info("rank %s: batch-cancel unsupported for request (%s); "
                         "using stream_generate", rank, e)
-    return stream_generate(**gen_kwargs)
+    return _maybe_capture_wrap(rank, gen_kwargs, stream_generate(**gen_kwargs))
 
 
 def run_generation(model, processor, prompt, max_tokens, rank, image=None,
@@ -10802,6 +10980,7 @@ def run_http_server(model, processor, rank):
                 "requests_completed": snapshot["completed"],
                 "requests_failed": snapshot["failed"],
                 "prompt_cache": _prompt_cache_status(),
+                "capture": _capture_corpus_status(),
                 "lifetime_tokens": _lifetime_with_active(snapshot, active),
                 "last_request": snapshot.get("last_request"),
                 "last_meaningful_request": snapshot.get("last_meaningful_request"),
@@ -10827,6 +11006,33 @@ def run_http_server(model, processor, rank):
             cleared = len(request_state.get("recent_requests") or [])
             request_state["recent_requests"] = []
         return {"ok": True, "cleared": cleared, "recent_request_stats": _history_stats([])}
+
+    @app.post("/admin/eagle3")
+    async def admin_eagle3_toggle(req: Request):
+        """Dashboard toggle for the EAGLE3 speculative path. The flag is
+        read by rank 0 per request and travels in the broadcast request op,
+        so flipping it mid-session can never desync the ranks."""
+        import m3_eagle3 as _m3e3
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        if "enabled" in (body or {}):
+            _m3e3.RUNTIME_ENABLED["value"] = bool(body["enabled"])
+        return {
+            "armed": _m3e3.enabled(),
+            "enabled": bool(_m3e3.RUNTIME_ENABLED.get("value")),
+            "stats": _m3e3.acceptance_stats(),
+        }
+
+    @app.get("/admin/eagle3")
+    async def admin_eagle3_status():
+        import m3_eagle3 as _m3e3
+        return {
+            "armed": _m3e3.enabled(),
+            "enabled": bool(_m3e3.RUNTIME_ENABLED.get("value")),
+            "stats": _m3e3.acceptance_stats(),
+        }
 
     @app.post("/admin/shutdown")
     async def admin_shutdown(req: Request):
@@ -11202,14 +11408,23 @@ def run_http_server(model, processor, rank):
                     {k: values[k] for k in decode_state_keys if k in values},
                 )
 
+        clamped = {}
         try:
-            changed = _set_runtime_tuning(values or {})
+            changed = _set_runtime_tuning(values or {}, clamped_out=clamped)
         except ValueError as exc:
             return JSONResponse(status_code=400, content={"error": str(exc)})
         try:
+            # Storage caps are rank0-local by design: rank1's SSD prune keeps
+            # its env-seeded cap (different disk budget) and capture-corpus
+            # writes only happen on rank0, so those keys never ride the
+            # tuning broadcast.
             _bcast({
                 "op": "runtime_tuning",
-                "values": _runtime_tuning_status(),
+                "values": {
+                    key: value
+                    for key, value in _runtime_tuning_status().items()
+                    if key not in _STORAGE_TUNING_KEYS
+                },
             }, rank)
         except Exception as e:
             _set_runtime_tuning(previous)
@@ -11221,14 +11436,21 @@ def run_http_server(model, processor, rank):
             )
         model_tuning = _apply_runtime_model_tuning(model)
         logger.info("localhost runtime tuning updated: %s", changed)
-        return {
+        response = {
             "ok": True,
             "changed": changed,
+            "clamped": clamped,
             "cache_reset_before_tuning": cache_reset_before_tuning,
             "model_tuning": model_tuning,
             "runtime_tuning": _runtime_tuning_status(),
             "generation_defaults": _generation_defaults_status(),
         }
+        if any(key in _STORAGE_TUNING_KEYS for key in (values or {})):
+            response["storage_note"] = (
+                "storage caps are rank0-local: rank1's SSD prune keeps its "
+                "env-seeded cap until the next restart re-reads .env.local"
+            )
+        return response
 
     @app.post("/v1/stop")
     @app.post("/stop")
@@ -11517,6 +11739,10 @@ def run_http_server(model, processor, rank):
             # them to the short chat default guarantees truncated, unusable
             # tool emissions (observed: 512-token cap eaten by narration).
             and not tools
+            # Thinking turns burn the whole short budget on reasoning and
+            # come back incomplete with empty content (512/512 mid-think,
+            # 2026-07-09 zcode sidecars) — only clamp when thinking is off.
+            and thinking_mode != "enabled"
             and NONSTREAM_DEFAULT_MAX_TOKENS > 0
             and max_tokens > NONSTREAM_DEFAULT_MAX_TOKENS
         ):
@@ -11585,6 +11811,13 @@ def run_http_server(model, processor, rank):
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 new request")
 
+        import m3_eagle3 as _m3e3
+        _eagle3_on = bool(
+            _m3e3.enabled()
+            and _m3e3.RUNTIME_ENABLED.get("value")
+            and not image_sources
+        )
+        _m3e3.REQUEST_ACTIVE["value"] = _eagle3_on
         rank_request = {"stop_nonce": uuid.uuid4().hex,
                         "prompt": prompt, "max_tokens": max_tokens,
                         "thinking_mode": thinking_mode,
@@ -11593,6 +11826,7 @@ def run_http_server(model, processor, rank):
                         "token_ids": request_token_ids,
                         "session_id": cache_session_id,
                         "session_source": cache_session_source,
+                        "eagle3": _eagle3_on,
                         "tools": tools,
                         # Tool-bearing requests are buffered and parsed after
                         # decode, so reaching max_tokens can leave no visible
@@ -12860,6 +13094,8 @@ def run_mirror(model, processor, rank):
         _clear_prefill_stop_file("rank 1 new request")
         _STOP_NONCE["value"] = req.get("stop_nonce")
         _FORCE_EOS["active"] = False
+        import m3_eagle3 as _m3e3
+        _m3e3.REQUEST_ACTIVE["value"] = bool(req.get("eagle3"))
 
         thinking_mode = req.get("thinking_mode", "adaptive")
         mirror_tools = req.get("tools")
