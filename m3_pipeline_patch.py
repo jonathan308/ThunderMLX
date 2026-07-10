@@ -23,11 +23,45 @@ Run this under mlx.launch so each rank gets a distributed group.
 """
 from __future__ import annotations
 import os
+import sys
 
 import mlx.core as mx
 
 
 _PIPELINE_GROUP = None
+
+# The eagle piggyback prints one [e3dbg] send/recv line per forward. That was a
+# deadlock-hunt diagnostic; under capture-only it fires every token, so gate it
+# behind an env (default off). Eagle rounds are rare enough that losing the
+# line by default is fine; set MLX_M3_EAGLE3_PIPE_DEBUG=1 to restore it.
+_E3_PIPE_DEBUG = os.environ.get(
+    "MLX_M3_EAGLE3_PIPE_DEBUG", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Fast gate read once at import: when unset (default), the capture-only hook in
+# _patched_call is skipped entirely — no m3_capture import, no per-forward work,
+# byte-identical to before. Both ranks read the same whitelisted env.
+_CAPTURE_ONLY_ENV = os.environ.get(
+    "MLX_M3_EAGLE3_CAPTURE_ONLY", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_CAPTURE_MOD = {"mod": None, "tried": False}
+
+
+def _capture_module():
+    """Import-and-cache m3_capture. MUST resolve on BOTH ranks so the capture
+    piggyback rides symmetrically (rank1 ships even though only rank0 keeps the
+    data); rank1 has no server wrapper to import it otherwise. Import is cheap
+    and dependency-free (mlx + stdlib), so failure just means capture-only off."""
+    if not _CAPTURE_MOD["tried"]:
+        _CAPTURE_MOD["tried"] = True
+        try:
+            import m3_capture as _m
+            _CAPTURE_MOD["mod"] = _m
+        except Exception:
+            _CAPTURE_MOD["mod"] = None
+    return _CAPTURE_MOD["mod"]
 
 # Chunked-prefill overlap (docs/DESIGN-chunk-overlap-native.md): while
 # m3_batch_cancel's depth-2 prefill pipeline drives the model, rank1's
@@ -212,15 +246,81 @@ def apply_pipeline_patch():
 
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
 
+        # Capture-only piggyback synthesis (feature/capture-only): when eagle is
+        # NOT driving this forward (no capture ids passed) but capture-only is
+        # armed, synthesize the SAME capture set the eagle path would use, so the
+        # boundary piggyback rides every normal forward. The decision is a pure
+        # function of shared env (forward_capture_active) + the rank's layer
+        # range, so both ranks derive identical _remote_caps/_ship_caps and the
+        # collective schedule stays lockstep. rank0 collects the concat into a
+        # private sink and hands it to m3_capture; the caller's hidden_sink stays
+        # untouched (it is None on the normal decode path).
+        _cap_only_sink = None
+        _capmod = None
+        if _CAPTURE_ONLY_ENV and not capture_set:
+            _capmod = _capture_module()
+            if _capmod is not None and _capmod.forward_capture_active():
+                capture_set = _capmod.capture_layers_set()
+                _cap_only_sink = []
+        # Effective capture sink: the caller's when eagle passes one, else the
+        # capture-only private sink. Leaves eagle behavior byte-identical.
+        _sink = hidden_sink if hidden_sink is not None else _cap_only_sink
+
+        # EAGLE3 capture piggyback (2026-07-09): captures for layers owned by
+        # EARLIER ranks (rank1 owns 0..start_idx-1 in the 2-rank split) ride
+        # the boundary send this forward already performs — the sender
+        # concatenates [h, *its captured hiddens] on the feature axis and the
+        # receiver splits. Zero new collectives, so the schedule stays
+        # identical to the proven decode path. Both sides derive the widths
+        # deterministically from (capture_set, start_idx/end_idx). Inactive
+        # (empty capture_set) leaves every shape byte-identical to before.
+        _remote_caps = (
+            sorted(i for i in capture_set if i < self.start_idx)
+            if capture_set
+            else []
+        )
+        _ship_caps = (
+            sorted(
+                i for i in capture_set
+                if self.start_idx <= i < (self.end_idx or self.start_idx)
+            )
+            if (capture_set and self.pipeline_rank != 0)
+            else []
+        )
+        _shipped_hiddens = {}
+
         # Receive hidden states from the next rank (rank+1 processes earlier layers)
         if self.pipeline_rank < self.pipeline_size - 1:
-            h = mx.distributed.recv_like(h, self.pipeline_rank + 1)
+            if _remote_caps:
+                width = h.shape[-1]
+                template = mx.zeros(
+                    (h.shape[0], h.shape[1], width * (1 + len(_remote_caps))),
+                    dtype=h.dtype,
+                )
+                if _E3_PIPE_DEBUG:
+                    print(
+                        f"[e3dbg] rank{self.pipeline_rank} RECV template "
+                        f"shape={tuple(template.shape)} dtype={template.dtype}",
+                        flush=True,
+                    )
+                packed = mx.distributed.recv_like(template, self.pipeline_rank + 1)
+                h = packed[..., :width]
+                if _sink is not None:
+                    for _j in range(len(_remote_caps)):
+                        _sink.append(
+                            packed[..., (1 + _j) * width : (2 + _j) * width]
+                        )
+            else:
+                h = mx.distributed.recv_like(h, self.pipeline_rank + 1)
 
         for local_idx, (layer, c) in enumerate(zip(players, cache)):
             h = layer(h, mask, c, position_ids=position_ids)
             global_idx = self.start_idx + local_idx
-            if hidden_sink is not None and global_idx in capture_set:
-                hidden_sink.append(h)
+            if global_idx in capture_set:
+                if global_idx in _ship_caps:
+                    _shipped_hiddens[global_idx] = h
+                elif _sink is not None:
+                    _sink.append(h)
             if layer_eval_every > 0 and (local_idx + 1) % layer_eval_every == 0:
                 # Break long lazy decode graphs into smaller Metal submissions.
                 # This is slower, but prevents rank 1 from hitting macOS GPU
@@ -229,7 +329,25 @@ def apply_pipeline_patch():
 
         # Send our output to the previous rank (rank-1 processes later layers)
         if self.pipeline_rank != 0:
-            h = mx.distributed.send(h, (self.pipeline_rank - 1) % self.pipeline_size)
+            if _ship_caps:
+                _orig_width = h.shape[-1]
+                packed = mx.concatenate(
+                    [h] + [_shipped_hiddens[g] for g in _ship_caps], axis=-1
+                )
+                if _E3_PIPE_DEBUG:
+                    print(
+                        f"[e3dbg] rank{self.pipeline_rank} SEND packed "
+                        f"shape={tuple(packed.shape)} dtype={packed.dtype}",
+                        flush=True,
+                    )
+                packed = mx.distributed.send(
+                    packed, (self.pipeline_rank - 1) % self.pipeline_size
+                )
+                # Downstream (dummy-logits return path) must see the original
+                # width; slicing the SEND RESULT keeps the send dependency.
+                h = packed[..., :_orig_width]
+            else:
+                h = mx.distributed.send(h, (self.pipeline_rank - 1) % self.pipeline_size)
             if cache:
                 # Match the official MLX pipeline pattern: depend only the
                 # final owned cache on the send. Depending every layer cache on
@@ -256,6 +374,15 @@ def apply_pipeline_patch():
             h = self.norm(h)
         if hidden_sink is not None and not capture_set:
             hidden_sink.append(h)
+        # Capture-only: rank0 concatenates this forward's capture layers on the
+        # feature axis ([seg0,seg1,seg2] -> D_concat) and hands them to
+        # m3_capture. Lazy (no eval here); m3_capture drops it if no request is
+        # active or the request is over its cap.
+        if _cap_only_sink and _capmod is not None:
+            try:
+                _capmod.push(mx.concatenate(_cap_only_sink, axis=-1))
+            except Exception:
+                pass
         return h
 
     MiniMaxM3Model.__call__ = _patched_call

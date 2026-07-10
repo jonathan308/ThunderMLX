@@ -35,6 +35,7 @@ from .msa import (
     msa_sparse_decode_b1,
     msa_sparse_decode_b1_mma,
     msa_sparse_decode_b1_mma_eligible,
+    msa_split_verify_attention,
 )
 
 _MSA_PREFILL_ENABLED = _msa_os.environ.get(
@@ -52,6 +53,18 @@ _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK = int(
 _MSA_K1_IMPL = _msa_os.environ.get(
     "MLX_M3_MSA_K1_IMPL", "auto"
 ).strip().lower()
+_MSA_PREFILL_MIN_L = int(
+    _msa_os.environ.get("MLX_M3_MSA_PREFILL_MIN_L", "16") or "16"
+)
+# Blockwise builder only when the standard builder's (L x kv) fp32 score
+# matrix would be heavy; below this the standard builder is faster because
+# it has no per-chunk full-kv sweep. 64MB ~= L=1024 @ 16k kv.
+_MSA_PREFILL_BLOCKWISE_TOPK_MIN_SCORE_BYTES = int(
+    _msa_os.environ.get(
+        "MLX_M3_MSA_PREFILL_BLOCKWISE_MIN_SCORE_BYTES", str(64 * 1024 * 1024)
+    )
+    or str(64 * 1024 * 1024)
+)
 # Sparse-decode crossover: take the compact top-k decode path when
 # key_length >= selected_length * FACTOR. Upstream hardcoded 64 (no mask) /
 # 16 (masked) — i.e. sparse decode only above 131k context — measured on
@@ -79,6 +92,34 @@ _FUSED_SPARSE_DECODE_MIN_KV = int(
 _DECODE_TOPK_REUSE_TOKENS = max(
     0,
     int(_msa_os.environ.get("MLX_M3_DECODE_TOPK_REUSE_TOKENS", "0") or "0"),
+)
+# Split-verify (ThunderMLX): short EAGLE3 verify blocks (2<=L<=8) currently
+# fall to DENSE masked attention over the full context whenever the one-pass
+# sparse-prefill kernel is ineligible (below its key_length crossover). Split
+# each verify query into a fused sparse HISTORY region [0,base) + a dense
+# causal TAIL [base,base+L), merged by log-sum-exp — replacing that dense
+# fallback with sparse-decode-cost attention. DEFAULT OFF: live behaviour is
+# unchanged until armed. Positioned to only replace the dense fallback; the
+# faster one-pass sparse kernel (ctx >= its threshold) is never displaced, so
+# an armed split-verify only ever improves the low-context dense regime.
+_SPLIT_VERIFY_ENABLED = _msa_os.environ.get(
+    "MLX_M3_SPLIT_VERIFY", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_SPLIT_VERIFY_IMPL = _msa_os.environ.get(
+    "MLX_M3_SPLIT_VERIFY_IMPL", "gather"
+).strip().lower()
+_SPLIT_VERIFY_MIN_L = int(
+    _msa_os.environ.get("MLX_M3_SPLIT_VERIFY_MIN_L", "2") or "2"
+)
+_SPLIT_VERIFY_MAX_L = int(
+    _msa_os.environ.get("MLX_M3_SPLIT_VERIFY_MAX_L", "8") or "8"
+)
+# Only fire below this total-context ceiling: at/above it the live one-pass
+# sparse-prefill kernel already handles verify faster than split-verify, so
+# leave that path alone. Default = the one-pass kernel's own crossover
+# (selected_length * 7 = 16 blocks * 128 * 7 = 14336).
+_SPLIT_VERIFY_MAX_KV = int(
+    _msa_os.environ.get("MLX_M3_SPLIT_VERIFY_MAX_KV", "14336") or "14336"
 )
 # -----------------------------------------------------------------------------
 
@@ -1172,6 +1213,14 @@ class MiniMaxAttention(nn.Module):
             reason = "batch"
         elif L <= 1:
             reason = "decode_or_empty"
+        elif L < _MSA_PREFILL_MIN_L:
+            # Tiny multi-token steps (EAGLE3 verify blocks, micro-suffixes)
+            # must NOT take this path: the blockwise top-k builder's cost is
+            # dominated by scoring the FULL kv history, so at L=4 over 19k
+            # context it turns each speculative round into an O(ctx) prefill
+            # (measured: decode collapsed 22 -> 6 t/s, scaling with ctx).
+            # Native's sparse decode handles small L at decode-like cost.
+            reason = "short_chunk"
         elif q_positions is not None:
             reason = "q_positions"
         elif mask is not None and not isinstance(mask, str):
@@ -1232,7 +1281,18 @@ class MiniMaxAttention(nn.Module):
 
         topk_builder = build_grouped_msa_topk
         builder_kwargs = {}
-        if idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN:
+        # Builder choice is about the SCORE-MATRIX memory, which scales with
+        # L x kv: the blockwise builder pays a full-kv scoring sweep per
+        # chunk (O(ctx) fixed cost), which is right for real prefill chunks
+        # (L in the thousands) and catastrophically wrong for tiny steps —
+        # an EAGLE3 L=4 verify at 19k context measured 120ms/round through
+        # it. The standard builder's (L x kv) fp32 scores are trivial at
+        # small L (4 x 19k x 4B ~ 300KB), so gate on BOTH dimensions.
+        if (
+            queries.shape[2] * idx_keys.shape[2] * 4
+            >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_SCORE_BYTES
+            and idx_keys.shape[2] >= _MSA_PREFILL_BLOCKWISE_TOPK_MIN_KV_LEN
+        ):
             _msa_stat("prefill_blockwise_topk")
             topk_builder = build_grouped_msa_topk_blockwise
             builder_kwargs["block_chunk_size"] = _MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK
@@ -1266,6 +1326,120 @@ class MiniMaxAttention(nn.Module):
             >= (self.sparse_topk_blocks - 1) * self.sparse_block_size,
         )
         return out.transpose(1, 0, 2)[None]
+
+    def _split_verify_attention(
+        self,
+        x: mx.array,
+        queries: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        cache,
+        rope_offset,
+        base: int,
+        mask: Optional[mx.array] = None,
+        q_positions: Optional[mx.array] = None,
+    ):
+        """Split-KV EAGLE3 verify attention (ThunderMLX overlay).
+
+        Armed by MLX_M3_SPLIT_VERIFY (default OFF). Replaces the DENSE masked
+        attention that a short verify block (``_SPLIT_VERIFY_MIN_L`` <= L <=
+        ``_SPLIT_VERIFY_MAX_L``) falls to when the one-pass sparse-prefill
+        kernel is ineligible (total context below ``_SPLIT_VERIFY_MAX_KV``).
+        Each verify query is split into a fused sparse HISTORY region [0,base)
+        + a dense causal TAIL [base,base+L), merged by log-sum-exp.
+
+        The leading block is a PURE eligibility check (no side effects) so an
+        ineligible step falls through to the untouched native indexer path,
+        which then performs this step's single index-cache update. Once past
+        the gate this path OWNS the index-cache update for the step (mirrors
+        ``_msa_prefill_attention``) and ALWAYS returns an output; the native
+        indexer is skipped, so the index cache is updated exactly once."""
+        if not _SPLIT_VERIFY_ENABLED or not mx.metal.is_available():
+            return None
+        B, L, _ = x.shape
+        total_len = keys.shape[2]
+        # ---- pure gate (no side effects) -----------------------------------
+        if (
+            B != 1
+            or L < _SPLIT_VERIFY_MIN_L
+            or L > _SPLIT_VERIFY_MAX_L
+            or self.sparse_score_type != "max"
+            or (mask is not None and not isinstance(mask, str))
+            or q_positions is not None
+            or cache is None
+            or not hasattr(cache, "update_index_and_fetch")
+            or self.index_heads != self.num_key_value_heads
+            or int(base) < _FUSED_SPARSE_DECODE_MIN_KV
+            or int(total_len) >= _SPLIT_VERIFY_MAX_KV
+            or int(total_len) - int(base) != L
+            or not msa_sparse_decode_b1_mma_eligible(
+                self.num_attention_heads,
+                self.num_key_value_heads,
+                self.head_dim,
+                self.sparse_block_size,
+            )
+        ):
+            return None
+        num_hist_blocks = (
+            int(base) + self.sparse_block_size - 1
+        ) // self.sparse_block_size
+        if num_hist_blocks < self.sparse_topk_blocks:
+            return None
+        _msa_stat("split_verify_eligible")
+
+        # ---- committed: this step OWNS the index-cache update --------------
+        # Index projections replicate MiniMaxM3Indexer.__call__ verbatim so the
+        # index-key stream is identical to the native path.
+        idx_queries = self.index_q_proj(x)
+        idx_keys = self.index_k_proj(x)
+        idx_queries = idx_queries.reshape(B, L, self.index_heads, self.index_dim)
+        idx_keys = idx_keys.reshape(B, L, 1, self.index_dim)
+        idx_queries = self.index_q_norm(idx_queries).transpose(0, 2, 1, 3)
+        idx_keys = self.index_k_norm(idx_keys).transpose(0, 2, 1, 3)
+        idx_queries = self.rope(idx_queries, offset=rope_offset)
+        idx_keys = self.rope(idx_keys, offset=rope_offset)
+        idx_keys = cache.update_index_and_fetch(idx_keys)
+
+        # Shared top-k block selection over the history [0, base): score a
+        # single representative query (the last speculative token) against the
+        # history index-keys. Adjacent verify queries have highly-correlated
+        # selections (the same reuse decode already relies on), so one shared
+        # selection replaces L per-query selections.
+        idx_q_rep = mx.contiguous(idx_queries[:, :, -1:, :])
+        idx_k_hist = mx.contiguous(idx_keys[:, :, : int(base), :])
+        topk_idx = msa_decode_select_topk(
+            idx_q_rep,
+            idx_k_hist,
+            q_pos=int(base) - 1,
+            block_size=self.sparse_block_size,
+            topk=self.sparse_topk_blocks,
+            init_blocks=self.sparse_init_blocks,
+            local_blocks=self.sparse_local_blocks,
+        )
+        if topk_idx is None:
+            # Unreachable given the gate (block_size=128, num_blocks in range),
+            # but never return None post-commit: a correct dense fallback keeps
+            # the index-cache update single. Query i (position base+i) attends
+            # keys [0, base+i] via the length-aligned causal mask.
+            _msa_stat("split_verify_select_declined")
+            return scaled_dot_product_attention(
+                queries, keys, values, cache=None, scale=self.scale, mask="causal"
+            )
+
+        topk_valid = topk_idx >= 0
+        out = msa_split_verify_attention(
+            queries,
+            keys,
+            values,
+            mx.maximum(topk_idx, 0),
+            topk_valid,
+            base=int(base),
+            scale=self.scale,
+            block_size=self.sparse_block_size,
+            impl=_SPLIT_VERIFY_IMPL,
+        )
+        _msa_stat("split_verify_forward")
+        return out
 
     def _build_sparse_mask(
         self,
@@ -1728,6 +1902,25 @@ class MiniMaxAttention(nn.Module):
                     cache,
                     rope_offset,
                     int(sparse_q_start),
+                    mask=mask,
+                    q_positions=sparse_q_positions,
+                )
+                if output is not None:
+                    output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                    return self.o_proj(output)
+            # ThunderMLX split-verify: short verify blocks that would fall to
+            # DENSE attention (one-pass sparse kernel ineligible at low ctx).
+            # Pure-check gated + owns the index-cache update when it fires;
+            # ineligible steps touch nothing and run the native path below.
+            if L > 1 and _SPLIT_VERIFY_ENABLED:
+                output = self._split_verify_attention(
+                    x,
+                    queries,
+                    keys,
+                    values,
+                    cache,
+                    rope_offset,
+                    int(offset),
                     mask=mask,
                     q_positions=sparse_q_positions,
                 )
