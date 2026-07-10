@@ -437,6 +437,12 @@ def _install_rank0_token_sync(group):
     if getattr(orig, "_m3_rank0_token_sync", False):
         return
 
+    try:
+        import constrained_tools as _ctools
+    except Exception:
+        _ctools = None
+    _ct_on = _ctools is not None and _ctools.env_enabled()
+
     def _server_force_eos():
         # Decode-stop EOS injection (2026-07-06): the serving layer arms this
         # when a client stop arrives. Resolved lazily because this patch loads
@@ -446,6 +452,18 @@ def _install_rank0_token_sync(group):
         return getattr(srv, "_FORCE_EOS", None) if srv is not None else None
 
     def _synced_sample_with_positions(*args, **kwargs):
+        # Constrained tool decoding (rank0 only): mask logits before sampling;
+        # the sampled token is folded into the automaton after the send-eval
+        # below (so the load-bearing eval ordering is untouched). No-op unless
+        # the env flag is on AND a per-request grammar is armed.
+        con = _ctools.active() if (_ct_on and group.rank() == 0) else None
+        if con is not None and len(args) >= 2:
+            try:
+                masked = con.mask_logits(args[1])
+                if masked is not args[1]:
+                    args = (args[0], masked) + tuple(args[2:])
+            except Exception:
+                con = None
         y = orig(*args, **kwargs)
         if group.rank() == 0:
             fe = _server_force_eos()
@@ -467,6 +485,13 @@ def _install_rank0_token_sync(group):
             ]
             if sends:
                 mx.eval(sends)
+            if con is not None:
+                # y is already materialized by mx.eval(sends) above; reading it
+                # here adds no new eval point ahead of the send.
+                try:
+                    con.observe(int(y.reshape(-1)[0]))
+                except Exception:
+                    pass
             return y
         synced = mx.distributed.recv_like(y, 0, group=group, stream=mx.cpu)
         mx.eval(synced)

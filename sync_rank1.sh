@@ -38,6 +38,7 @@ FILES=(
   M3_Stop.command
   auto_restart.sh
   cluster_gui.py
+  constrained_tools.py
   dashboard.html
   launch_cluster.sh
   m3_batch_cancel.py
