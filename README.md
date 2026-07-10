@@ -284,6 +284,13 @@ distributed Apple Silicon inference:
 - Sparse decode path and decode top-k reuse, currently tuned with
   `MLX_M3_DECODE_TOPK_REUSE_TOKENS=48`.
 - Sparse top-k override tuning, currently `MLX_M3_SPARSE_TOPK_BLOCKS_OVERRIDE=16`.
+- Split-verify attention kernel for speculative verify blocks (2<=L<=8):
+  per-query sparse history + dense causal tail, LSE-merged (gated behind
+  `MLX_M3_SPLIT_VERIFY`, off by default).
+- Capture-only training-data mode: normal generation optionally dumps
+  drafter-training pairs (<1% overhead, `MLX_M3_EAGLE3_CAPTURE_ONLY`).
+- Dashboard Storage card: live usage-vs-cap bars and runtime-tunable
+  limits for the SSD prompt-KV cache and capture corpus.
 - Compact decode sorting disabled by default after benchmarking:
   `MLX_M3_COMPACT_DECODE_SORT_TOPK=0`.
 - Direct decode kernel hooks are present but disabled by default because the
