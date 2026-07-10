@@ -55,7 +55,9 @@ ALLOW_START_M3 = env_bool("M3_GATEWAY_ALLOW_START_M3", True)
 ALLOW_STOP_M3 = env_bool("M3_GATEWAY_ALLOW_STOP_M3", True)
 # Even when auto-stop is allowed, never yank M3 while it is serving or has
 # served within this window — an oMLX probe once stopped it mid-session.
-STOP_M3_GRACE_S = float(os.environ.get("M3_GATEWAY_STOP_M3_GRACE_S", "120"))
+# 30s (was 120): single-user cluster - a 2-minute cooldown before oMLX
+# switches just feels broken from the model picker (2026-07-09).
+STOP_M3_GRACE_S = float(os.environ.get("M3_GATEWAY_STOP_M3_GRACE_S", "30"))
 # Streamed /v1/responses translates upstream deltas live (codex sees thinking
 # stream into its reasoning UI). 0 falls back to the end-of-turn replay.
 RESPONSES_LIVE_STREAM = env_bool("M3_GATEWAY_RESPONSES_LIVE", True)
