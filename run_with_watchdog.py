@@ -282,7 +282,11 @@ def start_watchdog():
                 # (the 06:39 wedge fired the fatal path but never the capture,
                 # with no surviving explanation — never again)
                 try:
-                    with open("/tmp/watchdog_stall_breadcrumb", "a") as bf:
+                    _bc = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "ops", "logs", "watchdog_stall_breadcrumb",
+                    )
+                    with open(_bc, "a") as bf:
                         bf.write(
                             f"{time.time():.0f} stall={stall:.0f} cap_at={STALL_CAPTURE_AT} "
                             f"rank={os.environ.get('MLX_RANK', '?')} fired={_stall_capture_fired}\n"
@@ -313,6 +317,11 @@ def start_watchdog():
                         os.path.dirname(capture), "logs", "autostall_capture.log"
                     )
                     with open(log_path, "a") as lf:
+                        lf.write(
+                            f"[{time.strftime('%F %T')}] spawning wedge "
+                            f"capture (stall={stall:.0f}s rank0)\n"
+                        )
+                        lf.flush()
                         subprocess.Popen(
                             ["/bin/zsh", capture, time.strftime("autostall_%H%M%S")],
                             stdout=lf,
@@ -343,6 +352,21 @@ def start_watchdog():
                 # Doing it here, right before exit, releases the ~160GB of
                 # model/activation buffers cleanly so the machine doesn't
                 # need a reboot after a watchdog-kill.
+                try:
+                    _crash = os.path.join(
+                        os.path.dirname(os.path.abspath(__file__)),
+                        "ops", "logs",
+                        time.strftime("crash_%Y%m%d_%H%M%S.txt"),
+                    )
+                    with open(_crash, "w") as cf:
+                        cf.write(
+                            f"watchdog fatal: stall={stall:.0f}s kind={stall_kind}\n"
+                            f"eval_ticks={tokens_seen} progress_tokens={progress_tokens_seen}\n"
+                            f"elapsed={elapsed:.0f}s timeout={timeout}s "
+                            f"rank={os.environ.get('MLX_RANK', '?')}\n"
+                        )
+                except Exception:
+                    pass
                 try:
                     clear_mlx_cache("watchdog forced exit")
                 except Exception:
