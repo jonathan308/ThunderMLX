@@ -11984,7 +11984,7 @@ def run_http_server(model, processor, rank):
         }
 
     @app.post("/v1/chat/completions")
-    async def chat(request: dict):
+    async def chat(request: dict, http_request: Request = None):
         with state_lock:
             if request_state["shutdown_requested"]:
                 return JSONResponse(
@@ -13333,7 +13333,33 @@ def run_http_server(model, processor, rank):
                     done_event.set()
 
             submit_generation_job(_job)
-            await asyncio.to_thread(done_event.wait)
+            # Non-stream orphan guard (2026-07-10): a client that times out
+            # or closes mid-generation used to leave the turn decoding into
+            # the void for up to max_tokens (an 18-minute orphan held the
+            # exclusive slot while the client's retries queued behind it).
+            # Poll the connection while the job runs and arm the SAME safe
+            # coordinated stop the stream path uses on disconnect.
+            disconnect_stopped = False
+            while not await asyncio.to_thread(done_event.wait, 2.0):
+                if (not disconnect_stopped
+                        and http_request is not None
+                        and STOP_ON_CLIENT_DISCONNECT and SAFE_DECODE_STOP
+                        and await http_request.is_disconnected()):
+                    disconnect_stopped = True
+                    stop_state = _request_inflight_stop(
+                        "client_disconnect",
+                        dict(active) if active else None,
+                    )
+                    update_generation_slot(
+                        active, client_connected=False,
+                        cancel_requested=True,
+                        cancel_reason="client_disconnect", **stop_state,
+                    )
+                    logger.warning(
+                        "[rank 0] non-stream client disconnected; distributed "
+                        "stop requested for %s at next token boundary",
+                        req_id,
+                    )
             if "error" in result:
                 raise result["error"]
             text = result.get("text")

@@ -2276,7 +2276,36 @@ async def anthropic_messages_route(request: Request):
         )
     if payload.get("stream"):
         return await anthropic_messages_stream(payload)
-    return await anthropic_messages(payload)
+    # Orphan guard (2026-07-10): same disconnect race the /responses branch
+    # uses. A zcode /v1/messages client that timed out or closed mid-turn
+    # left the backend decoding to budget (an 18-minute orphan held the
+    # slot while client retries queued behind it). On disconnect: fire
+    # /v1/stop upstream, cancel the translation task, return 499.
+    async def _watch_disconnect():
+        while True:
+            if await request.is_disconnected():
+                return True
+            await asyncio.sleep(0.5)
+
+    comp_task = asyncio.create_task(anthropic_messages(payload))
+    watch_task = asyncio.create_task(_watch_disconnect())
+    done, _ = await asyncio.wait(
+        {comp_task, watch_task}, return_when=asyncio.FIRST_COMPLETED
+    )
+    if watch_task in done and comp_task not in done:
+        try:
+            async with httpx.AsyncClient(timeout=10) as _sc:
+                await _sc.post(f"{M3_BASE_URL}/v1/stop", json={})
+            record_event("anthropic_disconnect_stop")
+        except Exception:
+            pass
+        comp_task.cancel()
+        return JSONResponse(status_code=499, content={
+            "type": "error",
+            "error": {"type": "client_disconnect",
+                      "message": "client disconnected; upstream stop issued"}})
+    watch_task.cancel()
+    return comp_task.result()
 
 
 @APP.post("/v1/messages/count_tokens")
