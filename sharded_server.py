@@ -1138,6 +1138,15 @@ THINKING_RAW_SILENT_LIMIT = int(
 THINKING_RUNAWAY_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "8192") or "8192"
 )
+# TOOL turns get a tighter thinking budget (2026-07-10 "tools silenced in
+# thinking"): a tool turn still inside <mm:think> past this many tokens is
+# drafting the answer in reasoning instead of calling — force EOS early so
+# the retry ladder converts it to a No-Think retry (TOOL_RETRY_NO_THINK),
+# which reliably emits the call, instead of burning to the global budget.
+TOOL_THINKING_RUNAWAY_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "6144")
+    or "6144"
+)
 # Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
 # the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
 # hundreds of times — a bare-marker+shell-command shape no tag/JSON detector
@@ -5821,7 +5830,13 @@ def _request_generation_params(request, tools=None):
         params.setdefault("repetition_penalty", DEFAULT_REPETITION_PENALTY)
     # Anti-loop sampling for thinking turns (breaks reasoning spirals at the
     # source). setdefault => an explicit client value always wins.
-    if _resolve_thinking_mode(request) == "enabled":
+    # NEVER on tool turns: the thinking floor was silently overwriting the
+    # tool temperature (0.2 -> 0.5) on every thinking+tools request — the
+    # exact temp that drove the drift wave. Tool discipline owns tool turns
+    # in BOTH thinking modes (2026-07-10 "tools silenced in thinking" root
+    # cause); think-loops on tool turns are contained by the tool thinking
+    # budget + No-Think retry instead.
+    if not has_tools and _resolve_thinking_mode(request) == "enabled":
         if THINKING_DEFAULT_REPETITION_PENALTY > 0:
             params.setdefault("repetition_penalty",
                               THINKING_DEFAULT_REPETITION_PENALTY)
@@ -6665,6 +6680,13 @@ def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loo
         and "force_final" in set(tool_loop_diag.get("reasons") or [])
     )
     if (not tools and not force_final) or not TOOL_SYSTEM_HINT_ENABLED or _tool_choice_disables_tools(request):
+        return processed_messages
+    # THINKING turns get the untouched prompt (2026-07-10): an injected
+    # build-strategy instruction is planning fuel for <mm:think> — the model
+    # drafts the whole file in reasoning and never emits the call. The hint's
+    # sectioning value is for No-Think agent loops; thinking keeps the exact
+    # prompt shape that was flawless pre-hint.
+    if _resolve_thinking_mode(request) == "enabled":
         return processed_messages
     hint = (TOOL_SYSTEM_HINT_TEXT or "").strip() if tools else ""
     steer = _tool_loop_steering_text(tool_loop_diag)
@@ -9653,18 +9675,23 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 # burn to the ceiling. Arm the SAME proven EOS stop, gated on
                 # visible content still being empty (thinking not yet closed)
                 # so a turn writing a long answer is never clipped.
+                _runaway_budget = (
+                    TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+                    if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+                )
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
-                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and _runaway_budget > 0
                         and thinking_mode == "enabled"
-                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and n >= _runaway_budget
                         and "</mm:think>" not in text
                         and "</think>" not in text):
                     logger.warning(
                         "rank 0: thinking-runaway guard at token %d "
-                        "(still in <mm:think>, no visible answer) — forcing "
+                        "(still in <mm:think>, no visible answer%s) — forcing "
                         "EOS to release the slot",
                         n,
+                        "; tool turn" if tools else "",
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
@@ -9975,17 +10002,22 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # burn to the ceiling. Arm the SAME proven EOS stop, gated on
                 # the splitter's authoritative in_thinking state (substring
                 # checks on the consumed `accumulated` buffer never matched).
+                _runaway_budget = (
+                    TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+                    if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+                )
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
-                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and _runaway_budget > 0
                         and thinking_mode == "enabled"
-                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and n >= _runaway_budget
                         and in_thinking):
                     logger.warning(
                         "rank 0: thinking-runaway guard at token %d "
-                        "(still in <mm:think>, no visible answer) — forcing "
+                        "(still in <mm:think>, no visible answer%s) — forcing "
                         "EOS to release the slot",
                         n,
+                        "; tool turn" if tools else "",
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
