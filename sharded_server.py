@@ -156,6 +156,9 @@ if TOOL_THINKING_MODE not in {"request", "enabled", "disabled", "adaptive"}:
 TOOL_SYSTEM_HINT_ENABLED = os.environ.get(
     "MLX_M3_TOOL_SYSTEM_HINT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+INJECT_DATE_CONTEXT = os.environ.get(
+    "MLX_M3_INJECT_DATE_CONTEXT", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 TOOL_SYSTEM_HINT_TEXT = os.environ.get(
     "MLX_M3_TOOL_SYSTEM_HINT_TEXT",
     (
@@ -190,6 +193,21 @@ TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS = int(
     )
     or "0"
 )
+TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT = int(
+    os.environ.get(
+        "MLX_M3_TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT",
+        "0",
+    )
+    or "0"
+)
+TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES = {
+    name.strip()
+    for name in os.environ.get(
+        "MLX_M3_TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES",
+        "",
+    ).split(",")
+    if name.strip()
+}
 TOOL_LOOP_FILTER_CONTROL_TOOLS = {
     name.strip()
     for name in os.environ.get(
@@ -212,16 +230,37 @@ TOOL_UNUSABLE_RETRY_ATTEMPTS = int(
 TOOL_UNUSABLE_RETRY_TEMPERATURES = [
     float(part)
     for part in os.environ.get(
-        "MLX_M3_TOOL_UNUSABLE_RETRY_TEMPERATURES", "0.3,0.7"
+        "MLX_M3_TOOL_UNUSABLE_RETRY_TEMPERATURES", "0.2,0.3"
     ).split(",")
     if part.strip()
-] or [0.3, 0.7]
+] or [0.2, 0.3]
 # Hard cap on a retry's decode budget. A valid tool call stops decode early,
 # so this only bounds pathological thinking rambles; long hot-suffix decodes
 # are also the JACCL wedge-prone regime, so keep retries short.
 TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
-    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "4096") or "0"
+    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "8192") or "0"
 )
+# A tool-required turn that has not even STARTED a call by this many decode
+# tokens is drafting work in prose rather than executing it. Stop that attempt
+# through the synchronized EOS path and let the bounded No-Think retry emit
+# the call. Once a real marker begins this guard permanently disengages, so a
+# large Write/Edit payload is never clipped. 0 disables.
+TOOL_NO_CALL_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "768") or "0"
+)
+# Later rounds of an action task may legitimately finish in prose. Give them
+# more room than the mandatory first call, but do not let a fresh code draft
+# run for thousands of tokens before finally emitting an empty marker.
+TOOL_ACTION_NO_CALL_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536") or "0"
+)
+# A completed tool block normally emits EOS immediately. Closing the outer
+# consumer first sends m3_batch_cancel into its GeneratorExit drain path; one
+# rank occasionally never reaches that boundary and leaves rank0 Metal wired.
+# Keep consuming the already synchronized batch until natural EOS instead.
+BATCH_TOOL_NATURAL_DRAIN = os.environ.get(
+    "MLX_M3_BATCH_TOOL_NATURAL_DRAIN", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 # Retry unusable tool turns in NO-THINK. A thinking-mode retry regenerates
 # another multi-minute reasoning turn that often re-botches the same marker
 # (2026-07-10 hermes: retry 1/2 ran 7+ min and the client had long since
@@ -230,6 +269,9 @@ TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
 TOOL_RETRY_NO_THINK = os.environ.get(
     "MLX_M3_TOOL_RETRY_NO_THINK", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
+TOOL_WRITE_CHUNK_MAX_CHARS = int(
+    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000") or "0"
+)
 DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
 )
@@ -949,6 +991,15 @@ PROMPT_CACHE_SSD_RESTORE_ENABLED = os.environ.get(
 PROMPT_CACHE_SSD_AUTO_SAVE = os.environ.get(
     "MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS = max(
+    0,
+    int(
+        os.environ.get(
+            "MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS", "8192"
+        )
+        or "8192"
+    ),
+)
 PROMPT_CACHE_SSD_DIR = os.environ.get(
     "MLX_M3_PROMPT_CACHE_SSD_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "thundermlx", "prompt-kv"),
@@ -1131,6 +1182,13 @@ THINKING_RAW_SILENT_LIMIT = int(
 THINKING_RUNAWAY_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "8192") or "8192"
 )
+# A tool-bearing turn that remains inside <mm:think> this long is not making
+# progress toward a call. End that attempt so the existing no-thinking retry
+# can emit the tool call without spending the full prose-thinking budget.
+TOOL_THINKING_RUNAWAY_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "2048")
+    or "2048"
+)
 # Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
 # the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
 # hundreds of times — a bare-marker+shell-command shape no tag/JSON detector
@@ -1217,6 +1275,45 @@ _STOP_NONCE = {"value": None}
 # end the generation identically, with zero new collectives.
 _FORCE_EOS = {"active": False, "eos_id": None}
 
+
+def _arm_rank0_semantic_eos(rank, reason, token_index):
+    """Request a decode stop without letting local parser state split ranks.
+
+    Tool/reasoning parsers run independently in each process and can observe a
+    completed or degenerate fragment on different iterations even though the
+    sampled token IDs are synchronized. Only rank 0 may turn that semantic
+    observation into control flow. Its sampler replaces the next token with
+    EOS, and the existing token synchronization delivers that same EOS to all
+    ranks at one shared decode boundary.
+    """
+    if rank != 0:
+        return False
+    if not _BATCH_PATH_ACTIVE.get("value"):
+        logger.warning(
+            "rank 0: semantic decode stop (%s) deferred at token %d because "
+            "the request is using the upstream generator; allowing natural "
+            "EOS preserves distributed lockstep",
+            reason,
+            token_index,
+        )
+        return False
+    if _FORCE_EOS.get("eos_id") is None:
+        logger.error(
+            "rank 0: cannot arm semantic decode stop (%s) at token %d: "
+            "EOS id is unavailable",
+            reason,
+            token_index,
+        )
+        return False
+    if not _FORCE_EOS.get("active"):
+        logger.info(
+            "rank 0: arming synchronized EOS for %s at token %d",
+            reason,
+            token_index,
+        )
+        _FORCE_EOS["active"] = True
+    return True
+
 # Rank-0 op-channel mutex: _bcast frames each op as bare size+payload
 # all_sums with no interleaving protection, so two rank-0 threads running
 # broadcast transactions concurrently shred the words and rank 1 wedges in
@@ -1229,7 +1326,13 @@ _FORCE_EOS = {"active": False, "eos_id": None}
 _RANK0_OP_MUTEX = threading.RLock()
 
 
-def _prefill_stop_payload(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+def _prefill_stop_payload(
+    reason="stop",
+    stop_at_tokens=None,
+    phase=None,
+    nonce=None,
+    decode_stop_at_tokens=None,
+):
     payload = {
         "version": 1,
         "at": round(time.time(), 6),
@@ -1238,6 +1341,11 @@ def _prefill_stop_payload(reason="stop", stop_at_tokens=None, phase=None, nonce=
     if stop_at_tokens is not None:
         try:
             payload["stop_at_tokens"] = int(stop_at_tokens)
+        except Exception:
+            pass
+    if decode_stop_at_tokens is not None:
+        try:
+            payload["decode_stop_at_tokens"] = int(decode_stop_at_tokens)
         except Exception:
             pass
     if phase:
@@ -1267,10 +1375,22 @@ def _read_prefill_stop_file():
         return {"version": 0, "reason": raw}
 
 
-def _touch_local_prefill_stop_file(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+def _touch_local_prefill_stop_file(
+    reason="stop",
+    stop_at_tokens=None,
+    phase=None,
+    nonce=None,
+    decode_stop_at_tokens=None,
+):
     if not PREFILL_STOP_FILE:
         return False
-    payload = _prefill_stop_payload(reason, stop_at_tokens, phase, nonce)
+    payload = _prefill_stop_payload(
+        reason,
+        stop_at_tokens,
+        phase,
+        nonce,
+        decode_stop_at_tokens,
+    )
     try:
         parent = os.path.dirname(PREFILL_STOP_FILE)
         if parent:
@@ -1284,12 +1404,24 @@ def _touch_local_prefill_stop_file(reason="stop", stop_at_tokens=None, phase=Non
         return False
 
 
-def _touch_remote_prefill_stop_file(reason="stop", stop_at_tokens=None, phase=None, nonce=None):
+def _touch_remote_prefill_stop_file(
+    reason="stop",
+    stop_at_tokens=None,
+    phase=None,
+    nonce=None,
+    decode_stop_at_tokens=None,
+):
     if not RANK1_SSH or not PREFILL_STOP_FILE:
         return None
     quoted_path = shlex.quote(PREFILL_STOP_FILE)
     payload = json.dumps(
-        _prefill_stop_payload(reason, stop_at_tokens, phase, nonce),
+        _prefill_stop_payload(
+            reason,
+            stop_at_tokens,
+            phase,
+            nonce,
+            decode_stop_at_tokens,
+        ),
         separators=(",", ":"),
     )
     quoted_payload = shlex.quote(payload)
@@ -1351,27 +1483,45 @@ def _user_stop_requested():
     return bool(kind and kind != "tool")
 
 
-def _request_inflight_stop(reason="stop", active_info=None):
-    _set_stop_request("user")
-    # Decode-phase stops use a token boundary a small margin ahead: both ranks
-    # process identical token indices and check the stop file on the same
-    # cadence, so they break at the same n — lockstep preserved, no collectives.
-    phase = None
-    stop_at_tokens = None
+def _stop_boundaries_from_active(active_info=None):
     try:
         emitted = int((active_info or {}).get("tokens_emitted") or 0)
     except Exception:
         emitted = 0
-    if emitted > 0:
-        stop_at_tokens = emitted + 16
-        phase = "decode"
-    else:
-        stop_at_tokens = _prefill_stop_at_from_active(active_info)
+    return {
+        "prefill_stop_at_tokens": _prefill_stop_at_from_active(active_info),
+        "decode_stop_at_tokens": max(16, emitted + 16),
+    }
+
+
+def _request_inflight_stop(reason="stop", active_info=None):
+    _set_stop_request("user")
+    # Carry independent future-safe boundaries for BOTH phases. A stop can
+    # arrive after the request slot is visible but before prefill/decode metrics
+    # are published. The old single-phase payload classified that race as
+    # prefill-only; if a short prefill completed before its next callback, the
+    # subsequent decode never observed the stop and ran to the token ceiling.
+    boundaries = _stop_boundaries_from_active(active_info)
+    decode_stop_at_tokens = boundaries["decode_stop_at_tokens"]
+    stop_at_tokens = boundaries["prefill_stop_at_tokens"]
+    phase = "any"
     nonce = _STOP_NONCE.get("value")
-    remote_ok = _touch_remote_prefill_stop_file(reason, stop_at_tokens, phase, nonce)
+    remote_ok = _touch_remote_prefill_stop_file(
+        reason,
+        stop_at_tokens,
+        phase,
+        nonce,
+        decode_stop_at_tokens,
+    )
     local_ok = False
     if remote_ok is not False:
-        local_ok = _touch_local_prefill_stop_file(reason, stop_at_tokens, phase, nonce)
+        local_ok = _touch_local_prefill_stop_file(
+            reason,
+            stop_at_tokens,
+            phase,
+            nonce,
+            decode_stop_at_tokens,
+        )
     else:
         logger.warning(
             "prefill stop file not armed locally because rank1 propagation failed; "
@@ -1381,6 +1531,7 @@ def _request_inflight_stop(reason="stop", active_info=None):
         "prefill_stop_local": local_ok,
         "prefill_stop_remote": remote_ok,
         "prefill_stop_at_tokens": stop_at_tokens,
+        "decode_stop_at_tokens": decode_stop_at_tokens,
     }
 
 
@@ -1455,7 +1606,11 @@ _prompt_cache_ssd_state = {
     "last_saved_tokens": 0,
     "last_saved_bytes": 0,
     "last_restored_tokens": 0,
+    "last_auto_save_deferred_at": None,
+    "last_auto_save_deferred_reason": None,
+    "auto_save_deferred_count": 0,
 }
+_prompt_cache_ssd_autosave_anchors = OrderedDict()
 _prompt_cache_ssd_scan_cache = {"at": None, "scan": None}
 _metal_warmup_lock = _threading.RLock()
 _metal_warmup_last_event = None
@@ -2250,6 +2405,88 @@ def _prompt_cache_ssd_layer_path(rank_dir, index):
     return os.path.join(rank_dir, f"layer-{int(index):03d}.safetensors")
 
 
+def _prompt_cache_ssd_record_autosave_anchor_unlocked(
+    session_key, token_ids, runtime_hash=None
+):
+    key = str(session_key or "")
+    if not key:
+        return
+    ids = list(token_ids or [])
+    _prompt_cache_ssd_autosave_anchors[key] = {
+        "tokens": len(ids),
+        "token_hash": _token_ids_sha256(ids),
+        "runtime_hash": str(runtime_hash or ""),
+    }
+    _prompt_cache_ssd_autosave_anchors.move_to_end(key)
+    while len(_prompt_cache_ssd_autosave_anchors) > max(
+        8, PROMPT_CACHE_SESSION_MAP_MAX
+    ):
+        _prompt_cache_ssd_autosave_anchors.popitem(last=False)
+
+
+def _prompt_cache_ssd_autosave_due_unlocked(model, processor):
+    """Return whether this rank should persist the current completed KV state.
+
+    A 256k two-rank checkpoint is roughly 33 GiB. Rewriting it after every
+    tiny follow-up adds seconds after the final token and unnecessary SSD
+    wear. Anchors are advanced only after a successful save or coordinated
+    restore, so both ranks make the same deterministic token-delta decision.
+    """
+    holder = _prompt_cache_holder
+    token_ids = list(holder.get("token_ids") or [])
+    session_id = holder.get("session_id")
+    session_source = holder.get("session_source")
+    if not PROMPT_CACHE_SSD_ENABLED or not PROMPT_CACHE_SSD_AUTO_SAVE:
+        return False, "disabled"
+    if not session_id:
+        return True, "no_session_anchor"
+    if len(token_ids) < PROMPT_CACHE_SSD_MIN_TOKENS:
+        return True, "below_min_tokens"
+    session_key = _prompt_cache_session_key(session_id, session_source)
+    anchor = _prompt_cache_ssd_autosave_anchors.get(session_key)
+    if not anchor:
+        return True, "first_checkpoint"
+
+    current_tokens = len(token_ids)
+    saved_tokens = int(anchor.get("tokens") or 0)
+    if current_tokens < saved_tokens:
+        return True, "cache_rewound"
+    if current_tokens == saved_tokens:
+        current_hash = _token_ids_sha256(token_ids)
+        if current_hash != str(anchor.get("token_hash") or ""):
+            return True, "same_length_branch_changed"
+        return False, "unchanged"
+
+    delta = current_tokens - saved_tokens
+    if delta < PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS:
+        return False, f"delta_below_threshold:{delta}"
+    return True, f"delta_threshold_reached:{delta}"
+
+
+def _prompt_cache_ssd_maybe_autosave_unlocked(
+    model, processor, *, prompt=None, reason="update"
+):
+    due, decision = _prompt_cache_ssd_autosave_due_unlocked(model, processor)
+    if not due:
+        now = round(time.time(), 3)
+        _prompt_cache_ssd_state.update({
+            "last_auto_save_deferred_at": now,
+            "last_auto_save_deferred_reason": decision,
+            "auto_save_deferred_count": int(
+                _prompt_cache_ssd_state.get("auto_save_deferred_count") or 0
+            ) + 1,
+        })
+        logger.info("prompt-cache SSD autosave deferred (%s)", decision)
+        return False
+    if prompt is not None:
+        _prompt_cache_make_ssd_checkpoint_unlocked(prompt=prompt, reason=reason)
+    return _prompt_cache_ssd_save_current_unlocked(
+        model,
+        processor,
+        reason=f"{reason}:{decision}",
+    )
+
+
 def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"):
     if not PROMPT_CACHE_SSD_ENABLED:
         return False
@@ -2377,7 +2614,13 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
             "saved_sessions": int(_prompt_cache_ssd_state.get("saved_sessions") or 0) + 1,
             "last_saved_tokens": len(token_ids),
             "last_saved_bytes": total_bytes,
+            "last_auto_save_deferred_reason": None,
         })
+        _prompt_cache_ssd_record_autosave_anchor_unlocked(
+            session_key,
+            token_ids,
+            runtime.get("hash"),
+        )
         _prompt_cache_ssd_invalidate_scan_cache_unlocked()
         entry = _prompt_cache_session_map.get(session_key)
         if entry is not None:
@@ -2606,6 +2849,11 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         "restored_sessions": int(_prompt_cache_ssd_state.get("restored_sessions") or 0) + 1,
         "last_restored_tokens": local_cache_len,
     })
+    _prompt_cache_ssd_record_autosave_anchor_unlocked(
+        session_key,
+        stored_ids,
+        meta.get("runtime_hash"),
+    )
     _set_prompt_cache_event(
         "ssd_restore",
         prompt_tokens=len(token_ids or []),
@@ -2746,6 +2994,9 @@ def _prompt_cache_ssd_status_unlocked(force_scan=False):
         "enabled": PROMPT_CACHE_SSD_ENABLED,
         "restore_enabled": PROMPT_CACHE_SSD_RESTORE_ENABLED,
         "auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
+        "auto_save_min_delta_tokens": (
+            PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS
+        ),
         "mode": (
             "restore+autosave"
             if (
@@ -4798,13 +5049,10 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
             and processor is not None
             and PROMPT_CACHE_SSD_AUTO_SAVE
         ):
-            _prompt_cache_make_ssd_checkpoint_unlocked(
-                prompt=prompt,
-                reason=save_reason,
-            )
-            _prompt_cache_ssd_save_current_unlocked(
+            _prompt_cache_ssd_maybe_autosave_unlocked(
                 model,
                 processor,
+                prompt=prompt,
                 reason=save_reason,
             )
     _enforce_prompt_cache_size_limit()
@@ -4926,6 +5174,31 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
         return False
     token_ids = list(token_ids)
     if not token_ids:
+        return False
+    # A one-token visible-transcript prewarm still evaluates attention over the
+    # entire resident KV. At very large context this optional post-response
+    # pass can wedge inside a Metal event after the client has already received
+    # its answer. The limit is rank-invariant because both peers receive the
+    # same token_ids, so both can safely skip before entering collectives while
+    # preserving the completed request's existing cache state.
+    if (
+        VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS > 0
+        and len(token_ids) > VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS
+    ):
+        _set_prompt_cache_event(
+            "prewarm_skipped_context_limit",
+            reason=reason,
+            prompt_tokens=len(token_ids),
+            max_tokens=VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS,
+            session_id=session_id,
+            session_source=session_source,
+        )
+        logger.info(
+            "prompt-cache visible prewarm skipped above hard context limit "
+            "(%d > %d tokens)",
+            len(token_ids),
+            VISIBLE_TRANSCRIPT_PREWARM_MAX_TOKENS,
+        )
         return False
     existing_reuse = 0
     existing_suffix = len(token_ids)
@@ -5069,7 +5342,7 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
                 **_prompt_cache_match_fields(len(token_ids), len(token_ids)),
             )
             if PROMPT_CACHE_SSD_AUTO_SAVE:
-                _prompt_cache_ssd_save_current_unlocked(
+                _prompt_cache_ssd_maybe_autosave_unlocked(
                     model,
                     processor,
                     reason=f"visible_transcript_prewarm:{reason}",
@@ -5303,7 +5576,9 @@ def _check_prefill_stop(rank, processed_tokens, total_tokens):
     stop_payload = _read_prefill_stop_file()
     if stop_payload is not None:
         _set_stop_request("user")
-        stop_at = stop_payload.get("stop_at_tokens")
+        stop_at = stop_payload.get("prefill_stop_at_tokens")
+        if stop_at is None:
+            stop_at = stop_payload.get("stop_at_tokens")
         try:
             stop_at = int(stop_at) if stop_at is not None else None
         except Exception:
@@ -5812,9 +6087,11 @@ def _request_generation_params(request, tools=None):
         params.setdefault("repetition_penalty", TOOL_DEFAULT_REPETITION_PENALTY)
     if DEFAULT_REPETITION_PENALTY > 0:
         params.setdefault("repetition_penalty", DEFAULT_REPETITION_PENALTY)
-    # Anti-loop sampling for thinking turns (breaks reasoning spirals at the
-    # source). setdefault => an explicit client value always wins.
-    if _resolve_thinking_mode(request) == "enabled":
+    # Prose-thinking sampling must not overwrite tool sampling. Previously the
+    # 0.5 thinking floor replaced the 0.2 tool default on thinking+tools turns,
+    # which made the quantized model drift into long reasoning instead of
+    # emitting a call. Explicit client values still win through setdefault.
+    if not has_tools and _resolve_thinking_mode(request) == "enabled":
         if THINKING_DEFAULT_REPETITION_PENALTY > 0:
             params.setdefault("repetition_penalty",
                               THINKING_DEFAULT_REPETITION_PENALTY)
@@ -5847,6 +6124,23 @@ def _generation_defaults_status():
         "tool_seed": TOOL_DEFAULT_SEED,
         "tool_thinking_mode": TOOL_THINKING_MODE,
         "tool_compat_overlay": TOOL_COMPAT_OVERLAY,
+        "inject_date_context": INJECT_DATE_CONTEXT,
+        "tool_no_call_token_budget": TOOL_NO_CALL_TOKEN_BUDGET,
+        "tool_action_no_call_token_budget": (
+            TOOL_ACTION_NO_CALL_TOKEN_BUDGET
+        ),
+        "tool_thinking_runaway_token_budget": (
+            TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+        ),
+        "tool_unusable_retry_attempts": TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        "tool_unusable_retry_max_tokens": TOOL_UNUSABLE_RETRY_MAX_TOKENS,
+        "tool_write_chunk_max_chars": TOOL_WRITE_CHUNK_MAX_CHARS,
+        "tool_loop_force_final_repeated_tool_count": (
+            TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
+        ),
+        "tool_loop_force_final_repeated_tool_names": sorted(
+            TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES
+        ),
         "repetition_penalty": DEFAULT_REPETITION_PENALTY,
         "presence_penalty": DEFAULT_PRESENCE_PENALTY,
         "frequency_penalty": DEFAULT_FREQUENCY_PENALTY,
@@ -5951,6 +6245,9 @@ def _generation_defaults_status():
         "prompt_cache_ssd": PROMPT_CACHE_SSD_ENABLED,
         "prompt_cache_ssd_restore": PROMPT_CACHE_SSD_RESTORE_ENABLED,
         "prompt_cache_ssd_auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
+        "prompt_cache_ssd_auto_save_min_delta_tokens": (
+            PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS
+        ),
         "prompt_cache_ssd_dir": os.path.expanduser(PROMPT_CACHE_SSD_DIR),
         "prompt_cache_ssd_dir_rank0": os.path.expanduser(
             PROMPT_CACHE_SSD_DIR_RANK0 or PROMPT_CACHE_SSD_DIR
@@ -6176,6 +6473,7 @@ def _request_shape_summary(request, processed_messages, prompt, token_ids, *,
         "requested_model": request.get("model"),
         "response_model": response_model,
         "top_level_keys": sorted(request.keys()),
+        "date_context_injected": bool(request.get("_date_context_injected")),
         "cache_session_id": _request_cache_session(request)[0],
         "cache_session_source": _request_cache_session(request)[1],
         "thinking_mode": thinking_mode,
@@ -6238,6 +6536,49 @@ def _request_looks_like_openwebui(request, processed_messages=None):
         "running locally",
     )
     return any(marker in text for marker in markers)
+
+
+_AUTHORITATIVE_DATE_CONTEXT_RE = re.compile(
+    r"(?i)(?:use this date/time context|full current datetime|current timezone|"
+    r"current date\s*[:=]|today(?:'s)? date\s*[:=]|"
+    r"the current date is\s+\d{4}-\d{2}-\d{2})"
+)
+
+
+def _current_date_context_text():
+    """Return a daily-stable local date context for model system prompts."""
+    now = time.localtime()
+    date_text = time.strftime("%Y-%m-%d (%A)", now)
+    zone_name = time.strftime("%Z", now).strip()
+    raw_offset = time.strftime("%z", now).strip()
+    if re.fullmatch(r"[+-]\d{4}", raw_offset):
+        raw_offset = f"{raw_offset[:3]}:{raw_offset[3:]}"
+    zone_parts = [part for part in (zone_name, raw_offset) if part]
+    zone_text = f" ({', '.join(zone_parts)})" if zone_parts else ""
+    return (
+        f"Current date: {date_text}. Local timezone{zone_text}. "
+        "Treat this date as authoritative when interpreting relative dates "
+        "such as today, tomorrow, or yesterday."
+    )
+
+
+def _add_date_system_context(processed_messages):
+    """Inject today's date unless the client already supplied date context."""
+    messages = list(processed_messages or [])
+    if not INJECT_DATE_CONTEXT:
+        return messages, False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in {
+            "system", "developer"
+        }:
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and _AUTHORITATIVE_DATE_CONTEXT_RE.search(content):
+            return messages, False
+    return [
+        {"role": "system", "content": _current_date_context_text()},
+        *messages,
+    ], True
 
 
 def _response_model_id(requested_model):
@@ -6552,6 +6893,16 @@ def _tool_loop_steering_diag(messages, tools):
         and "force_final" not in reasons
     ):
         reasons.append("force_final")
+    if (
+        TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT > 0
+        and repeated_tool_count >= TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
+        and repeated_tool in TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES
+        and assistant_tool_turns >= repeated_tool_count
+        and tool_results >= repeated_tool_count
+        and "force_final" not in reasons
+    ):
+        reasons.append("repeated_tool_limit")
+        reasons.append("force_final")
     if tool_fallback_turns >= 2:
         reasons.append("tool_fallback_loop")
         if "force_final" not in reasons:
@@ -6584,10 +6935,9 @@ def _tool_loop_steering_text(diag):
     if "force_final" in reasons:
         return (
             "Tool loop breaker: stop calling tools for this single turn because "
-            "the recent transcript already contains "
-            f"{diag.get('assistant_tool_turns', 0)} assistant tool-call turn(s) "
-            f"and {diag.get('tool_results', 0)} tool result(s) without a visible "
-            "assistant answer. Do not request another tool. Provide the final "
+            "the recent transcript already contains repeated tool calls and "
+            "tool results without a visible assistant answer. Do not request "
+            "another tool. Provide the final "
             "answer now using the gathered tool results, and if the task could "
             "not be completed, state exactly what is missing. Do not mention "
             "tool availability or server/tooling state; this is only a "
@@ -6605,9 +6955,8 @@ def _tool_loop_steering_text(diag):
         )
     return (
         "Long agent-loop steering: the recent transcript already contains "
-        f"{diag.get('assistant_tool_turns', 0)} assistant tool-call turn(s) "
-        f"and {diag.get('tool_results', 0)} tool result(s) after the latest "
-        "user request, with repeated tool activity. Tools remain available. "
+        "multiple tool-call turns and tool results after the latest user "
+        "request, with repeated tool activity. Tools remain available. "
         f"Do not call {repeated_tool} again unless it is genuinely the next "
         "new action. Prefer a different concrete tool if more evidence is "
         "needed, or provide the final answer if the gathered tool output is "
@@ -6652,6 +7001,79 @@ def _filter_looping_control_tools(tools, diag):
     return filtered_tools, sorted(filter_names)
 
 
+def _tool_working_directory_from_messages(processed_messages):
+    """Extract an explicit client-provided working directory, if present.
+
+    Agent clients commonly put this in an <env> block. MiniMax can otherwise
+    substitute a memorized example home directory in an otherwise valid tool
+    call. Only anchored metadata is accepted; arbitrary prose paths are not.
+    """
+    labels = ("Working directory", "Current working directory")
+    for message in processed_messages or []:
+        if not isinstance(message, dict) or message.get("role") not in {
+            "system", "developer"
+        }:
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        env_sections = re.findall(
+            r"<env>\s*(.*?)\s*</env>", content, flags=re.IGNORECASE | re.DOTALL
+        )
+        sections = env_sections or [content]
+        for section in sections:
+            for label in labels:
+                match = re.search(
+                    rf"(?mi)^\s*{re.escape(label)}\s*:\s*(/[^\r\n]+?)\s*$",
+                    section,
+                )
+                if match:
+                    candidate = os.path.normpath(match.group(1).strip())
+                    if (
+                        os.path.isabs(candidate)
+                        and candidate != "/"
+                        and len(candidate) <= 1024
+                        and not any(ord(ch) < 32 for ch in candidate)
+                    ):
+                        return candidate
+        cwd_match = re.search(
+            r"<cwd>\s*(/[^<\r\n]+?)\s*</cwd>",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if cwd_match:
+            candidate = os.path.normpath(cwd_match.group(1).strip())
+            if (
+                os.path.isabs(candidate)
+                and candidate != "/"
+                and len(candidate) <= 1024
+                and not any(ord(ch) < 32 for ch in candidate)
+            ):
+                return candidate
+    return ""
+
+
+def _file_write_chunk_hint(tools):
+    if TOOL_WRITE_CHUNK_MAX_CHARS <= 0:
+        return ""
+    has_write = any(
+        re.sub(r"[^a-z0-9]", "", _tool_function_name(tool).lower())
+        in _MUTATING_FILE_TOOL_NAMES
+        for tool in (tools or [])
+    )
+    if not has_write:
+        return ""
+    return (
+        "Large-file rule: keep each file-write `content` payload at or below "
+        f"{TOOL_WRITE_CHUNK_MAX_CHARS} characters. For a larger file, first "
+        "write a small valid working scaffold, then continue in later turns "
+        "with focused Edit calls or bounded append operations. Never attempt "
+        "the entire large file in one Write call. Do not bypass this limit "
+        "with a large Bash heredoc, printf, tee, base64, or shell-embedded "
+        "file body; use the provided Write and Edit tools in bounded stages."
+    )
+
+
 def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loop_diag=None):
     force_final = bool(
         tool_loop_diag
@@ -6659,7 +7081,67 @@ def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loo
     )
     if (not tools and not force_final) or not TOOL_SYSTEM_HINT_ENABLED or _tool_choice_disables_tools(request):
         return processed_messages
-    hint = (TOOL_SYSTEM_HINT_TEXT or "").strip() if tools else ""
+    # The static tool primer can become planning fuel inside <mm:think> and
+    # encourage the model to draft work instead of calling a tool. Keep the
+    # original thinking prompt shape, but retain dynamic steering once a real
+    # loop is detected so long-running agents can recover.
+    thinking_enabled = _resolve_thinking_mode(request) == "enabled"
+    if tools and thinking_enabled:
+        working_directory = _tool_working_directory_from_messages(
+            processed_messages
+        )
+        hint_parts = [
+            "Tool availability rule: use a provided tool when the answer "
+            "depends on current, external, or user-specific information that "
+            "is not already present in the conversation. If existing tool "
+            "results already provide the needed evidence, answer from them; "
+            "otherwise answer directly when no tool is needed."
+        ]
+        task_requests_action = (
+            _tool_choice_required_name(request)[0]
+            or _tool_text_requests_action(
+                _last_user_instruction_text(processed_messages)
+            )
+        )
+        if task_requests_action:
+            hint_parts.append(
+                "Tool execution rule for this task: if more work is needed, "
+                "keep reasoning brief and emit exactly one focused function "
+                "call using the provided tool format; if the task is complete, "
+                "answer normally. Do not draft code, commands, arguments, or "
+                "tool payloads inside <mm:think> or plain prose."
+            )
+        write_hint = _file_write_chunk_hint(tools)
+        if write_hint:
+            hint_parts.append(write_hint)
+        if working_directory:
+            hint_parts.append(
+                "Tool path anchor: the client explicitly set the working "
+                f"directory to {json.dumps(working_directory)}. Resolve "
+                "relative file names inside that directory and never "
+                "substitute a remembered example home, Downloads, or "
+                "project path."
+            )
+        hint = "\n\n".join(hint_parts)
+    else:
+        hint_parts = [
+            (TOOL_SYSTEM_HINT_TEXT or "").strip()
+        ] if tools else []
+        write_hint = _file_write_chunk_hint(tools)
+        if write_hint:
+            hint_parts.append(write_hint)
+        working_directory = _tool_working_directory_from_messages(
+            processed_messages
+        ) if tools else ""
+        if working_directory:
+            hint_parts.append(
+                "Tool path anchor: the client explicitly set the working "
+                f"directory to {json.dumps(working_directory)}. Resolve "
+                "relative file names inside that directory and never "
+                "substitute a remembered example home, Downloads, or "
+                "project path."
+            )
+        hint = "\n\n".join(part for part in hint_parts if part)
     steer = _tool_loop_steering_text(tool_loop_diag)
     if not hint:
         if not steer:
@@ -6910,8 +7392,17 @@ def _tool_parameters_for_name(tools, name):
 
 
 def _tool_schema_expects_arguments(tools, name):
+    """Whether an empty object violates the advertised JSON schema.
+
+    A schema may expose optional properties while accepting ``{}``. Treating
+    any ``properties`` entry as mandatory rejected legitimate parameterless
+    Hermes calls such as ``skills_list`` and forced the retry ladder. Required
+    fields are the authoritative boundary; their individual names are checked
+    again before a call is returned.
+    """
     params = _tool_parameters_for_name(tools, name)
-    return bool(params.get("properties") or params.get("required"))
+    required = params.get("required") if isinstance(params, dict) else None
+    return bool(required) if isinstance(required, list) else False
 
 
 def _tool_schema_property_names(tools, name):
@@ -7495,6 +7986,580 @@ def _last_user_text(processed_messages):
     return ""
 
 
+def _last_user_instruction_text(processed_messages):
+    """Return the latest real user instruction, skipping gateway tool results."""
+    for message in reversed(processed_messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        content = content.strip()
+        if not content or re.match(r"^Tool result(?:\s+\S+)?:", content):
+            continue
+        return content
+    return ""
+
+
+_TOOL_ACTION_VERBS = (
+    "add|audit|build|check|copy|create|delete|edit|execute|explore|fetch|"
+    "find|fix|implement|inspect|install|list|make|modify|move|open|patch|"
+    "read|remove|rename|review|rewrite|run|save|search|test|update|validate|"
+    "verify|write"
+)
+
+
+def _tool_text_requests_action(user_text):
+    """Return True for a clear action request, tolerant of CLI wrappers."""
+    if not isinstance(user_text, str) or not user_text.strip():
+        return False
+    normalized = re.sub(r"\s+", " ", user_text.strip()).lower()
+    if re.search(
+        r"\b(?:use|call|invoke)\s+(?:the\s+)?(?:available\s+)?"
+        r"(?:[a-z0-9_.:-]+\s+)?(?:function|tool)\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        rf"^[^a-z0-9]{{0,32}}(?:please\s+)?(?:{_TOOL_ACTION_VERBS})\b",
+        normalized,
+    ):
+        return True
+    if re.search(
+        rf"\b(?:can|could|would|will)\s+you\s+(?:please\s+)?"
+        rf"(?:{_TOOL_ACTION_VERBS})\b",
+        normalized,
+    ):
+        return True
+    return bool(re.search(
+        rf"\b(?:i\s+(?:want|need)\s+you\s+to|go\s+ahead\s+and)\s+"
+        rf"(?:{_TOOL_ACTION_VERBS})\b",
+        normalized,
+    ))
+
+
+def _tool_request_requires_call(processed_messages, request=None):
+    """Whether this turn needs an actual call rather than a prose answer.
+
+    OpenAI ``tool_choice=required`` remains authoritative. For ``auto`` we
+    infer only clear action requests on the first agent turn. Once the
+    transcript contains a tool result after the latest user request, prose is
+    valid again so an agent can finish instead of being forced into a loop.
+    """
+    if request and _tool_choice_required_name(request)[0]:
+        return True
+
+    messages = list(processed_messages or [])
+    last_user_index = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            last_user_index = index
+    if last_user_index < 0:
+        return False
+
+    for message in messages[last_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in {"tool", "function"}:
+            return False
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            return False
+
+    return _tool_text_requests_action(_last_user_text(messages))
+
+
+def _tool_call_started(text, tool_module):
+    """Cheaply recognize that generation entered an actual call payload."""
+    if not isinstance(text, str) or not text:
+        return False
+    start_marker, _ = _tool_call_markers(tool_module)
+    markers = tuple(filter(None, (
+        start_marker,
+        "<tool_call",
+        "<invoke",
+        "[Tool call:",
+        '"tool_calls"',
+    )))
+    return any(marker in text for marker in markers)
+
+
+def _file_write_payload_chars(text, tools):
+    """Characters emitted after a file-write invocation starts, or zero."""
+    if not isinstance(text, str) or not text:
+        return 0
+    for tool in tools or []:
+        name = _tool_function_name(tool)
+        normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+        if normalized not in _MUTATING_FILE_TOOL_NAMES:
+            continue
+        escaped = re.escape(name)
+        match = re.search(
+            rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
+            rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
+            text,
+        )
+        if match:
+            return len(text) - match.end()
+    return 0
+
+
+def _shell_create_file_payload_info(text, tools):
+    """Return a bounded-write target embedded in a command tool, if present.
+
+    This is intentionally narrow: only a command tool that starts a new file
+    through cat/tee/printf/echo/base64 redirection is recognized. Ordinary
+    Bash, test commands, and append operations remain untouched.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name:
+        return None
+    escaped = re.escape(command_name)
+    invocation = re.search(
+        rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
+        rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
+        text,
+    )
+    if not invocation:
+        return None
+    payload = text[invocation.end():]
+    head = payload[:1600]
+    path_atom = (
+        r'(?:"(?P<dq>[^"\r\n]+)"|\'(?P<sq>[^\'\r\n]+)\'|'
+        r'(?P<bare>[^\s;|<>&\r\n]+))'
+    )
+    patterns = (
+        rf"(?is)\bcat\b[^\r\n]{{0,320}}?(?<!>)>(?!>)\s*{path_atom}",
+        rf"(?is)\btee\b\s+(?:-[A-Za-z]+\s+)*{path_atom}",
+        rf"(?is)\b(?:printf|echo|base64)\b[^\r\n]{{0,640}}?"
+        rf"(?<!>)>(?!>)\s*{path_atom}",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, head)
+        if not match:
+            continue
+        path = next(
+            (
+                match.group(key).strip()
+                for key in ("dq", "sq", "bare")
+                if match.groupdict().get(key)
+            ),
+            "",
+        )
+        if (
+            not path
+            or path.startswith("-")
+            or "$" in path
+            or len(path) > 1024
+            or not os.path.splitext(path)[1]
+        ):
+            continue
+        return {
+            "command_name": command_name,
+            "path": path,
+            "payload_chars": len(payload),
+        }
+    return None
+
+
+def _tool_intent_without_call(text):
+    """Detect visible promises/drafts that should have been a tool call."""
+    if not isinstance(text, str) or not text:
+        return False
+    visible = text
+    for marker in ("</mm:think>", "</think>"):
+        if marker in visible:
+            visible = visible.rsplit(marker, 1)[1]
+    if (
+        ("<mm:think>" in visible or "<think>" in visible)
+        and "</mm:think>" not in text
+        and "</think>" not in text
+    ):
+        return False
+    normalized = re.sub(r"\s+", " ", visible.strip()).lower()
+    if not normalized:
+        return False
+    if normalized.startswith("```"):
+        return True
+    return bool(re.search(
+        rf"(?:^|[.!?]\s+)(?:let me|now i(?:'ll| will| need to| should)?|"
+        rf"i(?:'ll| will| need to| should)|next i(?:'ll| will)?)\s+"
+        rf"(?:carefully\s+|quickly\s+)?(?:{_TOOL_ACTION_VERBS})\b",
+        normalized,
+    ))
+
+
+_MUTATING_FILE_TOOL_NAMES = {
+    "applypatch",
+    "edit",
+    "editfile",
+    "makefile",
+    "multiedit",
+    "write",
+    "writefile",
+}
+_WRITE_FILE_TOOL_NAMES = {
+    "makefile",
+    "write",
+    "writefile",
+}
+_FILE_PATH_ARGUMENT_KEYS = (
+    "filePath",
+    "file_path",
+    "path",
+    "filename",
+    "file",
+    "target",
+)
+
+
+def _file_write_path(arguments):
+    if not isinstance(arguments, dict):
+        return ""
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _file_write_content_key(arguments):
+    if not isinstance(arguments, dict):
+        return ""
+    for key in ("content", "contents", "text", "data", "new_string", "newString"):
+        if key in arguments:
+            return key
+    return ""
+
+
+def _small_file_scaffold(path):
+    """Return a valid, intentionally tiny first stage for a large file."""
+    extension = os.path.splitext(str(path or ""))[1].lower()
+    if extension in {".html", ".htm"}:
+        return (
+            "<!doctype html>\n"
+            "<html lang=\"en\">\n"
+            "<head>\n"
+            "  <meta charset=\"utf-8\">\n"
+            "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+            "  <title>Work in progress</title>\n"
+            "</head>\n"
+            "<body>\n"
+            "  <main id=\"app\"></main>\n"
+            "  <!-- THUNDERMLX_CONTINUE: add the next bounded section here -->\n"
+            "</body>\n"
+            "</html>\n"
+        )
+    if extension == ".json":
+        return "{}\n"
+    if extension in {".md", ".mdx"}:
+        return "<!-- THUNDERMLX_CONTINUE: add the next bounded section here -->\n"
+    if extension in {".py", ".pyi", ".sh", ".rb", ".pl", ".r"}:
+        return "# THUNDERMLX_CONTINUE: implement in bounded sections.\n"
+    if extension in {
+        ".c", ".cc", ".cpp", ".css", ".go", ".h", ".hpp", ".java",
+        ".js", ".jsx", ".kt", ".m", ".mm", ".rs", ".scss", ".swift",
+        ".ts", ".tsx",
+    }:
+        return "// THUNDERMLX_CONTINUE: implement in bounded sections.\n"
+    return "THUNDERMLX_CONTINUE: add the next bounded section here.\n"
+
+
+def _bound_large_file_write_arguments(tool_name, arguments):
+    """Replace a giant atomic Write payload with a safe first-stage scaffold."""
+    normalized = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized not in _WRITE_FILE_TOOL_NAMES or not isinstance(arguments, dict):
+        return arguments, 0
+    content_key = _file_write_content_key(arguments)
+    content = arguments.get(content_key) if content_key else None
+    if (
+        TOOL_WRITE_CHUNK_MAX_CHARS <= 0
+        or not isinstance(content, str)
+        or len(content) <= TOOL_WRITE_CHUNK_MAX_CHARS
+    ):
+        return arguments, 0
+    bounded = dict(arguments)
+    bounded[content_key] = _small_file_scaffold(_file_write_path(arguments))
+    return bounded, len(content)
+
+
+def _extract_incomplete_file_write_path(text, tool_name):
+    if not isinstance(text, str) or not text:
+        return ""
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        escaped = re.escape(key)
+        match = re.search(
+            rf"(?is)<(?:parameter\s+name=[\"']{escaped}[\"']|{escaped})>"
+            rf"(?P<value>.*?)(?:</(?:parameter|{escaped})>|\n|$)",
+            text,
+        )
+        if match:
+            value = match.group("value").strip().strip("'\"`")
+            value = re.sub(r"\]<\]minimax\[>\[\s*$", "", value).strip()
+            if value:
+                return value
+        match = re.search(
+            rf"(?is)[\"']{escaped}[\"']\s*:\s*[\"'](?P<value>.*?)[\"']",
+            text,
+        )
+        if match:
+            value = match.group("value").strip()
+            if value:
+                return value
+    return ""
+
+
+def _synthesize_bounded_write_scaffold_text(full_output, tools):
+    """Recover an oversized unterminated Write as one parseable small call."""
+    direct_payload_chars = _file_write_payload_chars(full_output, tools)
+    shell_write = _shell_create_file_payload_info(full_output, tools)
+    shell_payload_chars = int((shell_write or {}).get("payload_chars") or 0)
+    if (
+        TOOL_WRITE_CHUNK_MAX_CHARS <= 0
+        or max(direct_payload_chars, shell_payload_chars)
+        <= TOOL_WRITE_CHUNK_MAX_CHARS
+    ):
+        return ""
+    name_map = _tool_name_map_from_schema(tools)
+    selected_name = ""
+    path = ""
+    if direct_payload_chars > TOOL_WRITE_CHUNK_MAX_CHARS:
+        for tool in tools or []:
+            name = _tool_function_name(tool)
+            normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+            if normalized not in _WRITE_FILE_TOOL_NAMES:
+                continue
+            escaped = re.escape(name)
+            if re.search(
+                rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
+                rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
+                full_output or "",
+            ):
+                selected_name = _canonical_tool_name(name, name_map) or name
+                path = _extract_incomplete_file_write_path(
+                    full_output,
+                    selected_name,
+                )
+                break
+    if not selected_name and shell_payload_chars > TOOL_WRITE_CHUNK_MAX_CHARS:
+        for tool in tools or []:
+            name = _tool_function_name(tool)
+            normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+            if normalized in _WRITE_FILE_TOOL_NAMES:
+                selected_name = _canonical_tool_name(name, name_map) or name
+                path = str((shell_write or {}).get("path") or "")
+                break
+    if not selected_name:
+        return ""
+    if not path:
+        return ""
+    arguments = _canonicalize_tool_argument_keys(
+        {
+            "file_path": path,
+            "filePath": path,
+            "path": path,
+            "filename": path,
+            "content": _small_file_scaffold(path),
+        },
+        tools,
+        selected_name,
+    )
+    required = _tool_schema_required_names(tools, selected_name)
+    if any(arguments.get(key) in (None, "") for key in required):
+        return ""
+    return f"[Tool call: {selected_name}]\n{json.dumps(arguments, ensure_ascii=False)}"
+
+
+_RELATIVE_MUTATION_TARGET_RE = re.compile(
+    r"\b(?:create|write|save|edit|update|modify|patch|rename|move|copy)\s+"
+    r"(?:a\s+|an\s+|the\s+)?(?:new\s+)?(?:text\s+)?(?:file\s+)?"
+    r"(?:named\s+|called\s+|at\s+|to\s+)?"
+    r"(?P<path>(?:[A-Za-z0-9_.-]+/)*"
+    r"[A-Za-z0-9_.-]+\.[A-Za-z0-9][A-Za-z0-9._-]*)",
+    re.IGNORECASE,
+)
+
+
+def _fill_missing_mutating_tool_path(
+    tool_name,
+    arguments,
+    tools,
+    processed_messages,
+):
+    """Fill one missing required path from one explicit relative user target.
+
+    This only repairs mutating file tools when the schema requires a path, the
+    client supplied an exact working directory, and the real user instruction
+    names exactly one safe relative file. It never guesses among multiple
+    targets and never rewrites an explicit absolute user path.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _MUTATING_FILE_TOOL_NAMES:
+        return arguments, []
+    if not isinstance(arguments, dict):
+        return arguments, []
+    if any(
+        isinstance(arguments.get(key), str) and arguments.get(key).strip()
+        for key in _FILE_PATH_ARGUMENT_KEYS
+    ):
+        return arguments, []
+    required = set(_tool_schema_required_names(tools, tool_name))
+    required_path_keys = [
+        key for key in _FILE_PATH_ARGUMENT_KEYS if key in required
+    ]
+    if len(required_path_keys) != 1:
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(
+        processed_messages
+    )
+    instruction = _last_user_instruction_text(processed_messages)
+    if not working_directory or not instruction:
+        return arguments, []
+    targets = []
+    for match in _RELATIVE_MUTATION_TARGET_RE.finditer(instruction):
+        target = os.path.normpath(match.group("path").strip())
+        if (
+            target
+            and not os.path.isabs(target)
+            and ".." not in target.split(os.sep)
+            and target not in targets
+        ):
+            targets.append(target)
+    if len(targets) != 1:
+        return arguments, []
+    candidate = os.path.normpath(os.path.join(working_directory, targets[0]))
+    try:
+        inside = os.path.commonpath([working_directory, candidate]) == working_directory
+    except ValueError:
+        inside = False
+    if not inside:
+        return arguments, []
+    key = required_path_keys[0]
+    repaired = dict(arguments)
+    repaired[key] = candidate
+    return repaired, [(key, candidate)]
+
+
+def _anchor_mutating_tool_paths(tool_name, arguments, processed_messages):
+    """Rewrite a hallucinated absolute target to a user-named relative path.
+
+    This is intentionally narrow: the tool must mutate a file, the client must
+    provide an exact working directory, and the latest user request must name
+    the same basename as a relative path. Explicit absolute user targets are
+    never rewritten. Returns ``(arguments, changes)``.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _MUTATING_FILE_TOOL_NAMES:
+        return arguments, []
+    if not isinstance(arguments, dict):
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(
+        processed_messages
+    )
+    if not working_directory:
+        return arguments, []
+    user_text = _last_user_instruction_text(processed_messages)
+    if not user_text:
+        return arguments, []
+
+    anchored = dict(arguments)
+    changes = []
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        raw_path = anchored.get(key)
+        if not isinstance(raw_path, str) or not os.path.isabs(raw_path):
+            continue
+        raw_path = os.path.normpath(raw_path.strip())
+        try:
+            if os.path.commonpath([working_directory, raw_path]) == working_directory:
+                continue
+        except ValueError:
+            pass
+        basename = os.path.basename(raw_path)
+        if not basename or basename in {".", ".."}:
+            continue
+        # An explicit absolute path is user authority. Leave it untouched so
+        # the normal boundary either accepts the exact path or rejects a drift.
+        absolute_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_.-])/"
+            rf"(?:[^/\s'\"`<>]+/)*{re.escape(basename)}"
+        )
+        if absolute_pattern.search(user_text):
+            continue
+        relative_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_.-])"
+            rf"((?:[A-Za-z0-9_.-]+/)*{re.escape(basename)})"
+            rf"(?![A-Za-z0-9_.-])"
+        )
+        matches = [match.group(1) for match in relative_pattern.finditer(user_text)]
+        if not matches:
+            continue
+        relative_target = max(matches, key=len)
+        candidate = os.path.normpath(
+            os.path.join(working_directory, relative_target)
+        )
+        try:
+            inside = (
+                os.path.commonpath([working_directory, candidate])
+                == working_directory
+            )
+        except ValueError:
+            inside = False
+        if not inside:
+            continue
+        anchored[key] = candidate
+        changes.append((key, raw_path, candidate))
+    return anchored, changes
+
+
+def _tool_request_path_violation(tool_name, arguments, processed_messages):
+    """Return a reason when a mutating call invents an external path.
+
+    Relative paths remain client-resolved. Explicit external paths in the
+    latest user request remain valid. This only catches absolute mutation
+    targets that conflict with an anchored client working directory.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _MUTATING_FILE_TOOL_NAMES:
+        return ""
+    if not isinstance(arguments, dict):
+        return ""
+    working_directory = _tool_working_directory_from_messages(
+        processed_messages
+    )
+    if not working_directory:
+        return ""
+    user_text = _last_user_instruction_text(processed_messages)
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        raw_path = arguments.get(key)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            continue
+        raw_path = raw_path.strip()
+        if len(raw_path) > 1024 or any(ord(ch) < 32 for ch in raw_path):
+            return (
+                f"{tool_name}.{key} is not a sane file path "
+                f"(length={len(raw_path)}, contains_control="
+                f"{any(ord(ch) < 32 for ch in raw_path)})"
+            )
+        if not os.path.isabs(raw_path):
+            continue
+        candidate = os.path.normpath(raw_path)
+        try:
+            inside_working_directory = (
+                os.path.commonpath([working_directory, candidate])
+                == working_directory
+            )
+        except ValueError:
+            inside_working_directory = False
+        if inside_working_directory or candidate in user_text:
+            continue
+        return (
+            f"{tool_name}.{key} absolute path {candidate!r} is outside "
+            f"client working directory {working_directory!r}"
+        )
+    return ""
+
+
 def _extract_simple_write_request(text):
     if not isinstance(text, str) or not text.strip():
         return None
@@ -7538,7 +8603,9 @@ def _synthesize_write_command_tool_call(processed_messages, tools, dropped_tool_
     }
     if dropped and "applypatch" not in dropped:
         return None
-    request = _extract_simple_write_request(_last_user_text(processed_messages))
+    request = _extract_simple_write_request(
+        _last_user_instruction_text(processed_messages)
+    )
     if not request:
         return None
     command_name = _command_tool_name_from_schema(tools)
@@ -7581,6 +8648,81 @@ def _tool_retry_gen_params(gen_params, attempt):
     return retry
 
 
+def _tool_retry_recovery_hint(full_output, tool_module, tools):
+    """Return targeted feedback for a structurally invalid tool call."""
+    def _write_hint(reason):
+        return (
+            f"Tool-call recovery: the previous file-write call {reason}. "
+            "Emit exactly one valid file-write call with both the path and "
+            "`content`. Create only a small working scaffold and keep "
+            f"`content` at or below {TOOL_WRITE_CHUNK_MAX_CHARS} "
+            "characters. Do not attempt the complete large file in this "
+            "retry; continue with focused Edit or bounded append calls "
+            "after the client executes the scaffold."
+        )
+
+    tool_calls, _ = _parse_tool_calls(full_output or "", tool_module, tools)
+    for tool_call in tool_calls:
+        name = _tool_call_name_for_loop(tool_call)
+        normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+        if normalized not in _MUTATING_FILE_TOOL_NAMES:
+            continue
+        arguments = _tool_call_arguments_dict(tool_call)
+        required = set(_tool_schema_required_names(tools, name))
+        content = arguments.get("content")
+        if "content" in required and not (
+            isinstance(content, str) and content
+        ):
+            return _write_hint(
+                "was invalid because its required `content` argument was missing"
+            )
+    raw_output = full_output or ""
+    if _looks_like_raw_tool_fragment(raw_output, tool_module):
+        for tool in tools or []:
+            name = _tool_function_name(tool)
+            normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+            if normalized not in _MUTATING_FILE_TOOL_NAMES:
+                continue
+            escaped = re.escape(name)
+            if re.search(
+                rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
+                rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
+                raw_output,
+            ):
+                return _write_hint(
+                    "did not close before the generation budget ended"
+                )
+    return ""
+
+
+def _render_tool_retry_prompt(model, processor, processed_messages, tools,
+                              retry_thinking_mode, recovery_hint):
+    if not recovery_hint:
+        return None
+    from mlx_vlm.prompt_utils import apply_chat_template
+
+    retry_messages = [
+        {"role": "system", "content": recovery_hint},
+        *[dict(message) for message in processed_messages],
+    ]
+    template_kwargs = _thinking_template_kwargs(
+        model.config,
+        enable_thinking=(retry_thinking_mode == "enabled"),
+        thinking_mode=retry_thinking_mode,
+    )
+    if tools:
+        template_kwargs["tools"] = tools
+    with _tokenizer_runtime_lock:
+        return apply_chat_template(
+            processor,
+            model.config,
+            retry_messages,
+            add_generation_prompt=True,
+            num_images=0,
+            **template_kwargs,
+        )
+
+
 def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
                       thinking_mode, require_call=False):
     """True when a buffered tool-mode generation can be returned as-is.
@@ -7602,6 +8744,7 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
             tools,
             return_dropped=True,
             return_dropped_names=True,
+            processed_messages=processed_messages,
         )
         if validated:
             return True
@@ -7641,6 +8784,11 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
         assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
     )
     content = _scrub_goal_state_echo((content or "").strip())
+    if _tool_intent_without_call(content):
+        # A post-tool turn can still end with "Now let me write/run..." and
+        # no call. Treat that as an unfinished action, not a final answer, so
+        # the bounded retry ladder emits the tool the model promised.
+        return False
     # A turn whose visible content is itself a copy-spiral (2026-07-10: a
     # No-Think retry looped a ~300-char analysis paragraph to its 4096 cap
     # and shipped as the answer) is never usable — force the ladder onward.
@@ -7654,7 +8802,8 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                              gen_params, image_path, token_ids, session_id,
                              session_source, tool_module, tools,
                              processed_messages, req_id, stream,
-                             should_abort=None, progress_cb=None):
+                             should_abort=None, progress_cb=None,
+                             action_tool_task=False):
     """Regenerate an unusable tool turn in place instead of falling back.
 
     MiniMax occasionally emits empty or malformed tool markup, especially in
@@ -7668,13 +8817,37 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         return full_output
     if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
         return full_output
-    # tool_choice rides the rank broadcast; custom keys do not. Derive
-    # the OpenAI required/named-forcing flag from it directly.
-    require_call = _tool_choice_required_name(rank_request or {})[0]
+    # Explicit OpenAI forcing and clear first-turn action requests both need
+    # a real call. A prose draft is not successful execution. The inference
+    # helper deliberately stops inferring once a tool result exists, so a
+    # normal final answer remains possible after the work is complete.
+    require_call = _tool_request_requires_call(
+        processed_messages,
+        rank_request or {},
+    )
     if _usable_tool_turn(full_output, tool_module, tools, processed_messages,
                          thinking_mode, require_call=require_call):
         return full_output
     label = "stream" if stream else "non-stream"
+    bounded_scaffold = _synthesize_bounded_write_scaffold_text(
+        full_output,
+        tools,
+    )
+    if bounded_scaffold and _usable_tool_turn(
+        bounded_scaffold,
+        tool_module,
+        tools,
+        processed_messages,
+        thinking_mode,
+        require_call=require_call,
+    ):
+        logger.warning(
+            "[rank 0] %s %s replaced an oversized incomplete Write with "
+            "a bounded scaffold tool call",
+            label,
+            req_id,
+        )
+        return bounded_scaffold
     ceiling = MAX_TOKENS_CEILING if MAX_TOKENS_CEILING > 0 else 16384
     retry_max_tokens = min(ceiling, max(int(max_tokens or 0), 2048) * 2)
     if TOOL_UNUSABLE_RETRY_MAX_TOKENS > 0:
@@ -7696,22 +8869,68 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         # pipeline). Fast + reliable: goes straight to the call instead of
         # re-entering the reasoning ramble that botched it.
         retry_thinking_mode = "disabled" if TOOL_RETRY_NO_THINK else thinking_mode
+        retry_prompt = prompt
+        retry_token_ids = token_ids
+        recovery_hint = _tool_retry_recovery_hint(
+            full_output,
+            tool_module,
+            tools,
+        )
+        if recovery_hint and not image_path:
+            try:
+                retry_prompt = _render_tool_retry_prompt(
+                    model,
+                    processor,
+                    processed_messages,
+                    tools,
+                    retry_thinking_mode,
+                    recovery_hint,
+                ) or prompt
+                rendered_token_ids = _tokenize_prompt(
+                    processor,
+                    retry_prompt,
+                )
+                if not rendered_token_ids:
+                    raise RuntimeError(
+                        "targeted retry prompt tokenization returned no ids"
+                    )
+                retry_token_ids = rendered_token_ids
+                logger.warning(
+                    "[rank 0] %s %s tool retry %d using targeted "
+                    "large-write recovery guidance (%d prompt tokens)",
+                    label,
+                    req_id,
+                    attempt,
+                    len(retry_token_ids),
+                )
+            except Exception as e:
+                logger.warning(
+                    "[rank 0] %s %s could not render targeted tool retry "
+                    "prompt; using original prompt: %s",
+                    label,
+                    req_id,
+                    e,
+                )
         retry_request = dict(rank_request)
         retry_request["gen_params"] = retry_params
         retry_request["max_tokens"] = retry_max_tokens
         retry_request["thinking_mode"] = retry_thinking_mode
+        retry_request["prompt"] = retry_prompt
+        retry_request["token_ids"] = retry_token_ids
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 tool retry")
         _bcast(retry_request, rank)
         try:
             full_output = run_generation(
-                model, processor, prompt, retry_max_tokens, rank,
+                model, processor, retry_prompt, retry_max_tokens, rank,
                 image=image_path, thinking_mode=retry_thinking_mode,
                 gen_params=retry_params, progress_cb=progress_cb,
-                token_ids=token_ids,
+                token_ids=retry_token_ids,
                 session_id=session_id, session_source=session_source,
                 reset_incomplete_thinking_on_limit=False,
                 tool_module=tool_module, tools=tools,
+                require_tool_call=require_call,
+                action_tool_task=action_tool_task,
             )
         except Exception as e:
             logger.error(
@@ -7757,6 +8976,7 @@ def _validate_outgoing_tool_calls(
     *,
     return_dropped=False,
     return_dropped_names=False,
+    processed_messages=None,
 ):
     """Return OpenAI tool_calls that match the submitted schema exactly.
 
@@ -7803,6 +9023,44 @@ def _validate_outgoing_tool_calls(
                 decoded = {}
             decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
             decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+            decoded, filled_paths = _fill_missing_mutating_tool_path(
+                name,
+                decoded,
+                tools,
+                processed_messages,
+            )
+            for key, target in filled_paths:
+                logger.warning(
+                    "filled missing outgoing %s.%s from the explicit client "
+                    "target %r",
+                    name,
+                    key,
+                    target,
+                )
+            decoded, anchored_paths = _anchor_mutating_tool_paths(
+                name,
+                decoded,
+                processed_messages,
+            )
+            for key, source, target in anchored_paths:
+                logger.warning(
+                    "anchored outgoing %s.%s from %r to client path %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
+            decoded, oversized_write_chars = _bound_large_file_write_arguments(
+                name,
+                decoded,
+            )
+            if oversized_write_chars:
+                logger.warning(
+                    "bounded outgoing %s content from %d characters to a "
+                    "small scaffold; continue through subsequent Edit calls",
+                    name,
+                    oversized_write_chars,
+                )
             required = _tool_schema_required_names(tools, name)
             missing_required = [
                 key for key in required
@@ -7820,6 +9078,14 @@ def _validate_outgoing_tool_calls(
                 continue
             if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
                 logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
+                dropped += 1
+                dropped_names.append(str(name))
+                continue
+            path_violation = _tool_request_path_violation(
+                name, decoded, processed_messages
+            )
+            if path_violation:
+                logger.warning("dropping outgoing tool call: %s", path_violation)
                 dropped += 1
                 dropped_names.append(str(name))
                 continue
@@ -7864,6 +9130,44 @@ def _validate_outgoing_tool_calls(
                 continue
         decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
         decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+        decoded, filled_paths = _fill_missing_mutating_tool_path(
+            name,
+            decoded,
+            tools,
+            processed_messages,
+        )
+        for key, target in filled_paths:
+            logger.warning(
+                "filled missing outgoing %s.%s from the explicit client "
+                "target %r",
+                name,
+                key,
+                target,
+            )
+        decoded, anchored_paths = _anchor_mutating_tool_paths(
+            name,
+            decoded,
+            processed_messages,
+        )
+        for key, source, target in anchored_paths:
+            logger.warning(
+                "anchored outgoing %s.%s from %r to client path %r",
+                name,
+                key,
+                source,
+                target,
+            )
+        decoded, oversized_write_chars = _bound_large_file_write_arguments(
+            name,
+            decoded,
+        )
+        if oversized_write_chars:
+            logger.warning(
+                "bounded outgoing %s content from %d characters to a small "
+                "scaffold; continue through subsequent Edit calls",
+                name,
+                oversized_write_chars,
+            )
         if not decoded and _tool_schema_expects_arguments(tools, name):
             logger.warning("dropping outgoing %s tool call with empty arguments", name)
             dropped += 1
@@ -7903,6 +9207,14 @@ def _validate_outgoing_tool_calls(
                 })
                 continue
             logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
+            dropped += 1
+            dropped_names.append(str(name))
+            continue
+        path_violation = _tool_request_path_violation(
+            name, decoded, processed_messages
+        )
+        if path_violation:
+            logger.warning("dropping outgoing tool call: %s", path_violation)
             dropped += 1
             dropped_names.append(str(name))
             continue
@@ -8953,6 +10265,23 @@ def _parse_tool_calls(text, tool_module, tools):
     if not text or tool_module is None:
         return [], text
     start, _ = _tool_call_markers(tool_module)
+    # Never execute a parser-recovered call from an unclosed native block.
+    # At max_tokens the permissive MLX parser can salvage `file_path` plus a
+    # partial `content` string and downstream clients will faithfully write a
+    # truncated file. A tool response is atomic: if its last native block did
+    # not close, discard every call and let the bounded retry regenerate it.
+    marker_at = text.rfind(start) if start else -1
+    open_tail = text[marker_at:] if marker_at >= 0 else ""
+    if (
+        marker_at >= 0
+        and not _tool_block_emission_finished(text, tool_module)
+        and "</invoke" not in open_tail
+    ):
+        logger.warning(
+            "native tool invocation ended before its closing tag; refusing "
+            "partial tool execution and requesting regeneration"
+        )
+        return [], text[:text.find(start)].rstrip()
     try:
         from mlx_vlm.server.responses_state import process_tool_calls
 
@@ -9493,7 +10822,9 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    token_ids=None, session_id=None, session_source=None,
                    prefill_progress_cb=None,
                    reset_incomplete_thinking_on_limit=True,
-                   tool_module=None, tools=None):
+                   tool_module=None, tools=None,
+                   require_tool_call=False,
+                   action_tool_task=False):
     """Both ranks run stream_generate in lockstep. On ANY error, raise so the
     caller can signal the partner and release memory.
 
@@ -9586,8 +10917,21 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     n = 0
     generated_token_ids = []
     tool_accumulated = ""
+    tool_call_started = False
+    tool_complete_seen = False
     raw_tool_fragment_tokens = 0
     stopped = False
+    runaway_budget = (
+        TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+        if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+    )
+    no_call_budget = (
+        TOOL_NO_CALL_TOKEN_BUDGET
+        if require_tool_call
+        else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
+        if action_tool_task
+        else TOOL_NO_CALL_TOKEN_BUDGET
+    )
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -9614,6 +10958,11 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 token_text = getattr(response, "text", None) or ""
                 if token_text:
                     tool_accumulated += token_text
+                    if tools and not tool_call_started:
+                        tool_call_started = _tool_call_started(
+                            tool_accumulated,
+                            tool_module,
+                        )
                     if rank == 0:
                         text += token_text
                 n += 1
@@ -9648,19 +10997,89 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 # so a turn writing a long answer is never clipped.
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
-                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and runaway_budget > 0
                         and thinking_mode == "enabled"
-                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and n >= runaway_budget
                         and "</mm:think>" not in text
                         and "</think>" not in text):
                     logger.warning(
                         "rank 0: thinking-runaway guard at token %d "
-                        "(still in <mm:think>, no visible answer) — forcing "
+                        "(still in <mm:think>, no visible answer%s) — forcing "
                         "EOS to release the slot",
                         n,
+                        "; tool turn" if tools else "",
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
+                        and no_call_budget > 0
+                        and n >= no_call_budget
+                        and not tool_call_started
+                        and (
+                            require_tool_call
+                            or action_tool_task
+                            or _tool_intent_without_call(tool_accumulated)
+                        )):
+                    logger.warning(
+                        "rank 0: no-call tool guard at token %d "
+                        "(required=%s, action_task=%s, budget=%d, no call "
+                        "marker started) — forcing EOS "
+                        "for bounded retry",
+                        n,
+                        bool(require_tool_call),
+                        bool(action_tool_task),
+                        no_call_budget,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
+                        and tool_call_started
+                        and TOOL_WRITE_CHUNK_MAX_CHARS > 0
+                        and n % 8 == 0):
+                    write_payload_chars = _file_write_payload_chars(
+                        tool_accumulated,
+                        tools,
+                    )
+                    shell_write = _shell_create_file_payload_info(
+                        tool_accumulated,
+                        tools,
+                    )
+                    shell_write_payload_chars = int(
+                        (shell_write or {}).get("payload_chars") or 0
+                    )
+                    oversized_payload_chars = max(
+                        write_payload_chars,
+                        shell_write_payload_chars,
+                    )
+                    if (
+                        oversized_payload_chars
+                        > TOOL_WRITE_CHUNK_MAX_CHARS
+                        and not _tool_call_complete_for_stop(
+                            tool_accumulated,
+                            tool_module,
+                            tools,
+                        )
+                    ):
+                        logger.warning(
+                            "rank 0: oversized %s payload at token %d "
+                            "(%d chars after invocation, budget=%d) — forcing "
+                            "EOS for scaffold retry",
+                            (
+                                "file-producing shell"
+                                if shell_write_payload_chars
+                                >= oversized_payload_chars
+                                else "file-write"
+                            ),
+                            n,
+                            oversized_payload_chars,
+                            TOOL_WRITE_CHUNK_MAX_CHARS,
+                        )
+                        _FORCE_EOS["active"] = True
+                        stopped = True
                 # Degenerate-repetition guard: force EOS on a tight copy-spiral
                 # (any repeating unit), checked cheaply every 12 tokens.
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
@@ -9681,18 +11100,28 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     _sp = _read_prefill_stop_file()
                     if (
                         _sp
-                        and _sp.get("phase") == "decode"
+                        and _sp.get("phase") in {"decode", "any"}
                         and _sp.get("nonce")
                         and _sp.get("nonce") == _STOP_NONCE.get("value")
-                        and int(_sp.get("stop_at_tokens") or 0) > 0
-                        and n >= int(_sp.get("stop_at_tokens") or 0)
+                        and int(
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens")
+                            or 0
+                        ) > 0
+                        and n >= int(
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens")
+                            or 0
+                        )
                     ):
                         logger.info(
                             "rank 0: decode stop honored at token %d — "
                             "forcing EOS via sampled-token sync "
                             "(stop_at=%s, reason=%s)",
                             n,
-                            _sp.get("stop_at_tokens"), _sp.get("reason"),
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens"),
+                            _sp.get("reason"),
                         )
                         _FORCE_EOS["active"] = True
                         stopped = True
@@ -9714,35 +11143,69 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     tool_accumulated, tool_module, tools
                 )
                 if tool_stop_ready:
-                    logger.info(
-                        "rank %s: complete tool call detected at token %d; "
-                        "requesting synchronized decode stop",
-                        rank, n,
-                    )
-                    if UNSAFE_INFLIGHT_STOP:
-                        _set_stop_request("tool")
+                    if _BATCH_PATH_ACTIVE["value"] and BATCH_TOOL_NATURAL_DRAIN:
+                        if not tool_complete_seen:
+                            logger.info(
+                                "rank %s: complete tool call detected at token "
+                                "%d; consuming to natural synchronized EOS",
+                                rank,
+                                n,
+                            )
+                            tool_complete_seen = True
                         continue
-                    break
+                    if _BATCH_PATH_ACTIVE["value"]:
+                        if rank == 0:
+                            logger.info(
+                                "rank 0: complete tool call detected at token "
+                                "%d; arming synchronized EOS",
+                                n,
+                            )
+                            _arm_rank0_semantic_eos(
+                                rank,
+                                "complete_tool_call",
+                                n,
+                            )
+                        continue
+                    # Upstream stream_generate may have a prefetched pipeline
+                    # step in flight when its consumer receives this yield.
+                    # Closing either local generator here can split the ranks;
+                    # let the model's natural EOS finish unsupported shapes.
+                    if rank == 0 and not tool_complete_seen:
+                        logger.info(
+                            "rank 0: complete tool call detected at token %d "
+                            "on upstream generator; draining to natural EOS",
+                            n,
+                        )
+                        tool_complete_seen = True
+                    continue
+                # Semantic parser state is process-local. Rank 1 must never
+                # close its generator from this guard: one such close at token
+                # 683 left rank 0 decoding past 5k until the watchdog killed
+                # both processes. Rank 0 instead injects EOS into the existing
+                # sampled-token sync, so both ranks finish at one boundary.
                 if (
-                    tools
+                    rank == 0
+                    and not _FORCE_EOS.get("active")
+                    and tools
                     and THINKING_RAW_SILENT_LIMIT > 0
                     and _tool_fragment_looks_degenerate(tool_accumulated, tool_module)
                 ):
                     raw_tool_fragment_tokens += 1
                     if raw_tool_fragment_tokens >= THINKING_RAW_SILENT_LIMIT:
                         logger.warning(
-                            "rank %s: incomplete raw tool fragment guard tripped "
+                            "rank 0: incomplete raw tool fragment guard tripped "
                             "at token %d (raw_tool_tokens=%d, limit=%d); "
-                            "requesting synchronized decode stop",
-                            rank,
+                            "arming synchronized EOS",
                             n,
                             raw_tool_fragment_tokens,
                             THINKING_RAW_SILENT_LIMIT,
                         )
-                        if UNSAFE_INFLIGHT_STOP:
-                            _set_stop_request("tool")
-                            continue
-                        break
+                        if _arm_rank0_semantic_eos(
+                            rank,
+                            "incomplete_raw_tool_fragment",
+                            n,
+                        ):
+                            stopped = True
                 else:
                     raw_tool_fragment_tokens = 0
         # On clean completion, record the full token sequence in the cache.
@@ -9803,7 +11266,9 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                           session_id=None, session_source=None,
                           prefill_progress_cb=None,
                           reset_incomplete_thinking_on_limit=True,
-                          tool_module=None, tools=None):
+                          tool_module=None, tools=None,
+                          require_tool_call=False,
+                          action_tool_task=False):
     """Streaming generation. Yields delta dicts with keys from
     {"reasoning", "content"} in OpenAI delta format.
 
@@ -9901,13 +11366,27 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     in_thinking = bool(enable_thinking)
     accumulated = ""
     raw_tail = ""  # rolling raw-text tail for the repetition guard
+    tool_guard_text = ""
+    tool_call_started = False
     at_response_start = True
     n = 0
     generated_token_ids = []
     stopped = False
     malformed_thinking = False
     raw_silent_tokens = 0
+    tool_complete_seen = False
     thinking_active = _enable_thinking_for_generation(thinking_mode)
+    runaway_budget = (
+        TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+        if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+    )
+    no_call_budget = (
+        TOOL_NO_CALL_TOKEN_BUDGET
+        if require_tool_call
+        else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
+        if action_tool_task
+        else TOOL_NO_CALL_TOKEN_BUDGET
+    )
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -9955,6 +11434,12 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # for history. 2026-07-10 ca0f2748: a retry spiraled 3.8k
                 # tokens of bare markers past a guard checking `accumulated`.
                 raw_tail = (raw_tail + token_text)[-600:]
+                if tools and not tool_call_started and token_text:
+                    tool_guard_text += token_text
+                    tool_call_started = _tool_call_started(
+                        tool_guard_text,
+                        tool_module,
+                    )
                 _watchdog_tick(progress=True)
                 # Safe decode-phase stop: rank 0 watches the coordinated stop
                 # file every 8 tokens and, when the boundary is reached, ARMS
@@ -9970,15 +11455,39 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # checks on the consumed `accumulated` buffer never matched).
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
-                        and THINKING_RUNAWAY_TOKEN_BUDGET > 0
+                        and runaway_budget > 0
                         and thinking_mode == "enabled"
-                        and n >= THINKING_RUNAWAY_TOKEN_BUDGET
+                        and n >= runaway_budget
                         and in_thinking):
                     logger.warning(
                         "rank 0: thinking-runaway guard at token %d "
-                        "(still in <mm:think>, no visible answer) — forcing "
+                        "(still in <mm:think>, no visible answer%s) — forcing "
                         "EOS to release the slot",
                         n,
+                        "; tool turn" if tools else "",
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
+                        and no_call_budget > 0
+                        and n >= no_call_budget
+                        and not tool_call_started
+                        and (
+                            require_tool_call
+                            or action_tool_task
+                            or _tool_intent_without_call(tool_guard_text)
+                        )):
+                    logger.warning(
+                        "rank 0: no-call tool guard at token %d "
+                        "(required=%s, action_task=%s, budget=%d, no call "
+                        "marker started) — forcing EOS "
+                        "for bounded retry",
+                        n,
+                        bool(require_tool_call),
+                        bool(action_tool_task),
+                        no_call_budget,
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
@@ -10001,19 +11510,29 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     _sp = _read_prefill_stop_file()
                     if (
                         _sp
-                        and _sp.get("phase") == "decode"
+                        and _sp.get("phase") in {"decode", "any"}
                         # nonce match = this stop belongs to THIS generation
                         and _sp.get("nonce")
                         and _sp.get("nonce") == _STOP_NONCE.get("value")
-                        and int(_sp.get("stop_at_tokens") or 0) > 0
-                        and n >= int(_sp.get("stop_at_tokens") or 0)
+                        and int(
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens")
+                            or 0
+                        ) > 0
+                        and n >= int(
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens")
+                            or 0
+                        )
                     ):
                         logger.info(
                             "rank 0: decode stop honored at token %d — "
                             "forcing EOS via sampled-token sync "
                             "(stop_at=%s, reason=%s)",
                             n,
-                            _sp.get("stop_at_tokens"), _sp.get("reason"),
+                            _sp.get("decode_stop_at_tokens")
+                            or _sp.get("stop_at_tokens"),
+                            _sp.get("reason"),
                         )
                         _FORCE_EOS["active"] = True
                         stopped = True
@@ -10074,7 +11593,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         raw_silent_tokens += 1
 
                 if (
-                    THINKING_RAW_SILENT_LIMIT > 0
+                    rank == 0
+                    and _BATCH_PATH_ACTIVE["value"]
+                    and not _FORCE_EOS.get("active")
+                    and THINKING_RAW_SILENT_LIMIT > 0
                     and not tools  # oMLX PARITY (2026-07-07): oMLX has NO
                     # no-visible guard. On a TOOL turn the holdback silences
                     # the client for the whole (legitimately long) tool block,
@@ -10090,32 +11612,44 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 ):
                     malformed_thinking = True
                     logger.warning(
-                        "rank %s: no-visible stream guard tripped at token %d "
-                        "(raw_silent=%d, limit=%d, thinking=%s); breaking",
-                        rank,
+                        "rank 0: no-visible stream guard tripped at token %d "
+                        "(raw_silent=%d, limit=%d, thinking=%s); arming "
+                        "synchronized EOS",
                         n,
                         raw_silent_tokens,
                         THINKING_RAW_SILENT_LIMIT,
                         thinking_active,
                     )
-                    if UNSAFE_INFLIGHT_STOP:
-                        _set_stop_request("tool")
-                        continue
-                    break
+                    if _arm_rank0_semantic_eos(
+                        rank,
+                        "no_visible_stream",
+                        n,
+                    ):
+                        stopped = True
                 tool_stop_ready = _tool_call_complete_for_stop(
                     accumulated, tool_module, tools
                 )
                 if rank != 0:
                     if tool_stop_ready:
-                        logger.info(
-                            "rank %s: complete tool call detected at token %d; "
-                            "requesting synchronized mirror stop",
-                            rank, n,
-                        )
-                        if UNSAFE_INFLIGHT_STOP:
-                            _set_stop_request("tool")
+                        if (
+                            _BATCH_PATH_ACTIVE["value"]
+                            and BATCH_TOOL_NATURAL_DRAIN
+                        ):
+                            if not tool_complete_seen:
+                                logger.info(
+                                    "rank %s: complete tool call detected at "
+                                    "token %d; consuming mirror to natural "
+                                    "synchronized EOS",
+                                    rank,
+                                    n,
+                                )
+                                tool_complete_seen = True
                             continue
-                        break
+                        # Rank 1 never turns semantic parser state into local
+                        # control flow. Rank 0 either injects synchronized EOS
+                        # on the batch path or both ranks drain natural EOS on
+                        # the upstream fallback path.
+                        continue
                     continue  # mirror rank: run forward calls, but emit nothing
 
                 metrics = {}
@@ -10149,15 +11683,36 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     yield metrics
 
                 if tool_stop_ready:
-                    logger.info(
-                        "rank %s: complete tool call detected at token %d; "
-                        "requesting synchronized stream stop",
-                        rank, n,
-                    )
-                    if UNSAFE_INFLIGHT_STOP:
-                        _set_stop_request("tool")
+                    if _BATCH_PATH_ACTIVE["value"] and BATCH_TOOL_NATURAL_DRAIN:
+                        if not tool_complete_seen:
+                            logger.info(
+                                "rank %s: complete tool call detected at token "
+                                "%d; consuming stream to natural synchronized "
+                                "EOS",
+                                rank,
+                                n,
+                            )
+                            tool_complete_seen = True
                         continue
-                    break
+                    if _BATCH_PATH_ACTIVE["value"]:
+                        logger.info(
+                            "rank 0: complete tool call detected at token %d; "
+                            "arming synchronized stream EOS",
+                            n,
+                        )
+                        _arm_rank0_semantic_eos(
+                            rank,
+                            "complete_stream_tool_call",
+                            n,
+                        )
+                    elif not tool_complete_seen:
+                        logger.info(
+                            "rank 0: complete tool call detected at token %d "
+                            "on upstream stream; draining to natural EOS",
+                            n,
+                        )
+                        tool_complete_seen = True
+                    continue
 
         # Flush any trailing buffered text
         if rank == 0 and accumulated and not stopped:
@@ -11182,6 +12737,7 @@ def run_http_server(model, processor, rank):
                 "reasoning_chars": 0,
                 "content_chars": 0,
                 "first_token_s": 0.0,
+                "last_token_s": 0.0,
                 "first_generator_token_s": 0.0,
                 "first_visible_delta_s": 0.0,
                 "cache_prepare_s": 0.0,
@@ -11225,14 +12781,14 @@ def run_http_server(model, processor, rank):
         with state_lock:
             current = request_state.get("active")
             if current is active:
-                if (
-                    "tokens_emitted" in updates
-                    and int(updates.get("tokens_emitted") or 0) > 0
-                    and not current.get("first_token_s")
-                ):
-                    updates["first_token_s"] = round(
-                        time.time() - current["started"], 3
-                    )
+                if "tokens_emitted" in updates:
+                    emitted = int(updates.get("tokens_emitted") or 0)
+                    previous = int(current.get("tokens_emitted") or 0)
+                    if emitted > previous:
+                        token_s = round(time.time() - current["started"], 3)
+                        if not current.get("first_token_s"):
+                            updates["first_token_s"] = token_s
+                        updates["last_token_s"] = token_s
                 current.update(updates)
 
     def _lifetime_with_active(snapshot, active):
@@ -11270,7 +12826,11 @@ def run_http_server(model, processor, rank):
             request_state["releasing"] = req_id
         shutdown_after_release = False
         total_elapsed = time.time() - active["started"]
-        generation_elapsed = float(active.get("generation_elapsed_s") or 0.0)
+        generation_elapsed = float(
+            active.get("generation_elapsed_s")
+            or active.get("last_token_s")
+            or 0.0
+        )
         elapsed = generation_elapsed if generation_elapsed > 0 else total_elapsed
         tokens = int(active.get("tokens_emitted") or 0)
         first_token_s = float(active.get("first_token_s") or 0.0)
@@ -11292,6 +12852,9 @@ def run_http_server(model, processor, rank):
             "post_generation_s": round(max(0.0, total_elapsed - elapsed), 2),
             "tps": tps,
             "first_token_s": round(first_token_s, 2),
+            "last_token_s": round(
+                float(active.get("last_token_s") or 0.0), 3
+            ),
             "first_generator_token_s": round(
                 float(active.get("first_generator_token_s") or 0.0), 2
             ),
@@ -11432,7 +12995,11 @@ def run_http_server(model, processor, rank):
             active["elapsed_s"] = round(elapsed, 3)
             tokens = int(active.get("tokens_emitted") or 0)
             first_token_s = float(active.get("first_token_s") or 0.0)
-            post_first_s = max(0.0, elapsed - first_token_s) if first_token_s > 0 else 0.0
+            decode_clock_s = float(active.get("last_token_s") or elapsed)
+            post_first_s = (
+                max(0.0, decode_clock_s - first_token_s)
+                if first_token_s > 0 else 0.0
+            )
             decode_tokens = max(0, tokens - 1)
             active["decode_tps"] = round(decode_tokens / post_first_s, 2) if post_first_s > 0 and decode_tokens > 0 else 0.0
             active["request_tps"] = round(tokens / elapsed, 2) if elapsed > 0 and tokens > 0 else 0.0
@@ -12141,11 +13708,28 @@ def run_http_server(model, processor, rank):
                 if key in m:
                     msg[key] = m[key]
             processed_messages.append(msg)
+        processed_messages, date_context_injected = _add_date_system_context(
+            processed_messages
+        )
+        request["_date_context_injected"] = date_context_injected
         processed_messages = _add_tool_system_hint_if_needed(
             processed_messages,
             request,
             tools,
             tool_loop_diag=tool_loop_diag,
+        )
+        require_tool_call = bool(
+            tools
+            and _tool_request_requires_call(processed_messages, request)
+        )
+        action_tool_task = bool(
+            tools
+            and (
+                _tool_choice_required_name(request)[0]
+                or _tool_text_requests_action(
+                    _last_user_instruction_text(processed_messages)
+                )
+            )
         )
 
         if (
@@ -12311,6 +13895,8 @@ def run_http_server(model, processor, rank):
             request_shape["prefill_step_size"] = _runtime_prefill_step_size(
                 len(request_token_ids)
             )
+        request_shape["require_tool_call"] = require_tool_call
+        request_shape["action_tool_task"] = action_tool_task
 
         # Clear any prior in-flight stop flag at the start of a new request.
         _clear_stop_request()
@@ -12338,6 +13924,8 @@ def run_http_server(model, processor, rank):
                         # when 'required'/named (2026-07-09).
                         "tool_choice": request.get(
                             "tool_choice", request.get("function_call")),
+                        "require_tool_call": require_tool_call,
+                        "action_tool_task": action_tool_task,
                         # Tool-bearing requests are buffered and parsed after
                         # decode, so reaching max_tokens can leave no visible
                         # content even when the stable tool/template prefix is
@@ -12448,6 +14036,8 @@ def run_http_server(model, processor, rank):
                             prefill_progress_cb=_prefill_progress,
                             tool_module=tool_module,
                             tools=tools,
+                            require_tool_call=require_tool_call,
+                            action_tool_task=action_tool_task,
                         ):
                             chunks_emitted += 1
                             prompt_tps = chunk.pop("_prompt_tps", None) if chunk else None
@@ -12738,6 +14328,7 @@ def run_http_server(model, processor, rank):
                                     or _user_stop_requested()
                                 ),
                                 progress_cb=_retry_progress,
+                                action_tool_task=action_tool_task,
                             )
                         tool_calls, remaining_text = _parse_tool_calls(
                             full_output, tool_module, tools
@@ -12792,6 +14383,7 @@ def run_http_server(model, processor, rank):
                                         tools,
                                         return_dropped=True,
                                         return_dropped_names=True,
+                                        processed_messages=processed_messages,
                                     )
                                 )
                             if not tool_calls and dropped_invalid_tool_calls:
@@ -12972,7 +14564,7 @@ def run_http_server(model, processor, rank):
                             out_q.put("data: [DONE]\n\n")
                             update_generation_slot(
                                 active,
-                                generation_elapsed_s=round(
+                                finalization_elapsed_s=round(
                                     time.time() - active["started"], 3
                                 ),
                                 reasoning_chars=reasoning_chars,
@@ -13249,6 +14841,8 @@ def run_http_server(model, processor, rank):
                         prefill_progress_cb=_prefill_progress,
                         tool_module=tool_module,
                         tools=tools,
+                        require_tool_call=require_tool_call,
+                        action_tool_task=action_tool_task,
                     )
                     if tools:
                         result["text"] = _ensure_usable_tool_turn(
@@ -13270,6 +14864,7 @@ def run_http_server(model, processor, rank):
                             stream=False,
                             should_abort=_user_stop_requested,
                             progress_cb=_progress,
+                            action_tool_task=action_tool_task,
                         )
                 except Exception as e:
                     job_error = e
@@ -13377,6 +14972,7 @@ def run_http_server(model, processor, rank):
                     tools,
                     return_dropped=True,
                     return_dropped_names=True,
+                    processed_messages=processed_messages,
                 )
             if not tool_calls and dropped_invalid_tool_calls:
                 synthesized = _synthesize_write_command_tool_call(
@@ -13657,7 +15253,13 @@ def run_mirror(model, processor, rank):
                                req.get("reset_incomplete_thinking_on_limit", True)
                            ),
                            tool_module=mirror_tool_module,
-                           tools=mirror_tools)
+                           tools=mirror_tools,
+                           require_tool_call=bool(
+                               req.get("require_tool_call", False)
+                           ),
+                           action_tool_task=bool(
+                               req.get("action_tool_task", False)
+                           ))
             if CLEAR_CACHE_AFTER_REQUEST:
                 mx.clear_cache()
             logger.info(

@@ -45,6 +45,7 @@ body.dark::before{ mix-blend-mode:screen; opacity:.18 }
 /* ---------------- masthead ---------------- */
 header.mast{ padding:26px 0 0 }
 .mast-row{ display:flex; align-items:flex-end; gap:24px; flex-wrap:wrap }
+.mast-identity{ min-width:0; flex:1 1 760px }
 h1.wordmark{
   font-size:clamp(44px,7vw,92px); line-height:.86; letter-spacing:-.035em;
   font-weight:900; text-transform:uppercase; font-stretch:condensed;
@@ -53,6 +54,17 @@ h1.wordmark{
 h1.wordmark small{
   display:block; font-size:11px; letter-spacing:.42em; font-weight:600;
   color:var(--muted); margin-top:10px; white-space:normal;
+}
+.model-ids{
+  display:flex; align-items:center; flex-wrap:wrap; gap:5px 14px;
+  margin-top:10px; font-family:var(--mono); font-size:11px;
+}
+.model-id{
+  appearance:none; border:0; border-bottom:1px solid var(--muted); padding:1px 0 2px;
+  background:transparent; color:var(--ink-2); cursor:pointer; font:inherit;
+}
+.model-id:hover,.model-id:focus-visible{
+  background:var(--ink); color:var(--paper); border-color:var(--ink); outline:none;
 }
 /* glitch: pure CSS, only on hover */
 .wordmark span.g{ position:relative; display:inline-block }
@@ -288,10 +300,18 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
 
 <header class="mast">
   <div class="mast-row">
-    <h1 class="wordmark" title="TYPE IS A LIVING THING. SO IS A CLUSTER.">
-      <span class="g" data-t="THUNDERMLX">THUNDERMLX</span>
-      <small id="tagline">2-MAC MINIMAX-M3 · RDMA PIPELINE · EVERY TOKEN LEAVES A TRACE</small>
-    </h1>
+    <div class="mast-identity">
+      <h1 class="wordmark" title="TYPE IS A LIVING THING. SO IS A CLUSTER.">
+        <span class="g" data-t="THUNDERMLX">THUNDERMLX</span>
+        <small id="tagline">2-MAC MINIMAX-M3 · RDMA PIPELINE · EVERY TOKEN LEAVES A TRACE</small>
+      </h1>
+      <div class="model-ids" aria-label="Available model IDs">
+        <span class="k">model ids</span>
+        <button type="button" class="model-id" data-model-id="Minimax-M3" title="Click to copy model ID">Minimax-M3</button>
+        <button type="button" class="model-id" data-model-id="Minimax-M3-No-Think" title="Click to copy model ID">Minimax-M3-No-Think</button>
+        <button type="button" class="model-id" data-model-id="M3-Web" title="Click to copy model ID">M3-Web</button>
+      </div>
+    </div>
     <div class="mast-side">
       <div class="line"><span class="k">status</span><span class="dot" id="hDot"></span><span class="v" id="hTxt">connecting</span></div>
       <div class="line"><span class="k">backend</span><span class="v" id="hBackend">—</span></div>
@@ -828,6 +848,11 @@ document.addEventListener("keydown", e => {
 /* ============ endpoint strip (click to copy) ============ */
 ["epApi","epGateway","epDash"].forEach(id => el(id).addEventListener("click", async () => {
   try{ await navigator.clipboard.writeText(el(id).textContent); toast("copied " + el(id).textContent); }
+  catch(e){ toast("copy failed"); }
+}));
+document.querySelectorAll("[data-model-id]").forEach(node => node.addEventListener("click", async () => {
+  const modelId = node.dataset.modelId;
+  try{ await navigator.clipboard.writeText(modelId); toast("copied " + modelId); }
   catch(e){ toast("copy failed"); }
 }));
 

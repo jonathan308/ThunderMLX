@@ -446,6 +446,14 @@ def main() -> int:
             "MLX_M3_STOP_ON_CLIENT_DISCONNECT=1, then run live abort tests."
         ),
     )
+    parser.add_argument(
+        "--live-stop",
+        action="store_true",
+        help=(
+            "Run the live abort matrix against the current coordinated stop "
+            "implementation without requiring the legacy unsafe flag."
+        ),
+    )
     args = parser.parse_args()
 
     initial = wait_idle(args.base_url)
@@ -455,7 +463,7 @@ def main() -> int:
     baseline_failed = int(initial.get("requests_failed") or 0)
     before_lifetime = dict(initial.get("lifetime_tokens") or {})
 
-    if args.require_unsafe_stop:
+    if args.require_unsafe_stop or args.live_stop:
         results = {
             "explicit_stop": explicit_stop(args.base_url, baseline_failed),
             "client_disconnect": client_disconnect(args.base_url, baseline_failed),

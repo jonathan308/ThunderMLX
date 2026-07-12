@@ -17,9 +17,12 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from model_gateway import (  # noqa: E402
+    _anthropic_bash_command_mutates,
     _anthropic_coding_continuation_message,
+    _anthropic_declared_working_directory,
     _anthropic_exact_reply_after_verified_tool,
     _anthropic_has_tool_result,
+    _anthropic_pending_mutation,
     _anthropic_write_fallback_message,
     _prune_openai_tools_for_anthropic_action,
     _repair_anthropic_tool_call_paths,
@@ -424,6 +427,94 @@ def test_action_tool_choice_relaxes_after_tool_result():
     assert out["tool_choice"] == "auto", out
 
 
+def test_pending_mutation_stays_tool_required_after_inspection():
+    payload = {
+        "model": "Minimax-M3-No-Think",
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Use tools to inspect notes, create AGENT_REPORT.txt, "
+                    "then verify it and reply long-agent-ok."
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_ls",
+                    "name": "Bash",
+                    "input": {"command": "ls notes"},
+                }],
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_ls",
+                    "content": "file_01.txt\nfile_02.txt",
+                }],
+            },
+        ],
+        "tools": [
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {
+                "name": "Write",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                },
+            },
+        ],
+        "tool_choice": {"type": "auto"},
+        "max_tokens": 2048,
+    }
+    assert _anthropic_pending_mutation(payload), payload
+    out = anthropic_to_openai_payload(payload)
+    assert out["tool_choice"] == "required", out
+    assert "Listing or reading files does not complete" in out["messages"][0]["content"]
+
+
+def test_pending_mutation_relaxes_after_real_write():
+    payload = {
+        "model": "Minimax-M3-No-Think",
+        "messages": [
+            {"role": "user", "content": "Create AGENT_REPORT.txt and verify it."},
+            {
+                "role": "assistant",
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_write",
+                    "name": "Write",
+                    "input": {
+                        "file_path": "AGENT_REPORT.txt",
+                        "content": "AX-01",
+                    },
+                }],
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_write",
+                    "content": "ok",
+                }],
+            },
+        ],
+        "tools": [{"name": "Write", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "any"},
+    }
+    assert not _anthropic_pending_mutation(payload), payload
+    out = anthropic_to_openai_payload(payload)
+    assert out["tool_choice"] == "auto", out
+    assert _anthropic_bash_command_mutates("python3 -c \"from pathlib import Path; Path('x').write_text('y')\"")
+    assert not _anthropic_bash_command_mutates("ls notes 2>/dev/null")
+
+
 def test_action_tool_pruning_for_file_tasks():
     names = [
         "Agent",
@@ -557,6 +648,79 @@ def test_tool_call_path_repair_from_ls_context():
     assert args["file_path"] == "src/app.py", args
 
 
+def test_tool_call_path_repair_anchors_existing_external_target():
+    cwd = "/private/tmp/claude-agent-project"
+    payload = {
+        "system": f"Agent context\n<env>\nWorking directory: {cwd}\n</env>",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Read the notes and create AGENT_REPORT.txt in the current "
+                "project directory."
+            ),
+        }],
+    }
+    assert _anthropic_declared_working_directory(payload) == cwd
+    data = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_wrong_home",
+                    "type": "function",
+                    "function": {
+                        "name": "make_file",
+                        "arguments": json.dumps({
+                            "filename": "/Users/example/AGENT_REPORT.txt",
+                            "content": "AX-01",
+                        }),
+                    },
+                }],
+            },
+        }],
+    }
+    out = _repair_anthropic_tool_call_paths(data, payload)
+    args = json.loads(
+        out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert args["filename"] == f"{cwd}/AGENT_REPORT.txt", args
+
+
+def test_tool_call_path_repair_uses_explicit_relative_target_without_cwd():
+    payload = {
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Read notes/*.txt and create AGENT_REPORT.txt in the current "
+                "project directory."
+            ),
+        }],
+    }
+    data = {
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_invented_home",
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "arguments": json.dumps({
+                            "file_path": "/Users/example/notes/AGENT_REPORT.txt",
+                            "content": "AX-01",
+                        }),
+                    },
+                }],
+            },
+        }],
+    }
+    out = _repair_anthropic_tool_call_paths(data, payload)
+    args = json.loads(
+        out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+    )
+    assert args["file_path"] == "AGENT_REPORT.txt", args
+
+
 def test_repeated_bash_ls_repair_breaks_loop():
     payload = {
         "messages": [
@@ -682,7 +846,7 @@ def test_coding_continuation_for_explicit_small_edit():
     assert "python3 src/app.py" in command, command
 
 
-def test_exact_reply_after_verified_tool():
+def test_exact_reply_does_not_rubber_stamp_dynamic_verification():
     payload = {
         "model": "Minimax-M3",
         "messages": [{
@@ -694,6 +858,25 @@ def test_exact_reply_after_verified_tool():
                     "then run cat AGENT_REPORT.txt to verify it. Reply with exactly "
                     "long-agent-ok."
                 ),
+            }],
+        }, {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_write",
+                "name": "Write",
+                "input": {
+                    "file_path": "AGENT_REPORT.txt",
+                    "content": "AX-01,AX-02,AX-03",
+                },
+            }],
+        }, {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_write",
+                "content": "ok",
+                "is_error": False,
             }],
         }, {
             "role": "assistant",
@@ -715,8 +898,96 @@ def test_exact_reply_after_verified_tool():
         "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
     }
     out = _anthropic_exact_reply_after_verified_tool(payload, "Minimax-M3")
+    assert out is None, out
+
+
+def test_exact_reply_after_literal_content_verification():
+    payload = {
+        "model": "Minimax-M3",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Create result.txt containing exactly thundermlx-tool-ok, "
+                "then run cat result.txt and reply with exactly done."
+            ),
+        }, {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_write",
+                "name": "Write",
+                "input": {"file_path": "result.txt", "content": "thundermlx-tool-ok"},
+            }],
+        }, {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_write",
+                "content": "ok",
+                "is_error": False,
+            }],
+        }, {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_cat",
+                "name": "Bash",
+                "input": {"command": "cat result.txt"},
+            }],
+        }, {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_cat",
+                "content": "thundermlx-tool-ok",
+                "is_error": False,
+            }],
+        }],
+        "tools": [
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {"name": "Write", "input_schema": {"type": "object"}},
+        ],
+    }
+    out = _anthropic_exact_reply_after_verified_tool(payload, "Minimax-M3")
     assert out is not None, payload
-    assert out["content"][0]["text"] == "long-agent-ok", out
+    assert out["content"][0]["text"] == "done", out
+
+
+def test_exact_reply_rejects_read_only_false_verification():
+    payload = {
+        "model": "Minimax-M3-No-Think",
+        "messages": [{
+            "role": "user",
+            "content": (
+                "Read notes, create AGENT_REPORT.txt, verify it, then reply "
+                "with exactly long-agent-ok."
+            ),
+        }, {
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_cat_notes",
+                "name": "Bash",
+                "input": {"command": "cat notes/*.txt"},
+            }],
+        }, {
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_cat_notes",
+                "content": "code: AX-01\ncode: AX-02",
+                "is_error": False,
+            }],
+        }],
+        "tools": [
+            {"name": "Bash", "input_schema": {"type": "object"}},
+            {"name": "Write", "input_schema": {"type": "object"}},
+        ],
+    }
+    assert _anthropic_pending_mutation(payload), payload
+    assert _anthropic_exact_reply_after_verified_tool(
+        payload, "Minimax-M3-No-Think"
+    ) is None
 
 
 def main():
@@ -734,14 +1005,20 @@ def main():
     test_write_postfallback_skips_coding_tasks()
     test_action_prompt_requires_tool_choice()
     test_action_tool_choice_relaxes_after_tool_result()
+    test_pending_mutation_stays_tool_required_after_inspection()
+    test_pending_mutation_relaxes_after_real_write()
     test_action_tool_pruning_for_file_tasks()
     test_required_tool_retry_payload()
     test_tool_call_path_repair_from_bootstrap_context()
     test_tool_call_path_repair_from_ls_context()
+    test_tool_call_path_repair_anchors_existing_external_target()
+    test_tool_call_path_repair_uses_explicit_relative_target_without_cwd()
     test_repeated_bash_ls_repair_breaks_loop()
     test_tool_result_detection()
     test_coding_continuation_for_explicit_small_edit()
-    test_exact_reply_after_verified_tool()
+    test_exact_reply_does_not_rubber_stamp_dynamic_verification()
+    test_exact_reply_after_literal_content_verification()
+    test_exact_reply_rejects_read_only_false_verification()
     print("PASS")
 
 
