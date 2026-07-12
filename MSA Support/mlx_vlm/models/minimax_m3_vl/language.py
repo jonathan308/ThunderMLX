@@ -93,6 +93,34 @@ _DECODE_TOPK_REUSE_TOKENS = max(
     0,
     int(_msa_os.environ.get("MLX_M3_DECODE_TOPK_REUSE_TOKENS", "0") or "0"),
 )
+_MSA_DECODE_TOPK_REUSE_TOKENS = _DECODE_TOPK_REUSE_TOKENS
+_MSA_COMPACT_DECODE_SORT_TOPK = _msa_os.environ.get(
+    "MLX_M3_COMPACT_DECODE_SORT_TOPK", "0"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def set_decode_topk_reuse_tokens(value: int) -> int:
+    """Update fused-decode selection reuse for safe runtime A/B tests."""
+    global _DECODE_TOPK_REUSE_TOKENS, _MSA_DECODE_TOPK_REUSE_TOKENS
+    applied = max(0, min(64, int(value or 0)))
+    _DECODE_TOPK_REUSE_TOKENS = applied
+    _MSA_DECODE_TOPK_REUSE_TOKENS = applied
+    return applied
+
+
+def set_compact_decode_sort_topk(value) -> bool:
+    """Retain the runtime-control contract used by the server dashboard."""
+    global _MSA_COMPACT_DECODE_SORT_TOPK
+    if isinstance(value, str):
+        _MSA_COMPACT_DECODE_SORT_TOPK = value.strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+    else:
+        _MSA_COMPACT_DECODE_SORT_TOPK = bool(value)
+    return _MSA_COMPACT_DECODE_SORT_TOPK
 # Split-verify (ThunderMLX): short EAGLE3 verify blocks (2<=L<=8) currently
 # fall to DENSE masked attention over the full context whenever the one-pass
 # sparse-prefill kernel is ineligible (below its key_length crossover). Split

@@ -147,6 +147,10 @@ Current implementation:
 3. Preserve hidden-thinking safety by creating prompt-prefix checkpoints only
    for explicit manual saves or when `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE=1`.
    Normal OpenAI/OpenWebUI/agent turns do not trim the RAM hot cache for SSD.
+   Automatic saves are coalesced until the completed cache advances by
+   `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS` (default `8192`). This
+   avoids synchronously rewriting tens of GiB after every small agent turn;
+   manual saves remain immediate and the in-memory cache remains the fast path.
 4. Restore only behind `MLX_M3_PROMPT_CACHE_SSD_RESTORE=1` after exact metadata,
    runtime, split, rank, model, tokenizer, shape, dtype, and token-prefix checks.
    Restore is attempted only after live RAM and resident-slot reuse miss and the

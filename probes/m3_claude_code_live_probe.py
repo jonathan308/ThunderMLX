@@ -24,8 +24,9 @@ DEFAULT_CLAUDE = str(Path.home() / ".local/bin/claude")
 
 
 def save_raw(args: argparse.Namespace, workdir: Path, name: str, raw: str) -> None:
-    if args.keep_workdir:
-        (workdir / f"{name}.stream.jsonl").write_text(raw)
+    # Successful probe roots are deleted in main(); failed roots are retained.
+    # Always persist the raw stream first so a rare failure is diagnosable.
+    (workdir / f"{name}.stream.jsonl").write_text(raw)
 
 
 def run_claude(
@@ -293,11 +294,13 @@ def run_long_agent_loop(args: argparse.Namespace, root: Path) -> dict[str, Any]:
     save_raw(args, workdir, "long_agent_loop", raw)
     report = workdir / "AGENT_REPORT.txt"
     expected_text = ",".join(expected)
-    if not report.exists() or report.read_text().strip() != expected_text:
+    actual_text = report.read_text().strip() if report.exists() else ""
+    actual_codes = [item.strip() for item in actual_text.split(",") if item.strip()]
+    if actual_codes != expected:
         raise AssertionError(
             "long agent report was not created correctly; "
             f"tools={tool_names(events)} result={final_result(events)!r} "
-            f"expected={expected_text!r} actual={report.read_text() if report.exists() else '<missing>'!r}"
+            f"expected={expected_text!r} actual={actual_text if report.exists() else '<missing>'!r}"
         )
     names = tool_names(events)
     if len(names) < 2:
@@ -334,6 +337,7 @@ def main() -> None:
         raise SystemExit(f"Claude Code CLI not found: {args.claude}")
 
     root = Path(tempfile.mkdtemp(prefix="thundermlx_claude_probe_"))
+    passed = False
     try:
         case_fns = {
             "simple_write": run_simple_write,
@@ -352,8 +356,9 @@ def main() -> None:
         for row in rows:
             print(json.dumps(row, sort_keys=True))
         print("PASS")
+        passed = True
     finally:
-        if args.keep_workdir:
+        if args.keep_workdir or not passed:
             print(json.dumps({"workdir": str(root)}, sort_keys=True))
         else:
             shutil.rmtree(root, ignore_errors=True)

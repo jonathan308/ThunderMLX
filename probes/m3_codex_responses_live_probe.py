@@ -12,7 +12,10 @@ import tempfile
 from typing import Any
 
 
-DEFAULT_CODEX = "/Applications/Codex.app/Contents/Resources/codex"
+DEFAULT_CODEX = (
+    shutil.which("codex")
+    or "/Applications/ChatGPT.app/Contents/Resources/codex"
+)
 DEFAULT_BASE = "http://127.0.0.1:8010/v1"
 
 

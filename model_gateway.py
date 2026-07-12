@@ -84,7 +84,7 @@ ANTHROPIC_SMALL_MODEL = os.environ.get("M3_GATEWAY_ANTHROPIC_SMALL_MODEL", "Mini
 ANTHROPIC_INTERNAL_TIMEOUT = float(os.environ.get("M3_GATEWAY_ANTHROPIC_TIMEOUT_SECONDS", "7200"))
 ANTHROPIC_RETRY_SMALL_ON_EMPTY_TOOL = env_bool("M3_GATEWAY_ANTHROPIC_RETRY_SMALL_ON_EMPTY_TOOL", True)
 ANTHROPIC_TOOL_HINT = env_bool("M3_GATEWAY_ANTHROPIC_TOOL_HINT", True)
-ANTHROPIC_ROUTE_ALIASED_TO_SMALL = env_bool("M3_GATEWAY_ANTHROPIC_ROUTE_ALIASED_TO_SMALL", True)
+ANTHROPIC_ROUTE_ALIASED_TO_SMALL = env_bool("M3_GATEWAY_ANTHROPIC_ROUTE_ALIASED_TO_SMALL", False)
 ANTHROPIC_REQUIRE_TOOLS_ON_ACTION = env_bool("M3_GATEWAY_ANTHROPIC_REQUIRE_TOOLS_ON_ACTION", True)
 # Context window advertised via /v1/models. The backend natively supports 1M,
 # but 262k-512k is the recommended coding window; 300k keeps Codex/Claude Code
@@ -99,6 +99,37 @@ STATE: dict[str, Any] = {
     "last_error": None,
     "events": [],
 }
+
+
+def canonical_m3_model_id(model: str | None) -> str | None:
+    """Map common client spelling/case variants to a visible M3 model id."""
+    raw = str(model or "").strip()
+    if not raw:
+        return None
+    by_casefold = {model_id.casefold(): model_id for model_id in M3_MODEL_IDS}
+    direct = by_casefold.get(raw.casefold())
+    if direct:
+        return direct
+    aliases = {
+        "m3": "Minimax-M3",
+        "m3-think": "Minimax-M3",
+        "m3-thinking": "Minimax-M3",
+        "minimax-m3-think": "Minimax-M3",
+        "minimax-m3-thinking": "Minimax-M3",
+        "minimax-m3-4bit": "Minimax-M3",
+        "mlx-community/minimax-m3-4bit": "Minimax-M3",
+        "mlx-community--minimax-m3-4bit": "Minimax-M3",
+        "m3-no-think": "Minimax-M3-No-Think",
+        "m3-nothink": "Minimax-M3-No-Think",
+        "m3-no-thinking": "Minimax-M3-No-Think",
+        "minimax-m3-nothink": "Minimax-M3-No-Think",
+        "minimax-m3-no-thinking": "Minimax-M3-No-Think",
+        "m3-web": "M3-Web",
+    }
+    candidate = aliases.get(raw.casefold())
+    if not candidate:
+        return None
+    return by_casefold.get(candidate.casefold(), candidate)
 
 
 def static_m3_model(model_id: str) -> dict[str, Any]:
@@ -134,16 +165,17 @@ def record_event(action: str, **fields: Any) -> None:
 def backend_for_model(model: str | None) -> str:
     if not model:
         return "m3"
-    if model in CLAUDE_MODEL_IDS:
+    if str(model).casefold() in {item.casefold() for item in CLAUDE_MODEL_IDS}:
         return "claude"
-    return "m3" if model in M3_MODEL_IDS else "omlx"
+    return "m3" if canonical_m3_model_id(model) else "omlx"
 
 
 def anthropic_model_to_m3(model: str | None) -> str:
     raw = str(model or "").strip()
     lowered = raw.lower()
-    if raw in M3_MODEL_IDS:
-        return raw
+    canonical = canonical_m3_model_id(raw)
+    if canonical:
+        return canonical
     if "no-think" in lowered or "nothink" in lowered or "haiku" in lowered:
         return ANTHROPIC_SMALL_MODEL
     return ANTHROPIC_DEFAULT_MODEL
@@ -172,6 +204,11 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
     if not model:
         payload["model"] = DEFAULT_MODEL_ID
         model = DEFAULT_MODEL_ID
+        changed = True
+    canonical_m3 = canonical_m3_model_id(model)
+    if canonical_m3 and canonical_m3 != model:
+        payload["model"] = canonical_m3
+        model = canonical_m3
         changed = True
     if not changed:
         return body, model, False
@@ -462,6 +499,67 @@ def _anthropic_text_requests_action(text: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _anthropic_text_requests_mutation(text: str) -> bool:
+    """Whether the task explicitly asks for a state-changing action."""
+    return bool(re.search(
+        r"\b(?:add|build|change|copy|create|delete|edit|fix|implement|make|"
+        r"modify|move|patch|remove|rename|rewrite|save|update|write)\b",
+        str(text or ""),
+        flags=re.IGNORECASE,
+    ))
+
+
+def _anthropic_bash_command_mutates(command: str) -> bool:
+    """Conservatively recognize shell commands that can satisfy a mutation."""
+    command = str(command or "")
+    if not command.strip():
+        return False
+    scrubbed = re.sub(r"(?:^|\s)\d+>{1,2}&?\d*\s*[^\s;|]*", " ", command)
+    if re.search(
+        r"(?:^|[;&|\n]\s*)(?:cp|install|mkdir|mv|rm|touch|truncate)\b",
+        scrubbed,
+    ):
+        return True
+    if re.search(r"\b(?:git\s+apply|perl\s+-pi|sed\s+-i|tee)\b", scrubbed):
+        return True
+    if re.search(r"\.(?:write_bytes|write_text)\s*\(", scrubbed):
+        return True
+    if re.search(r"\bopen\s*\([^\n]*,[^\n]*['\"](?:a|w|x)[+b]?['\"]", scrubbed):
+        return True
+    return bool(re.search(r"(?<![0-9])>{1,2}\s*[^&|\s]", scrubbed))
+
+
+def _anthropic_has_mutating_tool_use(payload: dict[str, Any]) -> bool:
+    mutating_names = {
+        "applypatch", "edit", "editfile", "makefile", "multiedit",
+        "notebookedit", "write", "writefile",
+    }
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = re.sub(
+                r"[^a-z0-9]", "", str(block.get("name") or "").lower()
+            )
+            if name in mutating_names:
+                return True
+            if name in {"bash", "execcommand", "shell"}:
+                tool_input = block.get("input")
+                if isinstance(tool_input, dict) and _anthropic_bash_command_mutates(
+                    tool_input.get("command") or tool_input.get("cmd") or ""
+                ):
+                    return True
+    return False
+
+
 def _anthropic_alias_input_to_model(args: dict[str, Any], alias: dict[str, Any] | None) -> dict[str, Any]:
     if not alias:
         return args
@@ -632,6 +730,13 @@ def anthropic_to_openai_payload(payload: dict[str, Any]) -> dict[str, Any]:
                     "valid tool call. Use the exact advertised tool names and "
                     "argument keys."
                 )
+            if _anthropic_text_requests_mutation(action_text):
+                hint_text += (
+                    " Do not give the requested completion/final answer until "
+                    "at least one requested state-changing action has actually "
+                    "succeeded. Listing or reading files does not complete a "
+                    "write, edit, create, fix, or update request."
+                )
             messages.insert(0, {
                 "role": "system",
                 "content": hint_text,
@@ -641,17 +746,25 @@ def anthropic_to_openai_payload(payload: dict[str, Any]) -> dict[str, Any]:
             payload.get("tool_choice"),
             name_aliases,
         )
-        if has_tool_result and out["tool_choice"] == "required":
+        pending_mutation = bool(
+            has_tool_result and _anthropic_pending_mutation(payload)
+        )
+        if (
+            has_tool_result
+            and out["tool_choice"] == "required"
+            and not pending_mutation
+        ):
             out["tool_choice"] = "auto"
         if (
             ANTHROPIC_REQUIRE_TOOLS_ON_ACTION
             and out["tool_choice"] == "auto"
-            and not has_tool_result
             and _anthropic_text_requests_action(action_text)
         ):
-            if "Bash" in _openai_tool_names(tools):
+            if pending_mutation:
+                out["tool_choice"] = "required"
+            elif not has_tool_result and "Bash" in _openai_tool_names(tools):
                 out["tool_choice"] = {"type": "function", "function": {"name": "Bash"}}
-            else:
+            elif not has_tool_result:
                 out["tool_choice"] = "required"
         if aliases:
             out["_anthropic_tool_aliases"] = aliases
@@ -791,6 +904,28 @@ def _openai_response_has_tool_calls(openai_response: dict[str, Any]) -> bool:
     return bool(message.get("tool_calls"))
 
 
+def _anthropic_declared_working_directory(payload: dict[str, Any]) -> str:
+    system = _anthropic_system_to_text(payload.get("system"))
+    patterns = (
+        r"<cwd>\s*(/[^<\r\n]+?)\s*</cwd>",
+        r"(?mi)^\s*(?:Current\s+)?Working directory\s*:\s*(/[^\r\n]+?)\s*$",
+        r"(?mi)^\s*cwd\s*:\s*(/[^\r\n]+?)\s*$",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, system, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = os.path.normpath(match.group(1).strip())
+        if (
+            os.path.isabs(candidate)
+            and candidate != "/"
+            and len(candidate) <= 1024
+            and not any(ord(ch) < 32 for ch in candidate)
+        ):
+            return candidate
+    return ""
+
+
 def _anthropic_tool_result_path_context(payload: dict[str, Any]) -> dict[str, Any]:
     parts: list[str] = []
     command_by_id: dict[str, str] = {}
@@ -820,7 +955,7 @@ def _anthropic_tool_result_path_context(payload: dict[str, Any]) -> dict[str, An
                     result_parts.append((tool_id, text))
     text = "\n".join(part for part in parts if part)
     files: set[str] = set()
-    cwd = ""
+    cwd = _anthropic_declared_working_directory(payload)
 
     def add_file(name: str, base_dir: str = "") -> None:
         name = str(name or "").strip()
@@ -917,9 +1052,11 @@ def _bash_command_for_repeated_inspection(payload: dict[str, Any], repeated: str
 
 
 def _repair_path_value_from_context(value: Any, context: dict[str, Any]) -> Any:
-    if not isinstance(value, str) or not value.startswith("/"):
+    if not isinstance(value, str) or not (
+        value.startswith("/") or value.startswith("~/")
+    ):
         return value
-    if os.path.exists(value):
+    if os.path.exists(os.path.expanduser(value)):
         return value
     files = context.get("files")
     if not isinstance(files, set) or not files:
@@ -937,13 +1074,19 @@ def _repair_path_value_from_context(value: Any, context: dict[str, Any]) -> Any:
 
 def _repair_anthropic_tool_call_paths(data: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     context = _anthropic_tool_result_path_context(payload)
+    action_text = _anthropic_action_text(payload)
     commands = context.get("commands") if isinstance(context.get("commands"), list) else []
     command_counts: dict[str, int] = {}
     for command in commands:
         normalized = _normalize_bash_command(str(command))
         if normalized:
             command_counts[normalized] = command_counts.get(normalized, 0) + 1
-    if not context.get("files") and not command_counts:
+    if (
+        not context.get("files")
+        and not command_counts
+        and not context.get("cwd")
+        and not action_text
+    ):
         return data
     changed = False
     for choice in data.get("choices") or []:
@@ -970,7 +1113,50 @@ def _repair_anthropic_tool_call_paths(data: dict[str, Any], payload: dict[str, A
                     args.setdefault("description", "Break repeated tool loop and gather evidence")
                     changed = True
             for key in ("file_path", "filePath", "path", "filename"):
-                repaired = _repair_path_value_from_context(args.get(key), context)
+                raw_value = args.get(key)
+                repaired = _repair_path_value_from_context(raw_value, context)
+                cwd = str(context.get("cwd") or "")
+                if (
+                    isinstance(raw_value, str)
+                    and os.path.isabs(raw_value)
+                    and raw_value not in action_text
+                ):
+                    normalized = os.path.normpath(raw_value)
+                    inside = False
+                    if cwd:
+                        try:
+                            inside = os.path.commonpath([cwd, normalized]) == cwd
+                        except ValueError:
+                            inside = False
+                    basename = os.path.basename(normalized)
+                    relative_match = re.search(
+                        rf"(?<![A-Za-z0-9_.-])"
+                        rf"((?:[A-Za-z0-9_.-]+/)*{re.escape(basename)})"
+                        rf"(?![A-Za-z0-9_.-])",
+                        action_text,
+                    ) if basename else None
+                    if not inside and relative_match:
+                        relative_target = relative_match.group(1)
+                        if cwd:
+                            candidate = os.path.normpath(
+                                os.path.join(cwd, relative_target)
+                            )
+                            try:
+                                candidate_inside = (
+                                    os.path.commonpath([cwd, candidate]) == cwd
+                                )
+                            except ValueError:
+                                candidate_inside = False
+                            if candidate_inside:
+                                repaired = candidate
+                        else:
+                            # Claude Code does not always place its cwd in the
+                            # Anthropic system payload. When the task itself
+                            # names a relative target, keep that client-relative
+                            # path instead of accepting a model-invented absolute
+                            # home-directory path. Explicit user absolute paths
+                            # are preserved by the raw_value-in-action guard.
+                            repaired = relative_target
                 if repaired != args.get(key):
                     args[key] = repaired
                     changed = True
@@ -1078,6 +1264,14 @@ def _anthropic_action_text(payload: dict[str, Any]) -> str:
     return user_text
 
 
+def _anthropic_pending_mutation(payload: dict[str, Any]) -> bool:
+    """True while an explicit mutation task has only inspection evidence."""
+    return (
+        _anthropic_text_requests_mutation(_anthropic_action_text(payload))
+        and not _anthropic_has_mutating_tool_use(payload)
+    )
+
+
 def _anthropic_has_tool_result(payload: dict[str, Any]) -> bool:
     messages = payload.get("messages")
     if not isinstance(messages, list):
@@ -1108,6 +1302,22 @@ def _anthropic_tool_result_text(payload: dict[str, Any]) -> str:
             if isinstance(block, dict) and block.get("type") == "tool_result":
                 parts.append(_anthropic_content_to_text(block.get("content")))
     return "\n".join(part for part in parts if part)
+
+
+def _anthropic_latest_tool_result_text(payload: dict[str, Any]) -> str:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                return _anthropic_content_to_text(block.get("content")).strip()
+    return ""
 
 
 def _anthropic_latest_tool_result_is_error(payload: dict[str, Any]) -> bool:
@@ -1168,24 +1378,37 @@ def _anthropic_exact_reply_after_verified_tool(
     """Return exact requested final text after a successful verification tool."""
     if not _anthropic_has_tool_result(payload) or _anthropic_latest_tool_result_is_error(payload):
         return None
+    # A read-only command such as `cat notes/*.txt` is evidence gathering, not
+    # proof that a requested output file was created. The old shortcut returned
+    # the exact final here and silently skipped the mutation.
+    if _anthropic_pending_mutation(payload):
+        return None
     exact = _anthropic_exact_reply_text(payload)
     if not exact:
         return None
     command = _normalize_bash_command(_anthropic_last_tool_command(payload)).lower()
-    result_text = _anthropic_tool_result_text(payload).strip()
+    result_text = _anthropic_latest_tool_result_text(payload)
     if not command or not result_text:
         return None
-    verification_markers = (
-        "cat ",
-        "python ",
-        "python3 ",
-        "pytest",
-        "npm test",
-        "uv run",
-    )
-    if not any(marker in command for marker in verification_markers):
-        return None
     if any(marker in result_text.lower() for marker in ("no such file", "traceback", "error:", "command not found")):
+        return None
+    # Only synthesize an exact final when the task supplied literal expected
+    # file content and the verification output matches it. Dynamic agent and
+    # coding tasks must return to the model for semantic verification; merely
+    # running `cat` does not prove ordering, completeness, or correctness.
+    verified_literal = False
+    for requested in _extract_write_requests(_anthropic_action_text(payload)):
+        filename = str(requested.get("filename") or "").strip()
+        expected_content = str(requested.get("content") or "").strip()
+        if (
+            filename
+            and expected_content
+            and filename.lower() in command
+            and result_text == expected_content
+        ):
+            verified_literal = True
+            break
+    if not verified_literal:
         return None
     return {
         "id": f"msg_{uuid.uuid4().hex[:24]}",
@@ -1234,7 +1457,7 @@ def _extract_write_requests(text: str) -> list[dict[str, str]]:
             content_end = matches[index + 1].start()
         else:
             tail = re.search(
-                r"\s*,?\s+then\s+(?:list|answer|reply|show|print)\b|[.。]\s*$",
+                r"\s*,?\s+then\s+(?:check|list|answer|reply|run|show|print|verify)\b|[.。]\s*$",
                 text[content_start:],
                 re.IGNORECASE | re.DOTALL,
             )
@@ -1648,7 +1871,10 @@ async def anthropic_messages(payload: dict[str, Any]) -> JSONResponse:
     if (
         openai_payload.get("tools")
         and openai_payload.get("tool_choice") == "required"
-        and not _anthropic_has_tool_result(payload)
+        and (
+            not _anthropic_has_tool_result(payload)
+            or _anthropic_pending_mutation(payload)
+        )
         and not _openai_response_has_tool_calls(data)
     ):
         retry_payload = _required_tool_retry_payload(openai_payload)
@@ -2645,6 +2871,20 @@ def _responses_sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+def _responses_model_prefers_reasoning_heartbeat(model: str) -> bool:
+    """Choose a protocol-safe pre-token heartbeat item for known models."""
+    key = str(model or "").strip().lower().replace("_", "-")
+    if "no-think" in key or "nothink" in key or "no-thinking" in key:
+        return False
+    return key in {
+        "minimax-m3",
+        "m3-web",
+        "minimax-m3-web",
+        "minimax-m3-think",
+        "minimax-m3-thinking",
+    } or "thinking" in key
+
+
 async def _responses_chat_completion(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     chat_payload = _responses_chat_payload(payload)
     model = str(chat_payload.get("model") or "")
@@ -2705,53 +2945,107 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
         shell = {"id": response_id, "object": "response", "created_at": created,
                  "status": "in_progress", "model": model, "output": []}
 
-        def _heartbeat_events():
-            """Keepalive the client COUNTS (2026-07-10): zcode's stream_idle_
-            timeout ignores response.in_progress pulses, so silent buffered
-            tails (giant tool authoring) died at its 10-min timer even though
-            our 10s heartbeats flowed. Emit an EMPTY output_text.delta on a
-            real open message item instead — protocol-legal, renders nothing,
-            resets client idle timers. The item is opened on first need and
-            real content later reuses it (message_id logic below)."""
-            nonlocal message_id, out_index
-            events = []
-            if message_id is None:
-                out_index += 1
-                message_id = f"msg_{uuid.uuid4().hex[:16]}"
-                events.append(emit("response.output_item.added", {
-                    "type": "response.output_item.added",
-                    "output_index": out_index,
-                    "item": {"id": message_id, "type": "message",
-                             "status": "in_progress",
-                             "role": "assistant", "content": []}}))
-                events.append(emit("response.content_part.added", {
-                    "type": "response.content_part.added",
-                    "item_id": message_id, "output_index": out_index,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": "",
-                             "annotations": []}}))
-            events.append(emit("response.output_text.delta", {
-                "type": "response.output_text.delta", "item_id": message_id,
-                "output_index": out_index, "content_index": 0, "delta": ""}))
-            return events
-        yield emit("response.created", {"type": "response.created", "response": dict(shell)})
-        yield emit("response.in_progress", {"type": "response.in_progress", "response": dict(shell)})
-
         output_items: list[dict[str, Any]] = []
         out_index = -1
         reasoning_id = None
+        reasoning_index = None
         reasoning_parts: list[str] = []
         message_id = None
+        message_index = None
         message_parts: list[str] = []
         tool_call_deltas: list[dict[str, Any]] = []
         usage: dict[str, Any] = {}
 
+        def _open_reasoning() -> list[str]:
+            nonlocal out_index, reasoning_id, reasoning_index
+            if reasoning_id is not None:
+                return []
+            out_index += 1
+            reasoning_index = out_index
+            reasoning_id = f"rs_{uuid.uuid4().hex[:24]}"
+            return [
+                emit("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": reasoning_index,
+                    "item": {"type": "reasoning", "id": reasoning_id,
+                             "status": "in_progress", "summary": []}}),
+                emit("response.reasoning_summary_part.added", {
+                    "type": "response.reasoning_summary_part.added",
+                    "item_id": reasoning_id, "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "part": {"type": "summary_text", "text": ""}}),
+            ]
+
+        def _open_message() -> list[str]:
+            nonlocal out_index, message_id, message_index
+            if message_id is not None:
+                return []
+            out_index += 1
+            message_index = out_index
+            message_id = f"msg_{uuid.uuid4().hex[:16]}"
+            return [
+                emit("response.output_item.added", {
+                    "type": "response.output_item.added",
+                    "output_index": message_index,
+                    "item": {"id": message_id, "type": "message",
+                             "status": "in_progress",
+                             "role": "assistant", "content": []}}),
+                emit("response.content_part.added", {
+                    "type": "response.content_part.added",
+                    "item_id": message_id, "output_index": message_index,
+                    "content_index": 0,
+                    "part": {"type": "output_text", "text": "",
+                             "annotations": []}}),
+            ]
+
+        def _heartbeat_events():
+            """Keepalive the client COUNTS (2026-07-10): zcode's stream_idle_
+            timeout ignores response.in_progress pulses, so silent buffered
+            tails died at its timer even though transport heartbeats flowed.
+            Emit an empty delta on the model's expected first output item. A
+            thinking prefill must NOT pre-open a message item: doing so made
+            later reasoning claim a second output index while final content
+            still referenced the first item (Codex showed thinking as chat and
+            dropped the answer)."""
+            events = []
+            if reasoning_id is not None:
+                events.append(emit("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "delta": ""}))
+                return events
+            if message_id is not None:
+                events.append(emit("response.output_text.delta", {
+                    "type": "response.output_text.delta", "item_id": message_id,
+                    "output_index": message_index, "content_index": 0,
+                    "delta": ""}))
+                return events
+            if _responses_model_prefers_reasoning_heartbeat(model):
+                events.extend(_open_reasoning())
+                events.append(emit("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta",
+                    "item_id": reasoning_id,
+                    "output_index": reasoning_index,
+                    "summary_index": 0,
+                    "delta": ""}))
+            else:
+                events.extend(_open_message())
+                events.append(emit("response.output_text.delta", {
+                    "type": "response.output_text.delta", "item_id": message_id,
+                    "output_index": message_index, "content_index": 0,
+                    "delta": ""}))
+            return events
+        yield emit("response.created", {"type": "response.created", "response": dict(shell)})
+        yield emit("response.in_progress", {"type": "response.in_progress", "response": dict(shell)})
+
         def _close_reasoning() -> list[str]:
-            nonlocal reasoning_id
+            nonlocal reasoning_id, reasoning_index
             if reasoning_id is None:
                 return []
             text = "".join(reasoning_parts)
-            idx = out_index
+            idx = reasoning_index
             item = {"type": "reasoning", "id": reasoning_id, "status": "completed",
                     "summary": [{"type": "summary_text", "text": text}]}
             output_items.append(item)
@@ -2770,14 +3064,15 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     "output_index": idx, "item": item}),
             ]
             reasoning_id = None
+            reasoning_index = None
             return events
 
         def _close_message() -> list[str]:
-            nonlocal message_id
+            nonlocal message_id, message_index
             if message_id is None:
                 return []
             text = "".join(message_parts)
-            idx = out_index
+            idx = message_index
             item = {"id": message_id, "type": "message", "status": "completed",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": text, "annotations": []}]}
@@ -2795,6 +3090,7 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     "output_index": idx, "item": item}),
             ]
             message_id = None
+            message_index = None
             return events
 
         client = httpx.AsyncClient(timeout=None)
@@ -2883,46 +3179,34 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                         r_piece = delta.get("reasoning_content") or delta.get("reasoning")
                         if r_piece:
                             if reasoning_id is None:
-                                out_index += 1
-                                reasoning_id = f"rs_{uuid.uuid4().hex[:24]}"
-                                yield emit("response.output_item.added", {
-                                    "type": "response.output_item.added",
-                                    "output_index": out_index,
-                                    "item": {"type": "reasoning", "id": reasoning_id,
-                                             "status": "in_progress", "summary": []}})
-                                yield emit("response.reasoning_summary_part.added", {
-                                    "type": "response.reasoning_summary_part.added",
-                                    "item_id": reasoning_id, "output_index": out_index,
-                                    "summary_index": 0,
-                                    "part": {"type": "summary_text", "text": ""}})
+                                # If an unknown model was optimistically given a
+                                # message heartbeat, close that empty item before
+                                # opening reasoning. Never leave two item kinds
+                                # live with one shared output index.
+                                if message_id is not None and not message_parts:
+                                    for ev in _close_message():
+                                        yield ev
+                                for ev in _open_reasoning():
+                                    yield ev
                             reasoning_parts.append(r_piece)
                             yield emit("response.reasoning_summary_text.delta", {
                                 "type": "response.reasoning_summary_text.delta",
-                                "item_id": reasoning_id, "output_index": out_index,
+                                "item_id": reasoning_id,
+                                "output_index": reasoning_index,
                                 "summary_index": 0, "delta": r_piece})
                         c_piece = delta.get("content")
                         if c_piece:
-                            if message_id is None:
+                            if reasoning_id is not None:
                                 for ev in _close_reasoning():
                                     yield ev
-                                out_index += 1
-                                message_id = f"msg_{uuid.uuid4().hex[:16]}"
-                                yield emit("response.output_item.added", {
-                                    "type": "response.output_item.added",
-                                    "output_index": out_index,
-                                    "item": {"id": message_id, "type": "message",
-                                             "status": "in_progress",
-                                             "role": "assistant", "content": []}})
-                                yield emit("response.content_part.added", {
-                                    "type": "response.content_part.added",
-                                    "item_id": message_id, "output_index": out_index,
-                                    "content_index": 0,
-                                    "part": {"type": "output_text", "text": "",
-                                             "annotations": []}})
+                            if message_id is None:
+                                for ev in _open_message():
+                                    yield ev
                             message_parts.append(c_piece)
                             yield emit("response.output_text.delta", {
                                 "type": "response.output_text.delta",
-                                "item_id": message_id, "output_index": out_index,
+                                "item_id": message_id,
+                                "output_index": message_index,
                                 "content_index": 0, "delta": c_piece})
                         if delta.get("tool_calls"):
                             tool_call_deltas = delta["tool_calls"]

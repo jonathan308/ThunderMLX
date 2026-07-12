@@ -264,6 +264,7 @@ after validating your storage paths:
 MLX_M3_PROMPT_CACHE_SSD=1
 MLX_M3_PROMPT_CACHE_SSD_RESTORE=1
 MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE=0
+MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS=8192
 ```
 
 See [docs/PERSISTENT_CACHE.md](docs/PERSISTENT_CACHE.md) for cache behavior,
@@ -319,14 +320,17 @@ python3 probes/m3_agent_staged_suffix_probe.py --base http://127.0.0.1:8080
 python3 probes/m3_prefill_shape_probe.py --base http://127.0.0.1:8080
 ```
 
-Current validated prompt-processing baseline on the reference `38,22`
+Current selected stability-first baseline on the reference `38,22`
 Thunderbolt/JACCL cluster:
 
-- 30k-class: about `379-382 prompt tok/s`.
-- 80k-class: about `370-373 prompt tok/s`.
-- 100k-class: about `365-367 prompt tok/s`.
-- 200k-class tool-heavy: about `340-342 prompt tok/s`.
+- 16k-class cold prefill: about `374 prompt tok/s`.
+- 48k actual tokens: about `353-368 prompt tok/s` across cold/repeat runs.
+- 131k actual tokens: about `318-321 prompt tok/s`.
+- Short/tool decode: about `31-32 tok/s`; 256k cached decode: about
+  `22.3 tok/s`.
 - Short hot tool-prefix turns: about `0.19-0.23s` server TTFT.
+- Faster native/cancel-cadence experiments are intentionally not promoted
+  because they failed in-flight stop or long-prefill disconnect gates.
 - Tool calls, image input, thinking routing, hot cache, and SSD restore have
   dedicated probes under `probes/`.
 

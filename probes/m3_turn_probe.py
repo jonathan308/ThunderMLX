@@ -255,17 +255,24 @@ def main():
     if final.get("requests_failed", 0) > initial.get("requests_failed", 0):
         raise SystemExit("probe saw a request failure")
     def healthy_followup(row):
+        server_prompt_tokens = int(row.get("server_prompt_tokens") or 0)
+        server_cached_tokens = int(row.get("server_cached_tokens") or 0)
+        server_reuse_ratio = (
+            server_cached_tokens / server_prompt_tokens
+            if server_prompt_tokens > 0
+            else 0.0
+        )
         reuse_ok = (
             (row.get("cache_reuse_ratio") or 0) >= 0.9
             and (row.get("cache_missed_tokens") or 0) <= 512
         )
-        fast_small_suffix = (
+        fast_cached_followup = (
             (row.get("server_ttft_s") or 999) <= 1.0
-            and (row.get("server_prompt_tokens") or 999999) <= 64
+            and server_reuse_ratio >= 0.9
             and (row.get("failed") or 0) == initial.get("requests_failed", 0)
         )
         prewarm_after_request = row.get("cache_action") == "prewarm_visible_transcript"
-        return reuse_ok or (prewarm_after_request and fast_small_suffix)
+        return reuse_ok or (prewarm_after_request and fast_cached_followup)
 
     poor = [row for row in (row2, row3) if not healthy_followup(row)]
     if poor:

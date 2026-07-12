@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import sys
+import time
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -16,22 +17,34 @@ sys.path.insert(0, str(ROOT))
 # remain regression-tested.
 os.environ.setdefault("MLX_M3_TOOL_COMPAT_OVERLAY", "1")
 os.environ.setdefault("MLX_M3_TOOL_SYSTEM_HINT", "1")
+os.environ.setdefault("MLX_M3_INJECT_DATE_CONTEXT", "1")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS", "8")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_TOOL", "6")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS", "3")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_FORCE_FINAL_AFTER", "8")
 
 from sharded_server import (
+    _BATCH_PATH_ACTIVE,
+    _FORCE_EOS,
+    _add_date_system_context,
     _add_tool_system_hint_if_needed,
     _assistant_content_for_template,
+    _bound_large_file_write_arguments,
+    _arm_rank0_semantic_eos,
     _filter_looping_control_tools,
+    _file_write_chunk_hint,
+    _file_write_payload_chars,
     _looks_like_tool_compat_fallback_content,
     _remember_assistant_reasoning,
     _tool_request_fallback_content,
+    _tool_retry_recovery_hint,
     _tool_loop_steering_diag,
+    _usable_tool_turn,
     _parse_tool_calls,
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
+    _shell_create_file_payload_info,
+    _synthesize_bounded_write_scaffold_text,
     _synthesize_write_command_tool_call,
     _tool_call_complete_for_stop,
     _tool_call_contains_complete_but_invalid,
@@ -406,6 +419,208 @@ def check_incomplete_loose_segment_command_is_not_emitted():
     assert remaining == "", remaining
 
 
+def check_incomplete_native_write_is_never_emitted():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        "I will write it now."
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Write">'
+        f'{ns}<parameter name="file_path">snake.html'
+        f'{ns}</parameter>'
+        f'{ns}<parameter name="content"><!doctype html><script>'
+        "function step() {"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert calls == [], calls
+    assert remaining == "I will write it now.", remaining
+    recovery = _tool_retry_recovery_hint(
+        text,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert "did not close before the generation budget ended" in recovery, recovery
+    assert _file_write_payload_chars(text, tools) > 0, text
+
+
+def check_large_write_chunk_hint_and_retry_feedback():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    hint = _file_write_chunk_hint(tools)
+    assert "6000 characters" in hint, hint
+    assert "small valid working scaffold" in hint, hint
+
+    ns = "]<]minimax[>["
+    malformed = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Write">'
+        f'{ns}<parameter name="file_path">/tmp/snake.html'
+        f'{ns}</parameter>'
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    recovery = _tool_retry_recovery_hint(
+        malformed,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert "required `content` argument was missing" in recovery, recovery
+    assert "small working scaffold" in recovery, recovery
+
+    oversized_call = {
+        "file_path": "/tmp/snake.html",
+        "content": "x" * 7000,
+    }
+    bounded, original_chars = _bound_large_file_write_arguments(
+        "Write",
+        oversized_call,
+    )
+    assert original_chars == 7000, original_chars
+    assert len(bounded["content"]) < 6000, bounded
+    assert "THUNDERMLX_CONTINUE" in bounded["content"], bounded
+    assert bounded["file_path"] == "/tmp/snake.html", bounded
+
+    incomplete_large = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Write">'
+        f"{ns}<file_path>/tmp/snake.html{ns}</file_path>"
+        f"{ns}<content>"
+        + ("x" * 7000)
+    )
+    scaffold_text = _synthesize_bounded_write_scaffold_text(
+        incomplete_large,
+        tools,
+    )
+    assert scaffold_text.startswith("[Tool call: Write]"), scaffold_text[:200]
+    calls, remaining = _parse_tool_calls(
+        scaffold_text,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert len(calls) == 1, calls
+    assert remaining == "", remaining
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["file_path"] == "/tmp/snake.html", args
+    assert "THUNDERMLX_CONTINUE" in args["content"], args
+    assert len(args["content"]) < 6000, args
+
+    shell_tools = [
+        *tools,
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
+    oversized_shell = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Bash">'
+        f"{ns}<command>cat > /tmp/from-bash.html <<'EOF'\n"
+        + ("x" * 7000)
+    )
+    shell_info = _shell_create_file_payload_info(
+        oversized_shell,
+        shell_tools,
+    )
+    assert shell_info, oversized_shell[:200]
+    assert shell_info["path"] == "/tmp/from-bash.html", shell_info
+    shell_scaffold = _synthesize_bounded_write_scaffold_text(
+        oversized_shell,
+        shell_tools,
+    )
+    calls, remaining = _parse_tool_calls(
+        shell_scaffold,
+        FakeMiniMaxToolModule,
+        shell_tools,
+    )
+    assert len(calls) == 1, calls
+    assert remaining == "", remaining
+    assert calls[0]["function"]["name"] == "Write", calls
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["file_path"] == "/tmp/from-bash.html", args
+    assert "THUNDERMLX_CONTINUE" in args["content"], args
+
+    ordinary_bash = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Bash">'
+        f"{ns}<command>python3 -m pytest\n"
+        + ("x" * 7000)
+    )
+    assert _shell_create_file_payload_info(ordinary_bash, shell_tools) is None
+    assert not _synthesize_bounded_write_scaffold_text(
+        ordinary_bash,
+        shell_tools,
+    )
+
+
+def check_post_tool_action_promise_is_not_a_final_answer():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    messages = [
+        {"role": "user", "content": "Create the document."},
+        {"role": "assistant", "tool_calls": [{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "Bash", "arguments": '{"command":"pwd"}'},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "/tmp"},
+    ]
+    text = (
+        "Now let me write a comprehensive Python script that builds the "
+        "document. I'll create it in /tmp and run it to produce the final .docx."
+    )
+    assert not _usable_tool_turn(
+        text,
+        FakeMiniMaxToolModule,
+        tools,
+        messages,
+        "enabled",
+    )
+
+
 def check_codex_tool_arg_schema_canonicalization():
     tools = [{
         "type": "function",
@@ -438,6 +653,8 @@ def check_codex_tool_arg_schema_canonicalization():
 
 
 def check_exec_command_justification_is_filled_when_supported():
+    import sharded_server as server
+
     tools = [{
         "type": "function",
         "function": {
@@ -460,7 +677,12 @@ def check_exec_command_justification_is_filled_when_supported():
             "arguments": {"cmd": "ls -la /tmp"},
         },
     }]
-    validated = _validate_outgoing_tool_calls(calls, tools)
+    previous = server.TOOL_SYNTH_JUSTIFICATION
+    server.TOOL_SYNTH_JUSTIFICATION = True
+    try:
+        validated = _validate_outgoing_tool_calls(calls, tools)
+    finally:
+        server.TOOL_SYNTH_JUSTIFICATION = previous
     assert len(validated) == 1, validated
     call = validated[0]
     assert '"cmd": "ls -la /tmp"' in call["function"]["arguments"], call
@@ -484,9 +706,62 @@ def check_post_tool_hint_tells_model_to_answer():
         {"role": "user", "content": "What app is this?"},
         {"role": "tool", "content": "Package.swift shows OpenScienceApp."},
     ]
-    patched = _add_tool_system_hint_if_needed(messages, {}, tools)
+    patched = _add_tool_system_hint_if_needed(
+        messages,
+        {"thinking_mode": "disabled"},
+        tools,
+    )
     assert patched[0]["role"] == "system", patched
     assert "provide the final answer now" in patched[0]["content"], patched[0]
+
+
+def check_daily_date_context_injection():
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "What date is it?"},
+    ]
+    patched, injected = _add_date_system_context(messages)
+    assert injected is True, patched
+    assert patched[0]["role"] == "system", patched
+    assert time.strftime("%Y-%m-%d") in patched[0]["content"], patched[0]
+    assert "Treat this date as authoritative" in patched[0]["content"], patched[0]
+
+    supplied = [
+        {
+            "role": "system",
+            "content": "Use this date/time context. Full current datetime: 2030-01-02.",
+        },
+        {"role": "user", "content": "What date is it?"},
+    ]
+    preserved, injected = _add_date_system_context(supplied)
+    assert injected is False, preserved
+    assert preserved == supplied, preserved
+
+
+def check_thinking_tool_hint_covers_fresh_information():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }]
+    messages = [{
+        "role": "user",
+        "content": "Who is playing in the World Cup today?",
+    }]
+    patched = _add_tool_system_hint_if_needed(
+        messages,
+        {"thinking_mode": "enabled"},
+        tools,
+    )
+    assert patched[0]["role"] == "system", patched
+    assert "current, external, or user-specific" in patched[0]["content"], patched[0]
+    assert "otherwise answer directly" in patched[0]["content"], patched[0]
 
 
 def check_soft_tool_loop_steering_preserves_tools():
@@ -532,6 +807,92 @@ def check_soft_tool_loop_steering_preserves_tools():
     assert patched[0]["role"] == "system", patched
     assert "Tools remain available" in patched[0]["content"], patched[0]
     assert "tool-call format" in patched[0]["content"], patched[0]
+
+
+def _repeated_named_tool_messages(tool_name, count):
+    messages = [{"role": "user", "content": "Research this and report back."}]
+    for index in range(count):
+        messages.append({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "arguments": {"query": f"topic {index}"},
+                },
+            }],
+        })
+        messages.append({"role": "tool", "content": f"result {index}"})
+    return messages
+
+
+def check_soft_tool_loop_hint_is_cache_stable():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }]
+    hints = []
+    for count in (6, 7):
+        messages = _repeated_named_tool_messages("web_search", count)
+        diag = _tool_loop_steering_diag(messages, tools)
+        assert diag and "repeated_tool" in diag["reasons"], diag
+        assert "force_final" not in diag["reasons"], diag
+        patched = _add_tool_system_hint_if_needed(
+            messages,
+            {"thinking_mode": "enabled"},
+            tools,
+            tool_loop_diag=diag,
+        )
+        hints.append(patched[0]["content"])
+    assert hints[0] == hints[1], hints
+
+
+def check_targeted_repeated_tool_breaker_is_scoped():
+    import sharded_server as server
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in ("web_search", "read_file")
+    ]
+    previous_after = server.TOOL_LOOP_FORCE_FINAL_AFTER
+    previous_count = server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
+    previous_names = server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES
+    try:
+        server.TOOL_LOOP_FORCE_FINAL_AFTER = 0
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT = 8
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES = {"web_search"}
+
+        search_diag = _tool_loop_steering_diag(
+            _repeated_named_tool_messages("web_search", 8),
+            tools,
+        )
+        assert "repeated_tool_limit" in search_diag["reasons"], search_diag
+        assert "force_final" in search_diag["reasons"], search_diag
+
+        coding_diag = _tool_loop_steering_diag(
+            _repeated_named_tool_messages("read_file", 8),
+            tools,
+        )
+        assert coding_diag and "repeated_tool" in coding_diag["reasons"], coding_diag
+        assert "force_final" not in coding_diag["reasons"], coding_diag
+    finally:
+        server.TOOL_LOOP_FORCE_FINAL_AFTER = previous_after
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT = previous_count
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES = previous_names
 
 
 def check_repeated_control_tool_filter_keeps_work_tools():
@@ -889,6 +1250,60 @@ def check_empty_required_tool_args_report_dropped():
     )
     assert validated == [], validated
     assert dropped == 1, dropped
+
+
+def check_parameterless_and_optional_only_tool_args_are_accepted():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "skills_list",
+                "description": "List installed skills.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_resources",
+                "description": "List resources, optionally filtered.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"server": {"type": "string"}},
+                    "required": [],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+    calls = [
+        {
+            "type": "function",
+            "function": {"name": "skills_list", "arguments": "{}"},
+        },
+        {
+            "type": "function",
+            "function": {"name": "list_resources", "arguments": {}},
+        },
+    ]
+    validated, dropped = _validate_outgoing_tool_calls(
+        calls,
+        tools,
+        return_dropped=True,
+    )
+    assert dropped == 0, dropped
+    assert [call["function"]["name"] for call in validated] == [
+        "skills_list",
+        "list_resources",
+    ], validated
+    assert all(
+        json.loads(call["function"]["arguments"]) == {}
+        for call in validated
+    ), validated
 
 
 def check_malformed_apply_patch_payload_report_dropped():
@@ -1523,6 +1938,28 @@ def check_malformed_apply_patch_simple_write_synthesizes_exec():
     assert "/Users/example/Desktop/test.txt" in args["cmd"], args
 
 
+def check_semantic_decode_stop_is_rank0_owned():
+    original = dict(_FORCE_EOS)
+    original_batch = dict(_BATCH_PATH_ACTIVE)
+    try:
+        _FORCE_EOS["active"] = False
+        _FORCE_EOS["eos_id"] = 123
+        _BATCH_PATH_ACTIVE["value"] = True
+        assert not _arm_rank0_semantic_eos(1, "test_guard", 17)
+        assert not _FORCE_EOS["active"]
+        assert _arm_rank0_semantic_eos(0, "test_guard", 17)
+        assert _FORCE_EOS["active"]
+        _FORCE_EOS["active"] = False
+        _BATCH_PATH_ACTIVE["value"] = False
+        assert not _arm_rank0_semantic_eos(0, "test_guard", 18)
+        assert not _FORCE_EOS["active"]
+    finally:
+        _FORCE_EOS.clear()
+        _FORCE_EOS.update(original)
+        _BATCH_PATH_ACTIVE.clear()
+        _BATCH_PATH_ACTIVE.update(original_batch)
+
+
 def main():
     check_complete_analysis_channel()
     check_stream_analysis_channel()
@@ -1535,10 +1972,17 @@ def main():
     check_display_style_tool_call_recovers_and_strips()
     check_loose_segment_command_tool_call_recovers()
     check_incomplete_loose_segment_command_is_not_emitted()
+    check_incomplete_native_write_is_never_emitted()
+    check_large_write_chunk_hint_and_retry_feedback()
+    check_post_tool_action_promise_is_not_a_final_answer()
     check_codex_tool_arg_schema_canonicalization()
     check_exec_command_justification_is_filled_when_supported()
     check_post_tool_hint_tells_model_to_answer()
+    check_daily_date_context_injection()
+    check_thinking_tool_hint_covers_fresh_information()
     check_soft_tool_loop_steering_preserves_tools()
+    check_soft_tool_loop_hint_is_cache_stable()
+    check_targeted_repeated_tool_breaker_is_scoped()
     check_repeated_control_tool_filter_keeps_work_tools()
     check_repeated_exec_command_keeps_tool_schema_stable()
     check_repeated_exec_command_eventually_forces_final_answer()
@@ -1548,6 +1992,7 @@ def main():
     check_update_plan_scalar_coerces_to_plan_item()
     check_missing_required_tool_args_report_dropped()
     check_empty_required_tool_args_report_dropped()
+    check_parameterless_and_optional_only_tool_args_are_accepted()
     check_malformed_apply_patch_payload_report_dropped()
     check_tool_call_reasoning_recall_restores_model_context()
     check_read_file_coerces_to_exec_command()
@@ -1563,6 +2008,7 @@ def main():
     check_tool_stop_on_valid_or_complete_invalid_tool_call()
     check_invalid_apply_patch_stops_decode_without_emitting_tool()
     check_malformed_apply_patch_simple_write_synthesizes_exec()
+    check_semantic_decode_stop_is_rank0_owned()
     print("PASS")
 
 
