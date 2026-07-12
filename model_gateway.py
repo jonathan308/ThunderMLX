@@ -90,6 +90,10 @@ ANTHROPIC_REQUIRE_TOOLS_ON_ACTION = env_bool("M3_GATEWAY_ANTHROPIC_REQUIRE_TOOLS
 # but 262k-512k is the recommended coding window; 300k keeps Codex/Claude Code
 # style shims compacting early enough for stable long agent runs.
 ADVERTISED_MAX_MODEL_LEN = int(os.environ.get("M3_GATEWAY_ADVERTISED_MAX_MODEL_LEN", "300000"))
+ZCODE_SESSION_TITLE_PROMPT = "Generate a concise title for this coding session."
+ZCODE_SESSION_TITLE_MAX_TOKENS = int(
+    os.environ.get("M3_GATEWAY_ZCODE_TITLE_MAX_TOKENS", "64") or "64"
+)
 
 APP = FastAPI(title="ThunderMLX Model Gateway")
 SWITCH_LOCK = asyncio.Lock()
@@ -170,6 +174,32 @@ def backend_for_model(model: str | None) -> str:
     return "m3" if canonical_m3_model_id(model) else "omlx"
 
 
+def model_ids_from_catalog(payload: dict[str, Any] | None) -> list[str]:
+    """Return the usable model ids from an OpenAI-compatible model catalog."""
+    if not isinstance(payload, dict):
+        return []
+    result: list[str] = []
+    for item in payload.get("data", []):
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or "").strip()
+        if model_id and model_id not in result:
+            result.append(model_id)
+    return result
+
+
+def rewrite_json_model(body: bytes, model_id: str) -> bytes:
+    """Canonicalize the model id in a JSON request without changing its shape."""
+    try:
+        payload = json.loads(body.decode("utf-8")) if body else {}
+    except Exception:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    payload["model"] = model_id
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 def anthropic_model_to_m3(model: str | None) -> str:
     raw = str(model or "").strip()
     lowered = raw.lower()
@@ -209,6 +239,34 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
     if canonical_m3 and canonical_m3 != model:
         payload["model"] = canonical_m3
         model = canonical_m3
+        changed = True
+    messages = payload.get("messages")
+    first_message = messages[0] if isinstance(messages, list) and messages else None
+    first_content = first_message.get("content") if isinstance(first_message, dict) else None
+    is_zcode_title = (
+        isinstance(first_content, str)
+        and first_content.strip().startswith(ZCODE_SESSION_TITLE_PROMPT)
+        and not payload.get("tools")
+        and not payload.get("functions")
+    )
+    if is_zcode_title:
+        # ZCode sends this auxiliary request beside the real agent turn. Keep
+        # it short and visible so it cannot spend a thinking budget, return an
+        # answer-like title, or occupy the single-flight model for minutes.
+        if canonical_m3_model_id(model):
+            payload["model"] = "Minimax-M3-No-Think"
+            model = "Minimax-M3-No-Think"
+        payload["thinking_mode"] = "disabled"
+        requested_max = payload.get("max_tokens", payload.get("max_completion_tokens"))
+        try:
+            requested_max = int(requested_max) if requested_max is not None else None
+        except (TypeError, ValueError):
+            requested_max = None
+        if ZCODE_SESSION_TITLE_MAX_TOKENS > 0 and (
+            requested_max is None or requested_max > ZCODE_SESSION_TITLE_MAX_TOKENS
+        ):
+            payload["max_tokens"] = ZCODE_SESSION_TITLE_MAX_TOKENS
+            payload.pop("max_completion_tokens", None)
         changed = True
     if not changed:
         return body, model, False
@@ -256,6 +314,42 @@ async def omlx_health() -> dict[str, Any] | None:
     if data and str(data.get("status", "")).lower() in {"healthy", "ok", "ready"}:
         return data
     return data
+
+
+async def resolve_requested_model(model: str | None) -> dict[str, Any]:
+    """Resolve a request before any destructive backend switch.
+
+    An unknown id used to fall through to oMLX. The gateway would unload M3,
+    then oMLX would reject the misspelled model. Validate against oMLX's live
+    catalog first so bad ids cannot change cluster state.
+    """
+    backend = backend_for_model(model)
+    if backend != "omlx":
+        return {"ok": True, "backend": backend, "model": model}
+
+    catalog = await get_json(f"{OMLX_BASE_URL}/v1/models")
+    if catalog is None:
+        return {
+            "ok": False,
+            "status_code": 503,
+            "type": "model_catalog_unavailable",
+            "message": "Could not validate the requested oMLX model; active backend was not changed.",
+            "model": model,
+        }
+
+    model_ids = model_ids_from_catalog(catalog)
+    by_casefold = {item.casefold(): item for item in model_ids}
+    matched = by_casefold.get(str(model or "").strip().casefold())
+    if not matched:
+        return {
+            "ok": False,
+            "status_code": 404,
+            "type": "model_not_found",
+            "message": f"Unknown model '{model}'. Select an id from GET /v1/models; active backend was not changed.",
+            "model": model,
+            "known_model_ids": model_ids,
+        }
+    return {"ok": True, "backend": "omlx", "model": matched}
 
 
 async def wait_for_m3(up: bool, timeout: float = SWITCH_TIMEOUT) -> bool:
@@ -3482,7 +3576,29 @@ async def openai_proxy(rest: str, request: Request):
     model = normalized_model if normalized_model is not None else await request_model(request, body)
     if normalized:
         record_event("defaulted_empty_model", path=f"/v1/{rest}", model=model)
-    backend = backend_for_model(model)
+    route = await resolve_requested_model(model)
+    if not route.get("ok"):
+        record_event(
+            "reject_unknown_model",
+            path=f"/v1/{rest}",
+            model=model,
+            reason=route.get("type"),
+            backend_preserved=STATE.get("active_backend"),
+        )
+        return JSONResponse(
+            status_code=int(route.get("status_code") or 404),
+            content={"error": {
+                "message": route.get("message") or "Unknown model",
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": route.get("type") or "model_not_found",
+            }},
+        )
+    backend = str(route["backend"])
+    routed_model = route.get("model")
+    if routed_model and routed_model != model:
+        body = rewrite_json_model(body, str(routed_model))
+        model = str(routed_model)
     ready = await ensure_backend(backend)
     if not ready.get("ok"):
         STATE["last_error"] = ready

@@ -22,6 +22,7 @@ os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_TOOL_ONLY_TURNS", "8")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_TOOL", "6")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS", "3")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_FORCE_FINAL_AFTER", "8")
+os.environ.setdefault("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "8192")
 
 from sharded_server import (
     _BATCH_PATH_ACTIVE,
@@ -29,11 +30,15 @@ from sharded_server import (
     _add_date_system_context,
     _add_tool_system_hint_if_needed,
     _assistant_content_for_template,
+    _anchor_command_working_directory,
+    _repair_reversed_edit_arguments_after_failure,
     _bound_large_file_write_arguments,
+    _date_context_for_session,
     _arm_rank0_semantic_eos,
     _filter_looping_control_tools,
     _file_write_chunk_hint,
     _file_write_payload_chars,
+    _incomplete_tool_call_budget_reached,
     _looks_like_tool_compat_fallback_content,
     _remember_assistant_reasoning,
     _tool_request_fallback_content,
@@ -454,6 +459,25 @@ def check_incomplete_native_write_is_never_emitted():
     )
     assert "did not close before the generation budget ended" in recovery, recovery
     assert _file_write_payload_chars(text, tools) > 0, text
+    assert not _incomplete_tool_call_budget_reached(
+        8191,
+        True,
+        text,
+        FakeMiniMaxToolModule,
+    )
+    assert _incomplete_tool_call_budget_reached(
+        8192,
+        True,
+        text,
+        FakeMiniMaxToolModule,
+    )
+    closed = text + f"{ns}</tool_call>"
+    assert not _incomplete_tool_call_budget_reached(
+        8192,
+        True,
+        closed,
+        FakeMiniMaxToolModule,
+    )
 
 
 def check_large_write_chunk_hint_and_retry_feedback():
@@ -489,8 +513,54 @@ def check_large_write_chunk_hint_and_retry_feedback():
         FakeMiniMaxToolModule,
         tools,
     )
-    assert "required `content` argument was missing" in recovery, recovery
+    assert "required argument(s) `content` were missing" in recovery, recovery
     assert "small working scaffold" in recovery, recovery
+
+    edit_tools = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            },
+        },
+    }]
+    incomplete_edit = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Edit">'
+        f"{ns}<file_path>/tmp/snake.html{ns}</file_path>"
+        f"{ns}<new_string>replacement without an old-string anchor"
+    )
+    edit_recovery = _tool_retry_recovery_hint(
+        incomplete_edit,
+        FakeMiniMaxToolModule,
+        edit_tools,
+    )
+    assert "exactly one valid `Edit` call" in edit_recovery, edit_recovery
+    assert "`old_string`" in edit_recovery, edit_recovery
+    assert "`new_string`" in edit_recovery, edit_recovery
+    assert "one focused replacement" in edit_recovery, edit_recovery
+
+    import sharded_server as server
+
+    original_chunk_limit = server.TOOL_WRITE_CHUNK_MAX_CHARS
+    server.TOOL_WRITE_CHUNK_MAX_CHARS = 0
+    try:
+        unbounded_recovery = _tool_retry_recovery_hint(
+            incomplete_edit,
+            FakeMiniMaxToolModule,
+            edit_tools,
+        )
+        assert "0 characters" not in unbounded_recovery, unbounded_recovery
+        assert "one focused replacement" in unbounded_recovery, unbounded_recovery
+    finally:
+        server.TOOL_WRITE_CHUNK_MAX_CHARS = original_chunk_limit
 
     oversized_call = {
         "file_path": "/tmp/snake.html",
@@ -652,6 +722,170 @@ def check_codex_tool_arg_schema_canonicalization():
     assert "justification" not in call["function"]["arguments"], call
 
 
+def check_command_workdir_drift_is_anchored_narrowly():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "workdir": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        },
+    }]
+    root = "/workspace/ThunderMLX/opencode-fixture"
+    messages = [
+        {
+            "role": "system",
+            "content": f"<env>\nWorking directory: {root}\n</env>",
+        },
+        {"role": "user", "content": "Run the unit tests."},
+    ]
+    repaired, changes = _anchor_command_working_directory(
+        "bash",
+        {
+            "command": "python3 -m unittest",
+            "workdir": "/tmp/other-checkout/opencode-fixture",
+        },
+        tools,
+        messages,
+    )
+    assert repaired["workdir"] == root, repaired
+    assert len(changes) == 1, changes
+
+    subdir, changes = _anchor_command_working_directory(
+        "bash",
+        {"command": "pwd", "workdir": f"{root}/tests"},
+        tools,
+        messages,
+    )
+    assert subdir["workdir"] == f"{root}/tests", subdir
+    assert not changes, changes
+
+    external = "/tmp/opencode-fixture"
+    explicit_messages = [
+        messages[0],
+        {"role": "user", "content": f"Run the check in {external}."},
+    ]
+    preserved, changes = _anchor_command_working_directory(
+        "bash",
+        {"command": "pwd", "workdir": external},
+        tools,
+        explicit_messages,
+    )
+    assert preserved["workdir"] == external, preserved
+    assert not changes, changes
+
+
+def check_reversed_edit_is_repaired_only_after_proven_failure():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "oldString": {"type": "string"},
+                    "newString": {"type": "string"},
+                },
+                "required": ["filePath", "oldString", "newString"],
+            },
+        },
+    }]
+    path = "/workspace/sample.py"
+    current = "def main():\n    return 1"
+    desired = "def helper():\n    return 2\n\n\ndef main():\n    return 1"
+    read_id = "read-1"
+    failed_id = "edit-1"
+    messages = [
+        {"role": "user", "content": "Add helper to sample.py."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": read_id,
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": json.dumps({"filePath": path}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": read_id,
+            "content": (
+                f"<path>{path}</path>\n<content>\n"
+                "1: def main():\n2:     return 1\n"
+                "</content>"
+            ),
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": failed_id,
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({
+                        "filePath": path,
+                        "oldString": desired,
+                        "newString": current,
+                    }),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": failed_id,
+            "content": (
+                "Could not find oldString in the file. It must match "
+                "exactly, including whitespace."
+            ),
+        },
+    ]
+    inverted = {
+        "filePath": path,
+        "oldString": desired,
+        "newString": current,
+    }
+    repaired, evidence = _repair_reversed_edit_arguments_after_failure(
+        "edit",
+        inverted,
+        messages,
+    )
+    assert evidence, (repaired, evidence)
+    assert repaired["oldString"] == current, repaired
+    assert repaired["newString"] == desired, repaired
+
+    without_failure, evidence = _repair_reversed_edit_arguments_after_failure(
+        "edit",
+        inverted,
+        messages[:-1],
+    )
+    assert without_failure == inverted, without_failure
+    assert evidence is None, evidence
+
+    valid = {
+        "filePath": path,
+        "oldString": current,
+        "newString": desired,
+    }
+    preserved, evidence = _repair_reversed_edit_arguments_after_failure(
+        "edit",
+        valid,
+        messages,
+    )
+    assert preserved == valid, preserved
+    assert evidence is None, evidence
+
+
 def check_exec_command_justification_is_filled_when_supported():
     import sharded_server as server
 
@@ -725,6 +959,29 @@ def check_daily_date_context_injection():
     assert patched[0]["role"] == "system", patched
     assert time.strftime("%Y-%m-%d") in patched[0]["content"], patched[0]
     assert "Treat this date as authoritative" in patched[0]["content"], patched[0]
+
+    session_id = f"date-pin-{time.time_ns()}"
+    first = _date_context_for_session(
+        session_id,
+        "Current date: 2030-01-02 (Wednesday).",
+    )
+    after_midnight = _date_context_for_session(
+        session_id,
+        "Current date: 2030-01-03 (Thursday).",
+    )
+    other_session = _date_context_for_session(
+        session_id + "-new",
+        "Current date: 2030-01-03 (Thursday).",
+    )
+    assert after_midnight == first, (first, after_midnight)
+    assert other_session != first, (first, other_session)
+
+    pinned_messages, injected = _add_date_system_context(
+        messages,
+        session_id=session_id,
+    )
+    assert injected is True, pinned_messages
+    assert pinned_messages[0]["content"] == first, pinned_messages[0]
 
     supplied = [
         {
@@ -1976,6 +2233,8 @@ def main():
     check_large_write_chunk_hint_and_retry_feedback()
     check_post_tool_action_promise_is_not_a_final_answer()
     check_codex_tool_arg_schema_canonicalization()
+    check_command_workdir_drift_is_anchored_narrowly()
+    check_reversed_edit_is_repaired_only_after_proven_failure()
     check_exec_command_justification_is_filled_when_supported()
     check_post_tool_hint_tells_model_to_answer()
     check_daily_date_context_injection()

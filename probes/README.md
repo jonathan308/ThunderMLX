@@ -4,6 +4,38 @@ Repeatable benchmark and regression probes live here. They call the running
 OpenAI-compatible endpoint and are intended for validation/tuning, not normal
 daily use.
 
+## Native-first release gate (2026-07-12)
+
+The production candidate keeps normal client calls on native `mlx-vlm` tool
+formatting. ThunderMLX validates the result and applies only narrow,
+transcript-proven repairs for malformed output. Static tool primers,
+constrained decoding, proactive no-call caps, and write scaffolding were off
+during this gate.
+
+- Five alternating extended Claude Code suites passed: `76` inference
+  requests, more than `50` executed Bash/Read/Edit/Write actions, `0` request
+  failures, and no leaked generation lock.
+- A real OpenCode run reached `69` messages and about `34k` prompt tokens,
+  recovered from client-side edit failures, wrote the requested implementation,
+  and passed `26/26` generated tests. Client cancellation returned the server
+  to healthy idle without orphaned wired memory.
+- Codex Responses real-file writes, Anthropic streaming/non-streaming tools,
+  native OpenAI tool calls in both thinking modes, OpenWebUI-shaped chat,
+  image input, and disconnect-followed-by-retry all passed.
+- Speed checks on the reference `38,22` cluster held short decode around
+  `32.0 tok/s`. A 30,743-token cold prompt processed at `380.46 prompt tok/s`;
+  its changed cached follow-up reused `30,719/30,748` tokens, reached `1.36s`
+  TTFT, and decoded at `27.56 tok/s`. At 106k and 200k, cached decode measured
+  `26.13` and `24.63 tok/s` respectively with at least `99.97%` reuse.
+- Cold long-prefill measurements after repeated stop/start and soak cycles were
+  `359.44 tok/s` at 78k, `344.21` at 106k, and `309.26` at 200k. These are
+  intentionally recorded separately from warmed historical peaks. The BQ64
+  long-context lane remained about 3% faster than plain Steel MMA at 200k.
+- A midnight rollover changed the injected date near the prompt prefix and
+  forced an 80k re-prefill. The release pins injected date text for the active
+  cache-session lifetime; new or idle-expired sessions still receive the
+  current date.
+
 Common probes:
 
 - `m3_turn_probe.py`: thinking/no-thinking multi-turn hot-cache check. The

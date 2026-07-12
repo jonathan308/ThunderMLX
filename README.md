@@ -73,9 +73,10 @@ of real agentic use.
   first-class reasoning items, tool calls stream as `function_call` items
 - 🧠 **Live thinking** — reasoning deltas stream token-by-token on every
   wire, including during tool-bearing agent turns
-- 🛠️ **Agent-grade tool calling** — parallel calls, streamed args, malformed-
-  call repair ladder, tool-complete early stop (no wasted decode after the
-  call closes)
+- 🛠️ **Agent-grade tool calling** — native `mlx-vlm` tool emission first,
+  parallel calls and streamed args, with narrowly evidenced repairs only for
+  structurally invalid calls; completed calls stop decode without exposing raw
+  MiniMax markup
 - 🗄️ **Tiered prompt/KV cache** — hot RAM residents with keepwarm → SSD
   (5-day TTL, 400GB LRU, per-rank) → re-prefill; sessions survive restarts;
   strict per-session isolation
@@ -100,9 +101,18 @@ of real agentic use.
 | Client | Wire | Thinking | Tools | Stops |
 | --- | --- | --- | --- | --- |
 | zcode | chat completions | ✅ live stream | ✅ | ✅ |
+| OpenCode | chat completions | ✅ live stream | ✅ multi-file loops | ✅ |
 | OpenWebUI | chat completions | ✅ live stream | ✅ | ✅ |
 | codex | native Responses | ✅ reasoning items | ✅ | ✅ |
+| Claude Code | Anthropic Messages | ✅ thinking blocks | ✅ extended loop | ✅ |
 | Any OpenAI SDK | either | ✅ | ✅ | ✅ |
+
+The 2026-07-12 native-first release gate ran five alternating thinking and
+no-thinking Claude Code suites: 76 inference requests, more than 50 real tool
+actions, zero failed requests, no leaked active slot, and clean wired-memory
+release after every stop. The same build passed Codex Responses file writes,
+OpenAI streaming/non-streaming tool calls, OpenWebUI-shaped history, image
+input, and client-disconnect recovery.
 
 ## Quick Start
 

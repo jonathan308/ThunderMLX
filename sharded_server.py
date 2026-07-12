@@ -272,6 +272,14 @@ TOOL_RETRY_NO_THINK = os.environ.get(
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
     os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000") or "0"
 )
+# A real tool invocation that opens but never closes is invisible to clients
+# while it burns decode tokens. Keep this far above ordinary tool payloads and
+# route the stop through synchronized EOS so the existing bounded retry can
+# regenerate the atomic call. This does not cap normal answers or completed
+# calls. 0 disables.
+TOOL_INCOMPLETE_CALL_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "8192") or "0"
+)
 DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
 )
@@ -6135,6 +6143,9 @@ def _generation_defaults_status():
         "tool_unusable_retry_attempts": TOOL_UNUSABLE_RETRY_ATTEMPTS,
         "tool_unusable_retry_max_tokens": TOOL_UNUSABLE_RETRY_MAX_TOKENS,
         "tool_write_chunk_max_chars": TOOL_WRITE_CHUNK_MAX_CHARS,
+        "tool_incomplete_call_token_budget": (
+            TOOL_INCOMPLETE_CALL_TOKEN_BUDGET
+        ),
         "tool_loop_force_final_repeated_tool_count": (
             TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
         ),
@@ -6562,7 +6573,49 @@ def _current_date_context_text():
     )
 
 
-def _add_date_system_context(processed_messages):
+_DATE_CONTEXT_SESSION_LOCK = threading.Lock()
+_DATE_CONTEXT_BY_SESSION = {}
+_DATE_CONTEXT_SESSION_MAX = 512
+
+
+def _date_context_for_session(session_id, current_text=None):
+    """Keep the injected date stable while a prompt-cache session is active.
+
+    A date change near the beginning of the rendered prompt invalidates every
+    later KV entry. Pinning only for the cache session avoids an 80k+ re-prefill
+    at midnight; new or idle-expired sessions still receive today's date.
+    """
+    text = current_text or _current_date_context_text()
+    key = str(session_id or "").strip()
+    if not key:
+        return text
+    now = time.monotonic()
+    idle_ttl = max(60, int(PROMPT_CACHE_TTL_SECONDS or 0))
+    with _DATE_CONTEXT_SESSION_LOCK:
+        stale = [
+            item_key
+            for item_key, item in _DATE_CONTEXT_BY_SESSION.items()
+            if now - float(item.get("last_seen") or 0.0) > idle_ttl
+        ]
+        for item_key in stale:
+            _DATE_CONTEXT_BY_SESSION.pop(item_key, None)
+        item = _DATE_CONTEXT_BY_SESSION.get(key)
+        if item:
+            item["last_seen"] = now
+            return item["text"]
+        if len(_DATE_CONTEXT_BY_SESSION) >= _DATE_CONTEXT_SESSION_MAX:
+            oldest = min(
+                _DATE_CONTEXT_BY_SESSION,
+                key=lambda item_key: float(
+                    _DATE_CONTEXT_BY_SESSION[item_key].get("last_seen") or 0.0
+                ),
+            )
+            _DATE_CONTEXT_BY_SESSION.pop(oldest, None)
+        _DATE_CONTEXT_BY_SESSION[key] = {"text": text, "last_seen": now}
+        return text
+
+
+def _add_date_system_context(processed_messages, *, session_id=None):
     """Inject today's date unless the client already supplied date context."""
     messages = list(processed_messages or [])
     if not INJECT_DATE_CONTEXT:
@@ -6576,7 +6629,10 @@ def _add_date_system_context(processed_messages):
         if isinstance(content, str) and _AUTHORITATIVE_DATE_CONTEXT_RE.search(content):
             return messages, False
     return [
-        {"role": "system", "content": _current_date_context_text()},
+        {
+            "role": "system",
+            "content": _date_context_for_session(session_id),
+        },
         *messages,
     ], True
 
@@ -8224,6 +8280,161 @@ def _file_write_path(arguments):
     return ""
 
 
+def _tool_message_text(message):
+    """Return text from an OpenAI-style message without assuming one shape."""
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for part in content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict):
+            text = part.get("text") or part.get("content")
+            if isinstance(text, str):
+                parts.append(text)
+    return "\n".join(parts)
+
+
+def _normalized_read_snapshot(text):
+    """Remove common client line-number wrappers from a Read tool result."""
+    if not isinstance(text, str) or not text:
+        return ""
+    content_match = re.search(
+        r"(?is)<content>\s*\n(?P<content>.*?)\n\s*</content>",
+        text,
+    )
+    body = content_match.group("content") if content_match else text
+    lines = []
+    for line in body.splitlines():
+        if re.match(r"^\s*\(End of file\b", line):
+            continue
+        line = re.sub(r"^\s*\d+(?::|\t)\s?", "", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _repair_reversed_edit_arguments_after_failure(
+    tool_name,
+    arguments,
+    processed_messages,
+):
+    """Swap an inverted Edit old/new pair only when the transcript proves it.
+
+    OpenCode occasionally receives a semantically reversed MiniMax call: the
+    desired replacement is placed in ``oldString`` and the exact current file
+    block in ``newString``. Wait for one real client-side edit failure, then
+    use an earlier Read result for the same path as evidence. This keeps valid
+    native calls untouched and works even when the client filesystem is remote
+    from the inference server.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in {"edit", "editfile"}:
+        return arguments, None
+    if not isinstance(arguments, dict):
+        return arguments, None
+
+    old_key = next(
+        (key for key in ("oldString", "old_string", "oldText", "old_text")
+         if isinstance(arguments.get(key), str) and arguments.get(key)),
+        "",
+    )
+    new_key = next(
+        (key for key in ("newString", "new_string", "newText", "new_text")
+         if isinstance(arguments.get(key), str) and arguments.get(key)),
+        "",
+    )
+    path = _file_write_path(arguments)
+    if not old_key or not new_key or not path:
+        return arguments, None
+    old_value = arguments[old_key].strip()
+    new_value = arguments[new_key].strip()
+    if not old_value or not new_value or old_value == new_value:
+        return arguments, None
+
+    calls_by_id = {}
+    for message in processed_messages or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "").strip()
+            if call_id:
+                calls_by_id[call_id] = call
+
+    latest_edit_failed = False
+    for message in reversed(processed_messages or []):
+        if not isinstance(message, dict) or message.get("role") not in {
+            "tool", "function"
+        }:
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        call = calls_by_id.get(call_id)
+        if not call:
+            continue
+        call_name = re.sub(
+            r"[^a-z0-9]", "", _tool_call_name_for_loop(call).lower()
+        )
+        call_args = _tool_call_arguments_dict(call)
+        if call_name not in {"edit", "editfile"}:
+            continue
+        if os.path.normpath(_file_write_path(call_args)) != os.path.normpath(path):
+            continue
+        result_text = _tool_message_text(message).lower()
+        latest_edit_failed = (
+            "could not find oldstring" in result_text
+            or "could not find old_string" in result_text
+            or (
+                "must match exactly" in result_text
+                and ("oldstring" in result_text or "old_string" in result_text)
+            )
+        )
+        break
+    if not latest_edit_failed:
+        return arguments, None
+
+    snapshots = []
+    for message in processed_messages or []:
+        if not isinstance(message, dict) or message.get("role") not in {
+            "tool", "function"
+        }:
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        call = calls_by_id.get(call_id)
+        if not call:
+            continue
+        call_name = re.sub(
+            r"[^a-z0-9]", "", _tool_call_name_for_loop(call).lower()
+        )
+        if call_name not in {"read", "readfile"}:
+            continue
+        call_args = _tool_call_arguments_dict(call)
+        if os.path.normpath(_file_write_path(call_args)) != os.path.normpath(path):
+            continue
+        snapshot = _normalized_read_snapshot(_tool_message_text(message))
+        if snapshot:
+            snapshots.append(snapshot)
+    if not snapshots:
+        return arguments, None
+    snapshot = snapshots[-1]
+    if new_value not in snapshot or old_value in snapshot:
+        return arguments, None
+
+    repaired = dict(arguments)
+    repaired[old_key] = arguments[new_key]
+    repaired[new_key] = arguments[old_key]
+    return repaired, {
+        "path": path,
+        "old_key": old_key,
+        "new_key": new_key,
+    }
+
+
 def _file_write_content_key(arguments):
     if not isinstance(arguments, dict):
         return ""
@@ -8512,6 +8723,61 @@ def _anchor_mutating_tool_paths(tool_name, arguments, processed_messages):
     return anchored, changes
 
 
+def _anchor_command_working_directory(
+    tool_name,
+    arguments,
+    tools,
+    processed_messages,
+):
+    """Repair a command cwd that drifted from the client's advertised root.
+
+    Agent prompts provide an exact working directory in trusted system/developer
+    metadata. MiniMax occasionally preserves the final directory name while
+    corrupting an earlier path component, which makes an otherwise valid shell
+    call fail and repeat forever. Only repair an external absolute cwd whose
+    basename exactly matches the advertised root; legitimate subdirectories and
+    user-requested absolute directories remain untouched.
+    """
+    if not isinstance(arguments, dict):
+        return arguments, []
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name or tool_name != command_name:
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(
+        processed_messages
+    )
+    if not working_directory:
+        return arguments, []
+    user_text = _last_user_instruction_text(processed_messages)
+    anchored = dict(arguments)
+    changes = []
+    for key in (
+        "workdir",
+        "cwd",
+        "working_directory",
+        "workingDirectory",
+        "directory",
+    ):
+        raw_value = anchored.get(key)
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        raw_path = os.path.normpath(raw_value.strip())
+        if not os.path.isabs(raw_path):
+            continue
+        try:
+            if os.path.commonpath([working_directory, raw_path]) == working_directory:
+                continue
+        except ValueError:
+            pass
+        if raw_path in user_text:
+            continue
+        if os.path.basename(raw_path) != os.path.basename(working_directory):
+            continue
+        anchored[key] = working_directory
+        changes.append((key, raw_path, working_directory))
+    return anchored, changes
+
+
 def _tool_request_path_violation(tool_name, arguments, processed_messages):
     """Return a reason when a mutating call invents an external path.
 
@@ -8650,15 +8916,39 @@ def _tool_retry_gen_params(gen_params, attempt):
 
 def _tool_retry_recovery_hint(full_output, tool_module, tools):
     """Return targeted feedback for a structurally invalid tool call."""
-    def _write_hint(reason):
-        return (
-            f"Tool-call recovery: the previous file-write call {reason}. "
-            "Emit exactly one valid file-write call with both the path and "
-            "`content`. Create only a small working scaffold and keep "
-            f"`content` at or below {TOOL_WRITE_CHUNK_MAX_CHARS} "
-            "characters. Do not attempt the complete large file in this "
-            "retry; continue with focused Edit or bounded append calls "
-            "after the client executes the scaffold."
+    def _mutation_hint(name, required, reason):
+        normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+        required_text = ", ".join(f"`{key}`" for key in sorted(required))
+        base = (
+            f"Tool-call recovery: the previous `{name}` call {reason}. "
+            f"Emit exactly one valid `{name}` call"
+            + (f" containing every required argument: {required_text}. "
+               if required_text else ". ")
+        )
+        if normalized in {"edit", "editfile", "multiedit", "applypatch"}:
+            size_limit = (
+                f" at or below {TOOL_WRITE_CHUNK_MAX_CHARS} characters"
+                if TOOL_WRITE_CHUNK_MAX_CHARS > 0
+                else ""
+            )
+            return base + (
+                "Make one focused replacement only. Use the exact existing "
+                "text as the old/target argument and a bounded replacement "
+                f"{size_limit} as the new argument. Do not regenerate the "
+                "entire file in one Edit."
+            )
+        if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
+            return base + (
+                "Create only a small working scaffold and keep the file "
+                f"content at or below {TOOL_WRITE_CHUNK_MAX_CHARS} "
+                "characters. Do not attempt the complete large file in this "
+                "retry; continue with focused Edit or bounded append calls "
+                "after the client executes the scaffold."
+            )
+        return base + (
+            "Emit a complete atomic call. For a large file, create a small "
+            "working scaffold first, then continue with focused Edit or "
+            "bounded append calls after the client executes it."
         )
 
     tool_calls, _ = _parse_tool_calls(full_output or "", tool_module, tools)
@@ -8669,12 +8959,17 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
             continue
         arguments = _tool_call_arguments_dict(tool_call)
         required = set(_tool_schema_required_names(tools, name))
-        content = arguments.get("content")
-        if "content" in required and not (
-            isinstance(content, str) and content
-        ):
-            return _write_hint(
-                "was invalid because its required `content` argument was missing"
+        missing = [
+            key for key in sorted(required)
+            if arguments.get(key) in (None, "")
+        ]
+        if missing:
+            return _mutation_hint(
+                name,
+                required,
+                "was invalid because required argument(s) "
+                + ", ".join(f"`{key}`" for key in missing)
+                + " were missing",
             )
     raw_output = full_output or ""
     if _looks_like_raw_tool_fragment(raw_output, tool_module):
@@ -8689,8 +8984,10 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
                 rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
                 raw_output,
             ):
-                return _write_hint(
-                    "did not close before the generation budget ended"
+                return _mutation_hint(
+                    name,
+                    set(_tool_schema_required_names(tools, name)),
+                    "did not close before the generation budget ended",
                 )
     return ""
 
@@ -9050,6 +9347,21 @@ def _validate_outgoing_tool_calls(
                     source,
                     target,
                 )
+            decoded, anchored_workdirs = _anchor_command_working_directory(
+                name,
+                decoded,
+                tools,
+                processed_messages,
+            )
+            for key, source, target in anchored_workdirs:
+                logger.warning(
+                    "anchored outgoing %s.%s from %r to client working "
+                    "directory %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
             decoded, oversized_write_chars = _bound_large_file_write_arguments(
                 name,
                 decoded,
@@ -9130,6 +9442,20 @@ def _validate_outgoing_tool_calls(
                 continue
         decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
         decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+        decoded, reversed_edit = _repair_reversed_edit_arguments_after_failure(
+            name,
+            decoded,
+            processed_messages,
+        )
+        if reversed_edit:
+            logger.warning(
+                "swapped outgoing %s %s/%s arguments after a prior failed "
+                "edit matched the client's Read snapshot for %r",
+                name,
+                reversed_edit["old_key"],
+                reversed_edit["new_key"],
+                reversed_edit["path"],
+            )
         decoded, filled_paths = _fill_missing_mutating_tool_path(
             name,
             decoded,
@@ -9152,6 +9478,21 @@ def _validate_outgoing_tool_calls(
         for key, source, target in anchored_paths:
             logger.warning(
                 "anchored outgoing %s.%s from %r to client path %r",
+                name,
+                key,
+                source,
+                target,
+            )
+        decoded, anchored_workdirs = _anchor_command_working_directory(
+            name,
+            decoded,
+            tools,
+            processed_messages,
+        )
+        for key, source, target in anchored_workdirs:
+            logger.warning(
+                "anchored outgoing %s.%s from %r to client working "
+                "directory %r",
                 name,
                 key,
                 source,
@@ -10415,6 +10756,22 @@ def _tool_call_complete_for_stop(text, tool_module, tools):
     return False
 
 
+def _incomplete_tool_call_budget_reached(
+    token_count,
+    tool_call_started,
+    text,
+    tool_module,
+):
+    """True only for an opened tool block that exceeded its atomic budget."""
+    if (
+        TOOL_INCOMPLETE_CALL_TOKEN_BUDGET <= 0
+        or not tool_call_started
+        or int(token_count or 0) < TOOL_INCOMPLETE_CALL_TOKEN_BUDGET
+    ):
+        return False
+    return not _tool_block_emission_finished(text, tool_module)
+
+
 def _tool_call_contains_complete_but_invalid(text, tool_module, tools):
     if not text or tool_module is None or not tools:
         return False
@@ -11037,6 +11394,25 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
                         and tools
+                        and n % 8 == 0
+                        and _incomplete_tool_call_budget_reached(
+                            n,
+                            tool_call_started,
+                            tool_accumulated,
+                            tool_module,
+                        )):
+                    logger.warning(
+                        "rank 0: incomplete tool-call guard at token %d "
+                        "(budget=%d, opened block never closed) — forcing "
+                        "EOS for bounded retry",
+                        n,
+                        TOOL_INCOMPLETE_CALL_TOKEN_BUDGET,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
                         and tool_call_started
                         and TOOL_WRITE_CHUNK_MAX_CHARS > 0
                         and n % 8 == 0):
@@ -11434,12 +11810,13 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # for history. 2026-07-10 ca0f2748: a retry spiraled 3.8k
                 # tokens of bare markers past a guard checking `accumulated`.
                 raw_tail = (raw_tail + token_text)[-600:]
-                if tools and not tool_call_started and token_text:
+                if tools and token_text:
                     tool_guard_text += token_text
-                    tool_call_started = _tool_call_started(
-                        tool_guard_text,
-                        tool_module,
-                    )
+                    if not tool_call_started:
+                        tool_call_started = _tool_call_started(
+                            tool_guard_text,
+                            tool_module,
+                        )
                 _watchdog_tick(progress=True)
                 # Safe decode-phase stop: rank 0 watches the coordinated stop
                 # file every 8 tokens and, when the boundary is reached, ARMS
@@ -11491,6 +11868,71 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
+                        and n % 8 == 0
+                        and _incomplete_tool_call_budget_reached(
+                            n,
+                            tool_call_started,
+                            tool_guard_text,
+                            tool_module,
+                        )):
+                    logger.warning(
+                        "rank 0: incomplete streaming tool-call guard at "
+                        "token %d (budget=%d, opened block never closed) — "
+                        "forcing EOS for bounded retry",
+                        n,
+                        TOOL_INCOMPLETE_CALL_TOKEN_BUDGET,
+                    )
+                    _FORCE_EOS["active"] = True
+                    stopped = True
+                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
+                        and not _FORCE_EOS["active"]
+                        and tools
+                        and tool_call_started
+                        and TOOL_WRITE_CHUNK_MAX_CHARS > 0
+                        and n % 8 == 0):
+                    write_payload_chars = _file_write_payload_chars(
+                        tool_guard_text,
+                        tools,
+                    )
+                    shell_write = _shell_create_file_payload_info(
+                        tool_guard_text,
+                        tools,
+                    )
+                    shell_write_payload_chars = int(
+                        (shell_write or {}).get("payload_chars") or 0
+                    )
+                    oversized_payload_chars = max(
+                        write_payload_chars,
+                        shell_write_payload_chars,
+                    )
+                    if (
+                        oversized_payload_chars
+                        > TOOL_WRITE_CHUNK_MAX_CHARS
+                        and not _tool_call_complete_for_stop(
+                            tool_guard_text,
+                            tool_module,
+                            tools,
+                        )
+                    ):
+                        logger.warning(
+                            "rank 0: oversized streaming %s payload at token "
+                            "%d (%d chars after invocation, budget=%d) — "
+                            "forcing EOS for scaffold retry",
+                            (
+                                "file-producing shell"
+                                if shell_write_payload_chars
+                                >= oversized_payload_chars
+                                else "file-write"
+                            ),
+                            n,
+                            oversized_payload_chars,
+                            TOOL_WRITE_CHUNK_MAX_CHARS,
+                        )
+                        _FORCE_EOS["active"] = True
+                        stopped = True
                 # Degenerate-repetition guard on the raw tail.
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
@@ -11627,7 +12069,9 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     ):
                         stopped = True
                 tool_stop_ready = _tool_call_complete_for_stop(
-                    accumulated, tool_module, tools
+                    tool_guard_text if tools else accumulated,
+                    tool_module,
+                    tools,
                 )
                 if rank != 0:
                     if tool_stop_ready:
@@ -13709,7 +14153,8 @@ def run_http_server(model, processor, rank):
                     msg[key] = m[key]
             processed_messages.append(msg)
         processed_messages, date_context_injected = _add_date_system_context(
-            processed_messages
+            processed_messages,
+            session_id=cache_session_id,
         )
         request["_date_context_injected"] = date_context_injected
         processed_messages = _add_tool_system_hint_if_needed(
@@ -13735,6 +14180,11 @@ def run_http_server(model, processor, rank):
         if (
             requested_max_tokens is None
             and OPENWEBUI_DEFAULT_MAX_TOKENS > 0
+            # Agent/tool requests need room to finish a structured call. The
+            # old stream_options heuristic also matched ZCode and truncated a
+            # large write at 2,048 tokens before the write/scaffold guards
+            # could produce an executable call.
+            and not tools
             and _request_looks_like_openwebui(request, processed_messages)
         ):
             if max_tokens > OPENWEBUI_DEFAULT_MAX_TOKENS:
