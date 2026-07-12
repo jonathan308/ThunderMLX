@@ -213,6 +213,7 @@ def main():
         raise SystemExit(f"endpoint unhealthy: {h}")
     models = args.model or ["Minimax-M3-No-Think", "Minimax-M3"]
     failures = []
+    failed_before = int(h.get("requests_failed") or 0)
     for model in models:
         row = run_case(model, args)
         turn2 = row["turn2"]
@@ -220,8 +221,12 @@ def main():
             failures.append(f"{model}: hot suffix too large: {turn2.get('cache_suffix_tokens')}")
         if (turn2.get("server_ttft_s") or 10**9) > args.max_hot_ttft:
             failures.append(f"{model}: hot TTFT too slow: {turn2.get('server_ttft_s')}")
-        if turn2.get("failed"):
-            failures.append(f"{model}: server failures={turn2.get('failed')}")
+        failed_after = int(turn2.get("failed") or 0)
+        if failed_after > failed_before:
+            failures.append(
+                f"{model}: server failures increased {failed_before}->{failed_after}"
+            )
+        failed_before = failed_after
     if failures:
         raise SystemExit("; ".join(failures))
     print("PASS", flush=True)
