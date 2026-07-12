@@ -17,7 +17,9 @@ from model_gateway import (  # noqa: E402
     _responses_model_prefers_reasoning_heartbeat,
     backend_for_model,
     canonical_m3_model_id,
+    model_ids_from_catalog,
     normalize_openai_json_body,
+    resolve_requested_model,
 )
 
 
@@ -67,6 +69,63 @@ def check_m3_case_and_path_aliases_are_canonicalized():
         assert payload["model"] == expected, (alias, payload)
         assert canonical_m3_model_id(alias) == expected, alias
         assert backend_for_model(alias) == "m3", alias
+
+
+def check_zcode_title_sidecar_is_short_and_visible():
+    body, model, changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Generate a concise title for this coding session.",
+                },
+                {"role": "user", "content": "Build an interactive transformer demo."},
+            ],
+            "stream": False,
+        }).encode("utf-8")
+    )
+    payload = json.loads(body)
+    assert changed is True, payload
+    assert model == "Minimax-M3-No-Think", payload
+    assert payload["model"] == "Minimax-M3-No-Think", payload
+    assert payload["thinking_mode"] == "disabled", payload
+    assert payload["max_tokens"] == 64, payload
+
+
+def check_unknown_models_cannot_trigger_an_omlx_switch():
+    catalog = {
+        "object": "list",
+        "data": [
+            {"id": "DeepSeek-V4-Flash-4bit"},
+            {"id": "Qwen3.6-35B-A3B-MLX-8bit"},
+        ],
+    }
+    assert model_ids_from_catalog(catalog) == [
+        "DeepSeek-V4-Flash-4bit",
+        "Qwen3.6-35B-A3B-MLX-8bit",
+    ]
+
+    old_get_json = gateway.get_json
+
+    async def _catalog(_url):
+        return catalog
+
+    gateway.get_json = _catalog
+    try:
+        valid = asyncio.run(resolve_requested_model("deepseek-v4-flash-4bit"))
+        assert valid == {
+            "ok": True,
+            "backend": "omlx",
+            "model": "DeepSeek-V4-Flash-4bit",
+        }, valid
+
+        typo = asyncio.run(resolve_requested_model("Minimax-M3-No-Thik"))
+        assert typo["ok"] is False, typo
+        assert typo["status_code"] == 404, typo
+        assert typo["type"] == "model_not_found", typo
+    finally:
+        gateway.get_json = old_get_json
 
 
 class _ConnectedRequest:
@@ -229,6 +288,8 @@ def main():
     check_empty_model_defaults_to_m3_agent_model()
     check_explicit_omlx_model_is_preserved()
     check_m3_case_and_path_aliases_are_canonicalized()
+    check_zcode_title_sidecar_is_short_and_visible()
+    check_unknown_models_cannot_trigger_an_omlx_switch()
     check_responses_heartbeat_model_selection()
     check_thinking_heartbeat_keeps_reasoning_separate()
     check_no_think_heartbeat_reuses_message_item()
