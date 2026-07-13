@@ -51,6 +51,7 @@ from sharded_server import (
     _tool_request_fallback_content,
     _tool_intent_without_call,
     _tool_retry_messages,
+    _tool_retry_no_call_budget,
     _tool_retry_prefix_safety,
     _tool_retry_prefers_no_think,
     _tool_retry_thinking_mode,
@@ -184,6 +185,24 @@ def check_tool_retry_preserves_long_prompt_prefix():
     assert "tool_call" not in safe_reasoning and "minimax" not in safe_reasoning
     assert _remaining_tool_reasoning("plan then call", "plan ") == "then call"
     assert _remaining_tool_reasoning("retry plan", "original plan") == ""
+
+
+def check_thinking_action_retry_is_not_clipped_at_focused_budget():
+    focused = _tool_retry_no_call_budget(
+        "disabled",
+        action_tool_task=True,
+    )
+    thinking_action = _tool_retry_no_call_budget(
+        "enabled",
+        action_tool_task=True,
+    )
+    thinking_required = _tool_retry_no_call_budget(
+        "enabled",
+        require_call=True,
+    )
+    assert focused == 384, focused
+    assert thinking_action == 1536, thinking_action
+    assert thinking_required == 1536, thinking_required
 
 
 def check_file_cleanup_promise_requires_a_tool_call():
@@ -4250,6 +4269,7 @@ def check_ssd_restore_append_capacity_is_bounded():
 def main():
     check_complete_analysis_channel()
     check_tool_retry_preserves_long_prompt_prefix()
+    check_thinking_action_retry_is_not_clipped_at_focused_budget()
     check_file_cleanup_promise_requires_a_tool_call()
     check_stream_analysis_channel()
     check_unknown_channel_does_not_buffer_forever()
