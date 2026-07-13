@@ -277,11 +277,10 @@ TOOL_NO_CALL_TOKEN_BUDGET = int(
 TOOL_ACTION_NO_CALL_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536") or "0"
 )
-# Hidden schema-repair retries already have a focused recovery instruction.
-# Keep their thinking-template attempt short so it either starts the requested
-# call quickly or advances to the final no-thinking fallback without replaying
-# another long visible plan. The guard disengages as soon as a call starts, so
-# it never clips a large but structurally valid Edit or Write payload.
+# Hidden schema-repair retries already have focused recovery instructions.
+# This is the no-thinking budget; thinking action retries inherit the larger
+# action budget below so legitimate planning is not clipped. Every guard
+# disengages as soon as a call starts, so valid Edit/Write payloads stay whole.
 TOOL_RETRY_NO_CALL_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_TOOL_RETRY_NO_CALL_TOKEN_BUDGET", "384") or "0"
 )
@@ -11151,6 +11150,28 @@ def _tool_retry_prefers_no_think(
     )
 
 
+def _tool_retry_no_call_budget(
+    thinking_mode,
+    *,
+    action_tool_task=False,
+    require_call=False,
+):
+    """Leave enough retry room for legitimate thinking before a tool call."""
+    budget = max(0, int(TOOL_RETRY_NO_CALL_TOKEN_BUDGET or 0))
+    if (
+        budget > 0
+        and _enable_thinking_for_generation(thinking_mode)
+        and (action_tool_task or require_call)
+    ):
+        budget = max(
+            budget,
+            max(0, int(TOOL_ACTION_NO_CALL_TOKEN_BUDGET or 0)),
+        )
+        if TOOL_THINKING_RUNAWAY_TOKEN_BUDGET > 0:
+            budget = min(budget, TOOL_THINKING_RUNAWAY_TOKEN_BUDGET)
+    return budget
+
+
 def _render_tool_retry_prompt(model, processor, processed_messages, tools,
                               retry_thinking_mode, recovery_hint):
     if not recovery_hint:
@@ -11453,8 +11474,22 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         retry_request["thinking_mode"] = retry_thinking_mode
         retry_request["prompt"] = retry_prompt
         retry_request["token_ids"] = retry_token_ids
-        retry_request["no_call_token_budget"] = (
-            TOOL_RETRY_NO_CALL_TOKEN_BUDGET
+        retry_no_call_budget = _tool_retry_no_call_budget(
+            retry_thinking_mode,
+            action_tool_task=action_tool_task,
+            require_call=require_call,
+        )
+        retry_request["no_call_token_budget"] = retry_no_call_budget
+        logger.info(
+            "[rank 0] %s %s tool retry %d no-call budget=%d "
+            "(mode=%s, action_task=%s, required=%s)",
+            label,
+            req_id,
+            attempt,
+            retry_no_call_budget,
+            retry_thinking_mode,
+            bool(action_tool_task),
+            bool(require_call),
         )
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 tool retry")
@@ -11470,7 +11505,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 tool_module=tool_module, tools=tools,
                 require_tool_call=require_call,
                 action_tool_task=action_tool_task,
-                no_call_token_budget=TOOL_RETRY_NO_CALL_TOKEN_BUDGET,
+                no_call_token_budget=retry_no_call_budget,
             )
         except Exception as e:
             logger.error(
