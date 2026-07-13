@@ -32,7 +32,9 @@ def request_json(method, path, payload=None, timeout=30):
 
 
 def health(timeout=5):
-    return request_json("GET", "/health", timeout=timeout)
+    out = request_json("GET", "/health", timeout=timeout)
+    nested = (out.get("m3") or {}).get("health") if isinstance(out, dict) else None
+    return nested if isinstance(nested, dict) else out
 
 
 def wait_idle(before_completed, timeout=120):

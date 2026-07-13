@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Validate in-memory multi-session prompt-cache slot restore.
+"""Validate multi-session prompt-cache isolation and restore.
 
 This is intentionally stricter than the short-session preserve probe:
 
 1. Build a long session A cache.
-2. Build a different long session B cache, which should stash A when
-   MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS >= 2.
-3. Send a visible-history follow-up for A and require A to restore from the
-   in-memory resident slot, processing only the new suffix.
+2. Build a different long session B cache, which should stash A in an extra
+   resident slot or persist it to SSD when only one RAM slot is configured.
+3. Send a visible-history follow-up for A and require an exact resident/SSD
+   restore that processes only the new suffix without leaking session B.
 """
 import argparse
 import json
@@ -126,6 +126,7 @@ def stream_chat(name, messages, *, model, max_tokens, session_id, timeout):
         "cache_reuse_ratio": prepare.get("reuse_ratio"),
         "cache_missed_tokens": prepare.get("missed_tokens"),
         "restored_resident_slot": prepare.get("restored_resident_slot"),
+        "restored_ssd_cache": prepare.get("restored_ssd_cache"),
         "restored_key": prepare.get("restored_key"),
         "restored_cache_len": prepare.get("restored_cache_len"),
         "failed": final.get("requests_failed"),
@@ -164,7 +165,6 @@ def main():
     parser.add_argument("--keep-cache", action="store_true")
     args = parser.parse_args()
     BASE = args.base.rstrip("/")
-
     initial = health()
     defaults = initial.get("generation_defaults") or {}
     print(json.dumps({
@@ -178,8 +178,14 @@ def main():
     }, sort_keys=True), flush=True)
     if initial.get("status") != "healthy":
         raise SystemExit(f"endpoint unhealthy: {initial}")
-    if int(defaults.get("prompt_cache_resident_slots") or 1) < 2:
-        raise SystemExit("MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS must be >= 2")
+    resident_slots = int(defaults.get("prompt_cache_resident_slots") or 1)
+    ssd = (initial.get("prompt_cache") or {}).get("ssd") or {}
+    if resident_slots < 2 and not (
+        ssd.get("enabled") and ssd.get("restore_enabled") and ssd.get("auto_save")
+    ):
+        raise SystemExit(
+            "one-slot validation requires SSD restore and auto-save to be enabled"
+        )
     if not args.keep_cache:
         print(json.dumps({"reset": reset_cache()}, sort_keys=True), flush=True)
 
@@ -242,10 +248,13 @@ def main():
     failures = []
     if final.get("requests_failed", 0) > initial.get("requests_failed", 0):
         failures.append("request failure count increased")
-    if args.session_a not in resident_slot_keys(after_b):
-        failures.append("session A was not stashed after session B")
-    if not a_follow.get("restored_resident_slot"):
-        failures.append(f"A follow-up did not restore a resident slot: {a_follow}")
+    if resident_slots >= 2:
+        if args.session_a not in resident_slot_keys(after_b):
+            failures.append("session A was not stashed after session B")
+        if not a_follow.get("restored_resident_slot"):
+            failures.append(f"A follow-up did not restore a resident slot: {a_follow}")
+    elif not a_follow.get("restored_ssd_cache"):
+        failures.append(f"A follow-up did not restore its SSD cache: {a_follow}")
     if (a_follow.get("cache_reuse_ratio") or 0) < 0.95:
         failures.append(f"A follow-up reuse below 95%: {a_follow.get('cache_reuse_ratio')}")
     if (a_follow.get("cache_suffix_tokens") or 999999) > 512:

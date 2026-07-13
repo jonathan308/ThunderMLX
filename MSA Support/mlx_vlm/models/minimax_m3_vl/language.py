@@ -56,6 +56,24 @@ _MSA_K1_IMPL = _msa_os.environ.get(
 _MSA_PREFILL_MIN_L = int(
     _msa_os.environ.get("MLX_M3_MSA_PREFILL_MIN_L", "16") or "16"
 )
+# Incremental suffixes over a long resident KV can hit a shape-specific Metal
+# stall in the custom sparse prefill kernel. Route only that narrow shape back
+# through mlx-vlm's native MiniMax attention path; full prefill chunks remain
+# on the accelerated MSA path. A max-L of 0 disables the guard.
+_MSA_PREFILL_LONG_K_SMALL_L_MAX_L = max(
+    0,
+    int(
+        _msa_os.environ.get("MLX_M3_MSA_PREFILL_LONG_K_SMALL_L_MAX_L", "0")
+        or "0"
+    ),
+)
+_MSA_PREFILL_LONG_K_SMALL_L_MIN_KV = max(
+    0,
+    int(
+        _msa_os.environ.get("MLX_M3_MSA_PREFILL_LONG_K_SMALL_L_MIN_KV", "32768")
+        or "32768"
+    ),
+)
 # Blockwise builder only when the standard builder's (L x kv) fp32 score
 # matrix would be heavy; below this the standard builder is faster because
 # it has no per-chunk full-kv sweep. 64MB ~= L=1024 @ 16k kv.
@@ -1249,6 +1267,12 @@ class MiniMaxAttention(nn.Module):
             # (measured: decode collapsed 22 -> 6 t/s, scaling with ctx).
             # Native's sparse decode handles small L at decode-like cost.
             reason = "short_chunk"
+        elif (
+            _MSA_PREFILL_LONG_K_SMALL_L_MAX_L > 0
+            and L <= _MSA_PREFILL_LONG_K_SMALL_L_MAX_L
+            and total_len >= _MSA_PREFILL_LONG_K_SMALL_L_MIN_KV
+        ):
+            reason = "long_k_small_l_guard"
         elif q_positions is not None:
             reason = "q_positions"
         elif mask is not None and not isinstance(mask, str):

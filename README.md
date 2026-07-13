@@ -43,8 +43,8 @@ M5 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
 
 | Metric | Result |
 | --- | --- |
-| Long-context prefill (MSA overlay) | **384 tok/s @ 21k · 378 @ 36k · 366 @ 57k** (2026-07-09) |
-| Cold serial prefill (short prompts) | 285–317 tok/s (4k–14k prompts) |
+| Cold prefill ladder (final candidate) | **367.94 tok/s @ 30.6k · 356.93 @ 81.9k · 337.45 @ 199.8k · 273.56 @ 353.6k** |
+| Cached decode ladder | **26.25 tok/s @ 30.6k · 25.48 @ 81.9k · 23.81 @ 199.8k · 20.96 @ 353.6k** |
 | Short-turn decode | **~30-32 tok/s** (thinking and no-think) |
 | Sustained long generation | **24.5 tok/s** over a 10,000-token completion |
 | Decode at 19k / 35k context (fused sparse decode) | **24.9 / 23.1 tok/s** — near-flat with context (was 20 / 17 dense) |
@@ -53,7 +53,7 @@ M5 Max MacBook Pro 128GB, TB5), MiniMax-M3-4bit, real client traffic:
 | Hot-cache agent turns | 1,000–36,000 tok/s effective prefill |
 | Cancelled-stream retry (agent timeout) | full cache kept → **0.87 s** TTFT on retry |
 | 36k-token session, cold vs hot | 170 s → **5.9 s** TTFT (~29× from KV reuse) |
-| Restart recovery (SSD tier) | 38 s re-prefill → **3.5 s** restore (~11×) |
+| Restart recovery (SSD tier) | **0.86 s @ 46.6k · 7.07 s @ 354k** restore TTFT |
 | In-flight stop → slot released | **< 1–8 s**, from any client, zero orphans; prefill aborts within one 4k chunk |
 | Model swap (M3 ⇄ oMLX) | ~45 s round trip, guarded |
 | Output budget / KV ceiling | 32k tokens / 1M-token KV |
@@ -113,6 +113,16 @@ actions, zero failed requests, no leaked active slot, and clean wired-memory
 release after every stop. The same build passed Codex Responses file writes,
 OpenAI streaming/non-streaming tool calls, OpenWebUI-shaped history, image
 input, and client-disconnect recovery.
+
+The July 13 ZCode gate then exercised the actual desktop client for more than
+30 minutes: roughly 1,275 server requests, hundreds of tool-bearing turns, a
+67k-token working context, multi-file Python edits, shell validation, DOCX/PDF
+generation, cancellation, and recovery from oversized-write retries. A final
+fresh ZCode workflow created two files, ran its verifier, reused the 8.3k-token
+tool prefix at 5,300-6,500 effective prompt tok/s, and finalized normally.
+Repeated identical command/result pairs now end the affected agent turn after
+four unchanged results instead of looping forever; productive reruns with
+changing output remain untouched.
 
 ## Quick Start
 

@@ -30,6 +30,7 @@ COORDINATION
 """
 import logging
 import asyncio
+import difflib
 import gc
 import hashlib
 import importlib.metadata
@@ -113,6 +114,17 @@ PREFILL_STEP_SIZE = int(os.environ.get("MLX_M3_PREFILL_STEP_SIZE", "128"))
 MLX_MAX_OPS_PER_BUFFER = int(os.environ.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
 MLX_MAX_MB_PER_BUFFER = int(os.environ.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
 MAX_KV_SIZE = int(os.environ.get("MLX_M3_MAX_KV_SIZE", "250000"))
+ADVERTISED_MAX_MODEL_LEN = max(
+    1,
+    int(os.environ.get("MLX_M3_ADVERTISED_MAX_MODEL_LEN", "300000") or "300000"),
+)
+# Zero leaves enforcement to the model/runtime. Operators of asymmetric
+# clusters can set a measured input ceiling so clients receive a compactable
+# OpenAI error before the lower-memory rank reaches its local Metal limit.
+HARD_MAX_INPUT_TOKENS = max(
+    0,
+    int(os.environ.get("MLX_M3_HARD_MAX_INPUT_TOKENS", "0") or "0"),
+)
 KV_QUANT_ENABLED = os.environ.get(
     "MLX_M3_KV_QUANT_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -193,6 +205,17 @@ TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS = int(
     )
     or "0"
 )
+# An exact command can be legitimate more than once (for example, rerunning a
+# test after an edit).  The same command returning the same result repeatedly
+# is a much stronger loop signal, so stop that pattern earlier without
+# penalizing productive command reuse.
+TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS = int(
+    os.environ.get(
+        "MLX_M3_TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS",
+        "4",
+    )
+    or "0"
+)
 TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT = int(
     os.environ.get(
         "MLX_M3_TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT",
@@ -225,7 +248,7 @@ TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS = {
     if name.strip()
 }
 TOOL_UNUSABLE_RETRY_ATTEMPTS = int(
-    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_ATTEMPTS", "2") or "0"
+    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_ATTEMPTS", "3") or "0"
 )
 TOOL_UNUSABLE_RETRY_TEMPERATURES = [
     float(part)
@@ -254,6 +277,14 @@ TOOL_NO_CALL_TOKEN_BUDGET = int(
 TOOL_ACTION_NO_CALL_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536") or "0"
 )
+# Hidden schema-repair retries already have a focused recovery instruction.
+# Keep their thinking-template attempt short so it either starts the requested
+# call quickly or advances to the final no-thinking fallback without replaying
+# another long visible plan. The guard disengages as soon as a call starts, so
+# it never clips a large but structurally valid Edit or Write payload.
+TOOL_RETRY_NO_CALL_TOKEN_BUDGET = int(
+    os.environ.get("MLX_M3_TOOL_RETRY_NO_CALL_TOKEN_BUDGET", "384") or "0"
+)
 # A completed tool block normally emits EOS immediately. Closing the outer
 # consumer first sends m3_batch_cancel into its GeneratorExit drain path; one
 # rank occasionally never reaches that boundary and leaves rank0 Metal wired.
@@ -261,17 +292,36 @@ TOOL_ACTION_NO_CALL_TOKEN_BUDGET = int(
 BATCH_TOOL_NATURAL_DRAIN = os.environ.get(
     "MLX_M3_BATCH_TOOL_NATURAL_DRAIN", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
-# Retry unusable tool turns in NO-THINK. A thinking-mode retry regenerates
-# another multi-minute reasoning turn that often re-botches the same marker
-# (2026-07-10 hermes: retry 1/2 ran 7+ min and the client had long since
-# timed out). No-Think is the reliable, fast tool modality — the retry's job
-# is to EMIT a valid call, not reason again. 0 keeps the original mode.
+# Permit the final unusable-tool retry to use NO-THINK. Earlier retries retain
+# the request template and therefore its long KV prefix; only the last resort
+# pays for a template switch and cold prefill. 0 keeps every retry in the
+# original mode.
 TOOL_RETRY_NO_THINK = os.environ.get(
     "MLX_M3_TOOL_RETRY_NO_THINK", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
-    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000") or "0"
+    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "8192") or "0"
 )
+# Aim well below the parser's hard ceiling. MiniMax otherwise treats the
+# advertised maximum as a target and frequently crosses it before emitting
+# the closing tool tag, turning every large-file step into a costly retry.
+_DEFAULT_TOOL_WRITE_CHUNK_TARGET_CHARS = (
+    min(4096, TOOL_WRITE_CHUNK_MAX_CHARS)
+    if TOOL_WRITE_CHUNK_MAX_CHARS > 0 else 0
+)
+TOOL_WRITE_CHUNK_TARGET_CHARS = int(
+    os.environ.get(
+        "MLX_M3_TOOL_WRITE_CHUNK_TARGET_CHARS",
+        str(_DEFAULT_TOOL_WRITE_CHUNK_TARGET_CHARS),
+    ) or "0"
+)
+if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
+    TOOL_WRITE_CHUNK_TARGET_CHARS = max(
+        1,
+        min(TOOL_WRITE_CHUNK_TARGET_CHARS, TOOL_WRITE_CHUNK_MAX_CHARS),
+    )
+else:
+    TOOL_WRITE_CHUNK_TARGET_CHARS = 0
 # A real tool invocation that opens but never closes is invisible to clients
 # while it burns decode tokens. Keep this far above ordinary tool payloads and
 # route the stop through synchronized EOS so the existing bounded retry can
@@ -347,12 +397,14 @@ MAX_CONCURRENT_REQUESTS = max(
 # both ranks share one model/prompt-cache state and must stay in lockstep.
 EFFECTIVE_MAX_CONCURRENT_REQUESTS = 1
 SSE_KEEPALIVE_SECONDS = float(os.environ.get("MLX_M3_SSE_KEEPALIVE_SECONDS", "5"))
-# Stream visible content live during tool-bearing turns (agent clients like
-# opencode otherwise see total silence for the whole turn). A small tail is
-# held back so tool-call markup can never leak, and streaming goes silent at
-# the first '<' out of caution (code-heavy turns fall back to buffered UX).
-# Truncation protections are UNCHANGED — decode stops still require a closed
-# tool block; only delta visibility changes. Default off = buffered baseline.
+# Native MiniMax tool XML can be malformed yet recoverable only after the
+# complete decode. Buffer the full transaction by default so a failed first
+# attempt cannot leak markup before a validated retry is ready.
+TOOL_STREAM_BUFFER_ALL = os.environ.get(
+    "MLX_M3_TOOL_STREAM_BUFFER_ALL", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+# Legacy opt-in for live visible content on tool turns. It is ignored while
+# TOOL_STREAM_BUFFER_ALL is enabled.
 TOOL_STREAM_CONTENT = os.environ.get("MLX_M3_TOOL_STREAM_CONTENT", "0") == "1"
 TOOL_STREAM_HOLDBACK_CHARS = max(
     8, int(os.environ.get("MLX_M3_TOOL_STREAM_HOLDBACK_CHARS", "24") or "24")
@@ -1008,6 +1060,22 @@ PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS = max(
         or "8192"
     ),
 )
+# SSD artifacts are cold backing, not a license to reserve the request's full
+# output ceiling in unified memory. A 45k-token restore previously inherited a
+# 32k-token max-output reserve on every layer and pushed the 128GB rank into a
+# local Metal OOM. Keep only a small, rank-aware hot append window; normal KV
+# growth takes over if a response actually exceeds it.
+PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS = max(
+    0,
+    _env_int_rank_aware("MLX_M3_PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS", 4096),
+)
+# Persist logical cache contents by default. Spare backing is cheap to recreate
+# during restore and expensive to serialize forever, especially after a large
+# request temporarily grew the live cache.
+PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS = max(
+    0,
+    _env_int_rank_aware("MLX_M3_PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS", 0),
+)
 PROMPT_CACHE_SSD_DIR = os.environ.get(
     "MLX_M3_PROMPT_CACHE_SSD_DIR",
     os.path.join(os.path.expanduser("~"), ".cache", "thundermlx", "prompt-kv"),
@@ -1614,6 +1682,11 @@ _prompt_cache_ssd_state = {
     "last_saved_tokens": 0,
     "last_saved_bytes": 0,
     "last_restored_tokens": 0,
+    "last_restore_target_capacity": 0,
+    "last_restore_requested_append_reserve_tokens": 0,
+    "last_restore_append_reserve_tokens": 0,
+    "last_saved_capacity": 0,
+    "last_saved_spare_tokens": 0,
     "last_auto_save_deferred_at": None,
     "last_auto_save_deferred_reason": None,
     "auto_save_deferred_count": 0,
@@ -1623,7 +1696,7 @@ _prompt_cache_ssd_scan_cache = {"at": None, "scan": None}
 _metal_warmup_lock = _threading.RLock()
 _metal_warmup_last_event = None
 
-PROMPT_CACHE_SSD_SCHEMA_VERSION = 1
+PROMPT_CACHE_SSD_SCHEMA_VERSION = 3
 PROMPT_CACHE_SSD_RECENT_ENTRIES = 12
 
 
@@ -2017,6 +2090,9 @@ def _prompt_cache_ssd_file_fingerprint():
     root = os.path.dirname(os.path.abspath(__file__))
     files = [
         os.path.join(root, "sharded_server.py"),
+        os.path.join(root, "m3_batch_cancel.py"),
+        os.path.join(root, "m3_pipeline_patch.py"),
+        os.path.join(root, "m3_eagle3.py"),
         os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "language.py"),
         os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "msa.py"),
     ]
@@ -2215,6 +2291,228 @@ def _cache_state_arrays(value, out=None):
         for item in value:
             _cache_state_arrays(item, out)
     return out
+
+
+def _prompt_cache_ssd_round_capacity(logical_tokens, reserve_tokens, step):
+    logical_tokens = max(0, int(logical_tokens or 0))
+    reserve_tokens = max(0, int(reserve_tokens or 0))
+    step = max(1, int(step or 1))
+    target = logical_tokens + reserve_tokens
+    return ((target + step - 1) // step) * step
+
+
+def _prompt_cache_ssd_bound_sequence(value, logical_tokens, reserve_tokens, step):
+    if not _is_mx_array(value) or len(value.shape) < 3:
+        return value
+    capacity = int(value.shape[2])
+    target = min(
+        capacity,
+        _prompt_cache_ssd_round_capacity(logical_tokens, reserve_tokens, step),
+    )
+    if target >= capacity:
+        return value
+    return value[..., :target, :]
+
+
+def _prompt_cache_ssd_backing_state(layer_cache, *, max_spare_tokens=None):
+    """Return cache tensors and explicit logical offsets for persistence.
+
+    Schema v3 can retain a deliberately bounded append window, but defaults to
+    logical cache contents only. Restore recreates a small hot append reserve.
+    This prevents one large output allowance from becoming permanent capacity
+    on every layer and rank.
+    """
+    nested = getattr(layer_cache, "kv_cache", None)
+    if nested is not None:
+        keys = getattr(nested, "keys", None)
+        values = getattr(nested, "values", None)
+        if _is_mx_array(keys) and _is_mx_array(values):
+            kv_offset = int(getattr(nested, "offset", keys.shape[2]) or 0)
+            step = max(1, int(getattr(layer_cache, "step", 1) or 1))
+            index_keys = getattr(layer_cache, "index_keys", None)
+            if index_keys is not None and not _is_mx_array(index_keys):
+                index_keys = None
+            index_offset = int(getattr(layer_cache, "index_offset", 0) or 0)
+            if max_spare_tokens is not None:
+                keys = _prompt_cache_ssd_bound_sequence(
+                    keys, kv_offset, max_spare_tokens, step
+                )
+                values = _prompt_cache_ssd_bound_sequence(
+                    values, kv_offset, max_spare_tokens, step
+                )
+                if index_keys is not None:
+                    index_keys = _prompt_cache_ssd_bound_sequence(
+                        index_keys, index_offset, max_spare_tokens, step
+                    )
+            return (
+                ((keys, values), index_keys),
+                {
+                    "layout": "nested_kv_backing_v2",
+                    "kv_offset": kv_offset,
+                    "kv_capacity": int(keys.shape[2]),
+                    "index_offset": index_offset,
+                    "index_capacity": (
+                        int(index_keys.shape[2]) if index_keys is not None else 0
+                    ),
+                    "saved_spare_tokens": max(0, int(keys.shape[2]) - kv_offset),
+                },
+            )
+
+    keys = getattr(layer_cache, "keys", None)
+    values = getattr(layer_cache, "values", None)
+    if _is_mx_array(keys) and _is_mx_array(values):
+        offset = int(getattr(layer_cache, "offset", keys.shape[2]) or 0)
+        step = max(1, int(getattr(layer_cache, "step", 1) or 1))
+        if max_spare_tokens is not None:
+            keys = _prompt_cache_ssd_bound_sequence(
+                keys, offset, max_spare_tokens, step
+            )
+            values = _prompt_cache_ssd_bound_sequence(
+                values, offset, max_spare_tokens, step
+            )
+        return (
+            (keys, values),
+            {
+                "layout": "kv_backing_v2",
+                "offset": offset,
+                "capacity": int(keys.shape[2]),
+                "saved_spare_tokens": max(0, int(keys.shape[2]) - offset),
+            },
+        )
+
+    return layer_cache.state, {"layout": "state_v1"}
+
+
+def _prompt_cache_ssd_pad_sequence_capacity(value, target_capacity):
+    if not _is_mx_array(value) or len(value.shape) < 3:
+        return value
+    current = int(value.shape[2])
+    target = max(current, int(target_capacity or 0))
+    if target <= current:
+        return value
+    padding = [(0, 0)] * len(value.shape)
+    padding[2] = (0, target - current)
+    return mx.pad(value, padding)
+
+
+def _prompt_cache_ssd_restore_backing_state(
+    layer_cache,
+    state,
+    storage,
+    *,
+    target_capacity=0,
+):
+    """Install schema-v3 state with a bounded request append capacity."""
+    storage = storage or {}
+    layout = str(storage.get("layout") or "")
+
+    if layout in {"nested_kv_backing_v1", "nested_kv_backing_v2"}:
+        kv_state, index_state = state
+        if not isinstance(kv_state, (tuple, list)) or len(kv_state) != 2:
+            raise ValueError("invalid nested KV backing state")
+        keys, values = kv_state
+        kv_offset = int(storage.get("kv_offset") or 0)
+        index_offset = int(storage.get("index_offset") or 0)
+        step = max(1, int(getattr(layer_cache, "step", 1) or 1))
+        requested_capacity = _prompt_cache_ssd_round_capacity(
+            max(kv_offset, index_offset, int(target_capacity or 0)),
+            0,
+            step,
+        )
+        # Do not inherit oversized spare capacity from an artifact. Crop before
+        # installing the state, then pad only to this request's bounded target.
+        keys = _prompt_cache_ssd_bound_sequence(
+            keys, requested_capacity, 0, step
+        )
+        values = _prompt_cache_ssd_bound_sequence(
+            values, requested_capacity, 0, step
+        )
+        if index_state is not None:
+            index_state = _prompt_cache_ssd_bound_sequence(
+                index_state, requested_capacity, 0, step
+            )
+        layer_cache.state = ((keys, values), index_state)
+        nested = getattr(layer_cache, "kv_cache", None)
+        if nested is None:
+            raise ValueError("nested KV backing metadata on non-nested cache")
+        keys = getattr(nested, "keys", None)
+        index_keys = getattr(layer_cache, "index_keys", None)
+        kv_capacity = int(keys.shape[2]) if keys is not None else 0
+        index_capacity = int(index_keys.shape[2]) if index_keys is not None else 0
+        if kv_offset < 0 or kv_offset > kv_capacity:
+            raise ValueError(
+                f"invalid restored KV offset {kv_offset}/{kv_capacity}"
+            )
+        if index_offset < 0 or index_offset > index_capacity:
+            raise ValueError(
+                f"invalid restored index offset {index_offset}/{index_capacity}"
+            )
+        if requested_capacity > kv_capacity:
+            nested.keys = _prompt_cache_ssd_pad_sequence_capacity(
+                nested.keys, requested_capacity
+            )
+            nested.values = _prompt_cache_ssd_pad_sequence_capacity(
+                nested.values, requested_capacity
+            )
+        if index_keys is not None and requested_capacity > index_capacity:
+            layer_cache.index_keys = _prompt_cache_ssd_pad_sequence_capacity(
+                index_keys, requested_capacity
+            )
+        nested.offset = kv_offset
+        layer_cache.index_offset = index_offset
+        return {
+            "layout": layout,
+            "offset": kv_offset,
+            "capacity": int(nested.keys.shape[2]),
+            "index_offset": index_offset,
+            "index_capacity": (
+                int(layer_cache.index_keys.shape[2])
+                if layer_cache.index_keys is not None
+                else 0
+            ),
+        }
+
+    if layout in {"kv_backing_v1", "kv_backing_v2"}:
+        if not isinstance(state, (tuple, list)) or len(state) != 2:
+            raise ValueError("invalid KV backing state")
+        keys, values = state
+        offset = int(storage.get("offset") or 0)
+        step = max(1, int(getattr(layer_cache, "step", 1) or 1))
+        requested_capacity = _prompt_cache_ssd_round_capacity(
+            max(offset, int(target_capacity or 0)),
+            0,
+            step,
+        )
+        keys = _prompt_cache_ssd_bound_sequence(
+            keys, requested_capacity, 0, step
+        )
+        values = _prompt_cache_ssd_bound_sequence(
+            values, requested_capacity, 0, step
+        )
+        layer_cache.state = (keys, values)
+        keys = getattr(layer_cache, "keys", None)
+        values = getattr(layer_cache, "values", None)
+        capacity = int(keys.shape[2]) if keys is not None else 0
+        if offset < 0 or offset > capacity:
+            raise ValueError(f"invalid restored KV offset {offset}/{capacity}")
+        if requested_capacity > capacity:
+            layer_cache.keys = _prompt_cache_ssd_pad_sequence_capacity(
+                keys, requested_capacity
+            )
+            layer_cache.values = _prompt_cache_ssd_pad_sequence_capacity(
+                values, requested_capacity
+            )
+        layer_cache.offset = offset
+        return {
+            "layout": layout,
+            "offset": offset,
+            "capacity": int(layer_cache.keys.shape[2]),
+        }
+
+    if layout != "state_v1":
+        raise ValueError(f"unsupported SSD cache backing layout: {layout!r}")
+    layer_cache.state = state
+    return {"layout": layout, "offset": None, "capacity": None}
 
 
 def _write_json_atomic(path, payload):
@@ -2538,6 +2836,8 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
         token_hash = _token_ids_sha256(token_ids)
         tail_hash = _token_ids_sha256(token_ids[-min(len(token_ids), 4096):])
         layer_meta = []
+        saved_capacities = []
+        saved_spares = []
         # Admin/manual save runs from an HTTP thread, not necessarily the MLX
         # generation thread. Give MLX an explicit stream before evaluating and
         # serializing tensors from the cached KV state.
@@ -2548,15 +2848,24 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
             )
             for idx, layer_cache in enumerate(cache):
                 arrays = {}
-                structure = _flatten_cache_state(layer_cache.state, arrays, f"layer_{idx}")
+                backing_state, storage = _prompt_cache_ssd_backing_state(
+                    layer_cache,
+                    max_spare_tokens=PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS,
+                )
+                structure = _flatten_cache_state(backing_state, arrays, f"layer_{idx}")
                 if arrays:
                     mx.eval(*arrays.values())
                 layer_path = _prompt_cache_ssd_layer_path(tmp_dir, idx)
                 mx.save_safetensors(layer_path, arrays)
+                capacity = storage.get("kv_capacity", storage.get("capacity"))
+                if capacity is not None:
+                    saved_capacities.append(int(capacity))
+                    saved_spares.append(max(0, int(capacity) - cache_len))
                 layer_meta.append({
                     "index": idx,
                     "class": layer_cache.__class__.__module__ + "." + layer_cache.__class__.__name__,
                     "file": os.path.basename(layer_path),
+                    "storage": storage,
                     "structure": structure,
                     "arrays": {
                         name: {
@@ -2595,6 +2904,14 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
             "token_ids_dtype": "int32",
             "layers": layer_meta,
             "layer_count": len(layer_meta),
+            "save_reserve_tokens": PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS,
+            "saved_min_capacity": (
+                min(saved_capacities) if saved_capacities else cache_len
+            ),
+            "saved_max_capacity": (
+                max(saved_capacities) if saved_capacities else cache_len
+            ),
+            "saved_max_spare_tokens": max(saved_spares) if saved_spares else 0,
             "bytes": total_bytes,
             "privacy": {
                 "raw_prompt_text": False,
@@ -2622,6 +2939,10 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
             "saved_sessions": int(_prompt_cache_ssd_state.get("saved_sessions") or 0) + 1,
             "last_saved_tokens": len(token_ids),
             "last_saved_bytes": total_bytes,
+            "last_saved_capacity": (
+                min(saved_capacities) if saved_capacities else cache_len
+            ),
+            "last_saved_spare_tokens": max(saved_spares) if saved_spares else 0,
             "last_auto_save_deferred_reason": None,
         })
         _prompt_cache_ssd_record_autosave_anchor_unlocked(
@@ -2672,7 +2993,8 @@ def _flatten_arrays_from_structure(structure, out=None):
 
 def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
                                               session_id, session_source,
-                                              allow_partial_restore=True):
+                                              allow_partial_restore=True,
+                                              append_reserve_tokens=0):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None, None, None, "disabled"
     if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
@@ -2751,6 +3073,18 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
                     f"stored={key_tokens}:ratio={partial_ratio:.4f}"
                 )
 
+        requested_append_reserve_tokens = max(
+            0, int(append_reserve_tokens or 0)
+        )
+        append_reserve_tokens = min(
+            requested_append_reserve_tokens,
+            PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS,
+        )
+        requested_capacity = len(token_ids) + append_reserve_tokens
+        if MAX_KV_SIZE > 0:
+            requested_capacity = min(requested_capacity, MAX_KV_SIZE)
+        restore_target_capacity = max(key_tokens, requested_capacity)
+
         from mlx_vlm.models import cache as _cache_mod
 
         # Do not reuse or mutate the holder's current object for restore
@@ -2764,26 +3098,48 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
         layers = meta.get("layers") or []
         if len(layers) != len(new_cache):
             return None, None, None, "layer_count_mismatch"
+        restored_capacities = []
         for layer_meta, layer_cache in zip(layers, new_cache):
             expected_class = layer_cache.__class__.__module__ + "." + layer_cache.__class__.__name__
             if layer_meta.get("class") != expected_class:
                 return None, None, None, "cache_class_mismatch"
             arrays = mx.load(os.path.join(rank_dir, layer_meta.get("file")))
-            layer_cache.state = _restore_cache_state(layer_meta.get("structure"), arrays)
+            state = _restore_cache_state(layer_meta.get("structure"), arrays)
+            restored_storage = _prompt_cache_ssd_restore_backing_state(
+                layer_cache,
+                state,
+                layer_meta.get("storage"),
+                target_capacity=restore_target_capacity,
+            )
+            layer_arrays = _cache_state_arrays(
+                _prompt_cache_ssd_backing_state(layer_cache)[0]
+            )
+            if layer_arrays:
+                # Materialize one layer at a time. At 350k, retaining every
+                # loaded source tensor until one final mx.eval doubles the
+                # transient KV footprint and can exhaust rank-0 headroom.
+                mx.eval(*layer_arrays)
+            capacity = restored_storage.get("capacity")
+            if capacity is not None:
+                restored_capacities.append(int(capacity))
+            del arrays, state, layer_arrays
         if restore_tokens < key_tokens:
             trim_tokens = key_tokens - restore_tokens
             if not _trim_prompt_cache_in_place(new_cache, trim_tokens):
                 return None, None, None, "partial_restore_trim_failed"
-        arrays_to_eval = []
-        for layer_cache in new_cache:
-            arrays_to_eval.extend(_cache_state_arrays(layer_cache.state))
-        if arrays_to_eval:
-            mx.eval(*arrays_to_eval)
         if restore_tokens < key_tokens:
             stored_ids = stored_ids[:restore_tokens]
             meta["_partial_restore"] = True
             meta["_stored_key_tokens"] = key_tokens
         meta["_restore_tokens"] = restore_tokens
+        meta["_restore_target_capacity"] = restore_target_capacity
+        meta["_restore_capacity"] = (
+            min(restored_capacities) if restored_capacities else restore_tokens
+        )
+        meta["_restore_requested_append_reserve_tokens"] = (
+            requested_append_reserve_tokens
+        )
+        meta["_restore_append_reserve_tokens"] = append_reserve_tokens
         meta["last_access_at"] = round(time.time(), 3)
         try:
             _write_json_atomic(meta_path, meta)
@@ -2796,7 +3152,8 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
 
 def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
                                            session_id=None, session_source=None,
-                                           allow_partial_restore=True):
+                                           allow_partial_restore=True,
+                                           append_reserve_tokens=0):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None
     if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
@@ -2805,6 +3162,7 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
     cache, stored_ids, meta, miss_reason = _prompt_cache_ssd_load_candidate_unlocked(
         model, processor, token_ids, session_id, session_source,
         allow_partial_restore=allow_partial_restore,
+        append_reserve_tokens=append_reserve_tokens,
     )
     rank, world = _prompt_cache_ssd_current_rank_world()
     local_ok = 1 if cache is not None and stored_ids and meta else 0
@@ -2856,6 +3214,15 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         "last_restored_session": meta.get("session_key_label") or session_key,
         "restored_sessions": int(_prompt_cache_ssd_state.get("restored_sessions") or 0) + 1,
         "last_restored_tokens": local_cache_len,
+        "last_restore_target_capacity": int(
+            meta.get("_restore_capacity") or local_cache_len
+        ),
+        "last_restore_requested_append_reserve_tokens": int(
+            meta.get("_restore_requested_append_reserve_tokens") or 0
+        ),
+        "last_restore_append_reserve_tokens": int(
+            meta.get("_restore_append_reserve_tokens") or 0
+        ),
     })
     _prompt_cache_ssd_record_autosave_anchor_unlocked(
         session_key,
@@ -2872,6 +3239,13 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         session_source=session_source,
         ssd_session_hash=(meta.get("session_hash") or "")[:16],
         ssd_rank=rank,
+        ssd_restore_capacity=int(meta.get("_restore_capacity") or local_cache_len),
+        ssd_requested_append_reserve_tokens=int(
+            meta.get("_restore_requested_append_reserve_tokens") or 0
+        ),
+        ssd_append_reserve_tokens=int(
+            meta.get("_restore_append_reserve_tokens") or 0
+        ),
         **_prompt_cache_match_fields(len(token_ids or []), local_key_tokens),
     )
     logger.info(
@@ -2886,6 +3260,15 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         "ssd_session_hash": (meta.get("session_hash") or "")[:16],
         "ssd_saved_at": meta.get("saved_at"),
         "restored_cache_len": local_cache_len,
+        "ssd_restore_capacity": int(
+            meta.get("_restore_capacity") or local_cache_len
+        ),
+        "ssd_requested_append_reserve_tokens": int(
+            meta.get("_restore_requested_append_reserve_tokens") or 0
+        ),
+        "ssd_append_reserve_tokens": int(
+            meta.get("_restore_append_reserve_tokens") or 0
+        ),
         "ssd_partial_restore": bool(meta.get("_partial_restore")),
         "ssd_stored_key_tokens": int(meta.get("_stored_key_tokens") or local_key_tokens),
     }
@@ -2904,7 +3287,8 @@ def _prompt_cache_ssd_restore_eligible_unlocked(token_ids, session_id):
 def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
                                              session_id=None, session_source=None,
                                              reason="miss",
-                                             allow_partial_restore=True):
+                                             allow_partial_restore=True,
+                                             append_reserve_tokens=0):
     """Try durable restore only when RAM/live reuse has already missed.
 
     This helper intentionally does not inspect local artifact existence before
@@ -2921,6 +3305,7 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
         session_id=session_id,
         session_source=session_source,
         allow_partial_restore=allow_partial_restore,
+        append_reserve_tokens=append_reserve_tokens,
     )
 
 
@@ -3005,6 +3390,9 @@ def _prompt_cache_ssd_status_unlocked(force_scan=False):
         "auto_save_min_delta_tokens": (
             PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS
         ),
+        "append_reserve_tokens": PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS,
+        "save_reserve_tokens": PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS,
+        "schema_version": PROMPT_CACHE_SSD_SCHEMA_VERSION,
         "mode": (
             "restore+autosave"
             if (
@@ -3681,6 +4069,43 @@ def _cache_token_count(cache):
     return 0
 
 
+def _cache_capacity_status(cache):
+    """Return first-layer logical/capacity counters without evaluating MLX."""
+    status = {
+        "cache_physical_tokens": 0,
+        "cache_capacity_tokens": 0,
+        "cache_spare_tokens": 0,
+        "index_capacity_tokens": 0,
+    }
+    if not cache:
+        return status
+    try:
+        layer = cache[0]
+        nested = getattr(layer, "kv_cache", None)
+        if nested is not None:
+            keys = getattr(nested, "keys", None)
+            offset = int(getattr(nested, "offset", 0) or 0)
+            capacity = int(keys.shape[2]) if keys is not None else 0
+            index_keys = getattr(layer, "index_keys", None)
+            index_capacity = (
+                int(index_keys.shape[2]) if index_keys is not None else 0
+            )
+        else:
+            keys = getattr(layer, "keys", None)
+            offset = int(getattr(layer, "offset", 0) or 0)
+            capacity = int(keys.shape[2]) if keys is not None else 0
+            index_capacity = 0
+        status.update({
+            "cache_physical_tokens": offset,
+            "cache_capacity_tokens": capacity,
+            "cache_spare_tokens": max(0, capacity - offset),
+            "index_capacity_tokens": index_capacity,
+        })
+    except Exception:
+        pass
+    return status
+
+
 def _trim_prompt_cache_in_place(cache, n):
     """Trim n tokens from every layer cache; return True only if all agree."""
     if not cache or n <= 0:
@@ -3713,6 +4138,7 @@ def _prompt_cache_status():
             and not _prompt_cache_holder.get("in_use")
         ):
             expires = max(0.0, round(PROMPT_CACHE_TTL_SECONDS - idle, 3))
+        capacity_status = _cache_capacity_status(_prompt_cache_holder.get("cache"))
         return {
             "enabled": PROMPT_CACHE_ENABLED,
             "thinking_enabled": PROMPT_CACHE_THINKING_ENABLED,
@@ -3731,6 +4157,7 @@ def _prompt_cache_status():
             "session_source": _prompt_cache_holder.get("session_source"),
             "key_tokens": len(_prompt_cache_holder.get("token_ids") or []),
             "cache_len": int(_prompt_cache_holder.get("cache_len") or 0),
+            **capacity_status,
             "last_input_tokens": int(_prompt_cache_holder.get("last_input_tokens") or 0),
             "last_generated_tokens": int(_prompt_cache_holder.get("last_generated_tokens") or 0),
             "last_exact_generated_ids": bool(_prompt_cache_holder.get("last_exact_generated_ids")),
@@ -4130,7 +4557,8 @@ def _prewarm_plan_consensus(my_skip, prompt_to_send, cached_prompt_cache):
 
 def _prepare_cached_prompt(model, processor, prompt, token_ids,
                            session_id=None, session_source=None,
-                           thinking_mode="adaptive"):
+                           thinking_mode="adaptive",
+                           append_reserve_tokens=0):
     """Compute (suffix_prompt, prompt_cache) for prefix-aware generation.
 
     Returns (prompt_to_send, prompt_cache_or_None). If a long prefix is reused,
@@ -4165,10 +4593,35 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
             and _prompt_cache_current_session_key_unlocked()
             != _prompt_cache_session_key(session_id, session_source)
         ):
-            restored_slot = _prompt_cache_restore_resident_unlocked(
-                session_id=session_id,
-                session_source=session_source,
-            )
+            if PROMPT_CACHE_RESIDENT_SLOTS > 1:
+                restored_slot = _prompt_cache_restore_resident_unlocked(
+                    session_id=session_id,
+                    session_source=session_source,
+                )
+            elif not _is_auto_cache_session_source(session_source):
+                # A one-slot runtime cannot retain two live KV trees. Persist
+                # the outgoing explicit session, then release it before the
+                # normal cold/SSD path selects the requested session. This is
+                # both the isolation boundary and the memory-safe alternative
+                # to staging two 200k+ caches during a durable restore.
+                outgoing_session_id = holder.get("session_id")
+                outgoing_cache_len = int(holder.get("cache_len") or 0)
+                _prompt_cache_ssd_maybe_autosave_unlocked(
+                    model,
+                    processor,
+                    prompt=holder.get("prompt"),
+                    reason=f"one_slot_switch:{session_id}",
+                )
+                holder["cache"] = None
+                _clear_prompt_cache_key_state_unlocked(holder)
+                gc.collect()
+                logger.info(
+                    "prompt-cache: released one-slot %s-session %d-token cache "
+                    "before switch to %s-session",
+                    outgoing_session_id,
+                    outgoing_cache_len,
+                    session_id,
+                )
         cached_ids = holder["token_ids"]
         cache = holder["cache"]
 
@@ -4181,6 +4634,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="cold_or_empty_ram",
                 allow_partial_restore=allow_partial_ssd_restore,
+                append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
                 cached_ids = holder["token_ids"]
@@ -4292,6 +4746,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_source=session_source,
                     reason="auto_isolation_after_stash",
                     allow_partial_restore=allow_partial_ssd_restore,
+                    append_reserve_tokens=append_reserve_tokens,
                 )
                 if restored_ssd:
                     return _prepare_cached_prompt(
@@ -4302,6 +4757,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                         session_id=session_id,
                         session_source=session_source,
                         thinking_mode=thinking_mode,
+                        append_reserve_tokens=append_reserve_tokens,
                     )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -4360,13 +4816,14 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
         )
         if (
             session_mismatch
-            and PROMPT_CACHE_RESIDENT_SLOTS > 1
             and protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
             and not small_static_prefix_switch
         ):
-            stashed = _prompt_cache_stash_current_unlocked(
-                reason=f"session_switch:{session_id or '__default__'}"
-            )
+            stashed = False
+            if PROMPT_CACHE_RESIDENT_SLOTS > 1:
+                stashed = _prompt_cache_stash_current_unlocked(
+                    reason=f"session_switch:{session_id or '__default__'}"
+                )
             restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
                 model,
                 processor,
@@ -4375,6 +4832,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="session_switch_after_stash",
                 allow_partial_restore=allow_partial_ssd_restore,
+                append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
                 return _prepare_cached_prompt(
@@ -4385,6 +4843,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_id=session_id,
                     session_source=session_source,
                     thinking_mode=thinking_mode,
+                    append_reserve_tokens=append_reserve_tokens,
                 )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -4541,6 +5000,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="low_reuse_before_rebuild",
                 allow_partial_restore=allow_partial_ssd_restore,
+                append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
                 return _prepare_cached_prompt(
@@ -4551,6 +5011,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_id=session_id,
                     session_source=session_source,
                     thinking_mode=thinking_mode,
+                    append_reserve_tokens=append_reserve_tokens,
                 )
             # Not enough overlap to bother: reset and process full prompt.
             _prompt_cache_stash_current_unlocked(reason=f"replace:{session_id or '__default__'}")
@@ -4922,6 +5383,21 @@ def _prompt_cache_allowed_for_request(thinking_mode, token_ids):
     return True
 
 
+def _prompt_cache_allowed_for_generation(thinking_mode, token_ids, image):
+    """Keep text KV reuse away from image-bearing VLM generations.
+
+    MLX-VLM expands image placeholders into feature tokens during prefill. A
+    text-prefix cache can trim those placeholders while the caller still
+    supplies image features, yielding ``Image features and Image tokens do not
+    match`` on a retry or follow-up. Until multimodal cache metadata tracks
+    those feature positions explicitly, a full image-bearing prefill is the
+    only shape-safe path. Text-only sessions keep their normal RAM/SSD reuse.
+    """
+    if image is not None:
+        return False
+    return _prompt_cache_allowed_for_request(thinking_mode, token_ids)
+
+
 def _should_tokenize_prompt_for_cache(thinking_mode):
     if not PROMPT_CACHE_ENABLED:
         return False
@@ -5254,6 +5730,7 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
                 model, processor, prompt, token_ids,
                 session_id=session_id,
                 session_source=session_source,
+                append_reserve_tokens=1,
             )
             prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
             my_skip = bool(
@@ -6137,17 +6614,25 @@ def _generation_defaults_status():
         "tool_action_no_call_token_budget": (
             TOOL_ACTION_NO_CALL_TOKEN_BUDGET
         ),
+        "tool_retry_no_call_token_budget": (
+            TOOL_RETRY_NO_CALL_TOKEN_BUDGET
+        ),
         "tool_thinking_runaway_token_budget": (
             TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
         ),
         "tool_unusable_retry_attempts": TOOL_UNUSABLE_RETRY_ATTEMPTS,
         "tool_unusable_retry_max_tokens": TOOL_UNUSABLE_RETRY_MAX_TOKENS,
+        "tool_stream_buffer_all": TOOL_STREAM_BUFFER_ALL,
         "tool_write_chunk_max_chars": TOOL_WRITE_CHUNK_MAX_CHARS,
+        "tool_write_chunk_target_chars": TOOL_WRITE_CHUNK_TARGET_CHARS,
         "tool_incomplete_call_token_budget": (
             TOOL_INCOMPLETE_CALL_TOKEN_BUDGET
         ),
         "tool_loop_force_final_repeated_tool_count": (
             TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
+        ),
+        "tool_loop_force_final_identical_command_results": (
+            TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS
         ),
         "tool_loop_force_final_repeated_tool_names": sorted(
             TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES
@@ -6160,6 +6645,8 @@ def _generation_defaults_status():
         "openwebui_default_max_tokens": OPENWEBUI_DEFAULT_MAX_TOKENS,
         "max_tokens_ceiling": MAX_TOKENS_CEILING,
         "max_kv_size": MAX_KV_SIZE,
+        "advertised_max_model_len": ADVERTISED_MAX_MODEL_LEN,
+        "hard_max_input_tokens": HARD_MAX_INPUT_TOKENS,
         "prefill_step_size": PREFILL_STEP_SIZE,
         "effective_prefill_step_size": runtime_tuning.get("prefill_step_size"),
         "adaptive_prefill_step_tokens": ADAPTIVE_PREFILL_STEP_TOKENS,
@@ -6230,6 +6717,13 @@ def _generation_defaults_status():
         "msa_prefill_blockwise_topk_block_chunk": int(
             os.environ.get("MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK", "2") or "2"
         ),
+        "msa_prefill_long_k_small_l_max_l": int(
+            os.environ.get("MLX_M3_MSA_PREFILL_LONG_K_SMALL_L_MAX_L", "0") or "0"
+        ),
+        "msa_prefill_long_k_small_l_min_kv": int(
+            os.environ.get("MLX_M3_MSA_PREFILL_LONG_K_SMALL_L_MIN_KV", "32768")
+            or "32768"
+        ),
         "visible_transcript_prewarm": VISIBLE_TRANSCRIPT_PREWARM_ENABLED,
         "visible_transcript_prewarm_min_generated": VISIBLE_TRANSCRIPT_PREWARM_MIN_GENERATED,
         "effective_visible_transcript_prewarm_min_generated": (
@@ -6258,6 +6752,16 @@ def _generation_defaults_status():
         "prompt_cache_ssd_auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
         "prompt_cache_ssd_auto_save_min_delta_tokens": (
             PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS
+        ),
+        "prompt_cache_ssd_append_reserve_tokens": (
+            PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS
+        ),
+        "prompt_cache_ssd_save_reserve_tokens": (
+            PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS
+        ),
+        "batch_append_reserve_tokens": _env_int_rank_aware(
+            "MLX_M3_BATCH_APPEND_RESERVE_TOKENS",
+            PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS,
         ),
         "prompt_cache_ssd_dir": os.path.expanduser(PROMPT_CACHE_SSD_DIR),
         "prompt_cache_ssd_dir_rank0": os.path.expanduser(
@@ -6854,9 +7358,13 @@ def _tool_loop_steering_diag(messages, tools):
     visible_assistant_turns = 0
     tool_fallback_turns = 0
     command_counts = {}
+    command_result_counts = {}
+    pending_commands_by_id = {}
+    pending_commands_without_id = []
     tool_name_counts = {}
     user_content_counts = {}
-    for message in messages or []:
+    user_content_indices = {}
+    for message_index, message in enumerate(messages or []):
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
         content = message.get("content")
@@ -6870,6 +7378,7 @@ def _tool_loop_steering_diag(messages, tools):
         if len(normalized) >= 500:
             key = _short_hash(normalized)
             user_content_counts[key] = user_content_counts.get(key, 0) + 1
+            user_content_indices.setdefault(key, []).append(message_index)
     for message in (messages or [])[last_user_index + 1:]:
         if not isinstance(message, dict):
             continue
@@ -6894,8 +7403,34 @@ def _tool_loop_steering_diag(messages, tools):
                     fingerprint = _tool_call_command_fingerprint(tool_call)
                     if fingerprint:
                         command_counts[fingerprint] = command_counts.get(fingerprint, 0) + 1
+                        call_id = str(tool_call.get("id") or "").strip()
+                        if call_id:
+                            pending_commands_by_id[call_id] = fingerprint
+                        else:
+                            pending_commands_without_id.append(fingerprint)
         elif role == "tool":
             tool_results += 1
+            call_id = str(message.get("tool_call_id") or "").strip()
+            command = pending_commands_by_id.pop(call_id, "") if call_id else ""
+            if not command and pending_commands_without_id:
+                command = pending_commands_without_id.pop(0)
+            if command:
+                result = message.get("content", "")
+                if not isinstance(result, str):
+                    try:
+                        result = json.dumps(
+                            result,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                    except (TypeError, ValueError):
+                        result = str(result)
+                normalized_result = re.sub(r"\s+", " ", result.strip())
+                pair = f"{command}\nresult={_short_hash(normalized_result)}"
+                command_result_counts[pair] = (
+                    command_result_counts.get(pair, 0) + 1
+                )
 
     if visible_assistant_turns:
         return None
@@ -6903,6 +7438,12 @@ def _tool_loop_steering_diag(messages, tools):
     if command_counts:
         repeated_command, repeated_command_count = max(
             command_counts.items(),
+            key=lambda item: item[1],
+        )
+    repeated_command_result, repeated_command_result_count = "", 0
+    if command_result_counts:
+        repeated_command_result, repeated_command_result_count = max(
+            command_result_counts.items(),
             key=lambda item: item[1],
         )
     repeated_tool, repeated_tool_count = "", 0
@@ -6950,6 +7491,14 @@ def _tool_loop_steering_diag(messages, tools):
     ):
         reasons.append("force_final")
     if (
+        TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS > 0
+        and repeated_command_result_count
+        >= TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS
+        and "force_final" not in reasons
+    ):
+        reasons.append("identical_command_result")
+        reasons.append("force_final")
+    if (
         TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT > 0
         and repeated_tool_count >= TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
         and repeated_tool in TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_NAMES
@@ -6963,8 +7512,44 @@ def _tool_loop_steering_diag(messages, tools):
         reasons.append("tool_fallback_loop")
         if "force_final" not in reasons:
             reasons.append("force_final")
-    repeated_user_prompt_count = max(user_content_counts.values(), default=0)
-    if repeated_user_prompt_count >= 3:
+    repeated_user_prompt_key = max(
+        user_content_counts,
+        key=user_content_counts.get,
+        default=None,
+    )
+    repeated_user_prompt_count = (
+        user_content_counts.get(repeated_user_prompt_key, 0)
+        if repeated_user_prompt_key else 0
+    )
+    repeated_user_stalled_intervals = 0
+    repeated_indices = user_content_indices.get(repeated_user_prompt_key, [])
+    for left, right in zip(repeated_indices, repeated_indices[1:]):
+        made_progress = False
+        for message in (messages or [])[left + 1:right]:
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") in {"tool", "function"}:
+                made_progress = True
+                break
+            if message.get("role") != "assistant":
+                continue
+            if message.get("tool_calls"):
+                made_progress = True
+                break
+            content = message.get("content")
+            if (
+                isinstance(content, str)
+                and content.strip()
+                and not _looks_like_tool_compat_fallback_content(content)
+            ):
+                made_progress = True
+                break
+        if not made_progress:
+            repeated_user_stalled_intervals += 1
+    if (
+        repeated_user_prompt_count >= 3
+        and repeated_user_stalled_intervals >= 2
+    ):
         reasons.append("repeated_user_tool_prompt")
         if "force_final" not in reasons:
             reasons.append("force_final")
@@ -6977,10 +7562,16 @@ def _tool_loop_steering_diag(messages, tools):
         "tool_results": tool_results,
         "tool_fallback_turns": tool_fallback_turns,
         "repeated_user_prompt_count": repeated_user_prompt_count,
+        "repeated_user_stalled_intervals": repeated_user_stalled_intervals,
         "repeated_tool": repeated_tool,
         "repeated_tool_count": repeated_tool_count,
         "repeated_command_count": repeated_command_count,
         "repeated_command_hash": _short_hash(repeated_command) if repeated_command else None,
+        "repeated_command_result_count": repeated_command_result_count,
+        "repeated_command_result_hash": (
+            _short_hash(repeated_command_result)
+            if repeated_command_result else None
+        ),
     }
 
 
@@ -7019,6 +7610,21 @@ def _tool_loop_steering_text(diag):
         "already enough. Do not emit raw tool markup or describe a tool call "
         "in prose; use the provided tool-call format for any tool."
         f"{filtered_text}"
+    )
+
+
+def _tool_loop_forced_final_fallback(diag):
+    count = int((diag or {}).get("repeated_command_result_count") or 0)
+    if count:
+        return (
+            "The same action returned the same result repeatedly, so I "
+            "stopped retrying it. This step is still incomplete and needs a "
+            "different action before the task can continue."
+        )
+    return (
+        "The recent actions stopped making progress, so I ended the repeated "
+        "attempt. The task is still incomplete and needs a different next "
+        "step."
     )
 
 
@@ -7106,6 +7712,32 @@ def _tool_working_directory_from_messages(processed_messages):
                 and not any(ord(ch) < 32 for ch in candidate)
             ):
                 return candidate
+    # ZCode can place the task root in the user's first instruction instead of
+    # its system <env> block.  Accept only an imperative, directory-labeled
+    # form ("Work only in the existing /abs/path directory"); a bare path in
+    # ordinary prose is not authority for later mutation rewrites.
+    user_workspace_re = re.compile(
+        r"(?is)\bwork\s+only\s+in\s+(?:the\s+existing\s+)?"
+        r"(?:[`\"'])?(?P<path>/[^\r\n`\"']+?)(?:[`\"'])?\s+"
+        r"(?:directory|folder)\b"
+    )
+    for message in reversed(processed_messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str) or not content:
+            continue
+        match = user_workspace_re.search(content)
+        if not match:
+            continue
+        candidate = os.path.normpath(match.group("path").strip())
+        if (
+            os.path.isabs(candidate)
+            and candidate != "/"
+            and len(candidate) <= 1024
+            and not any(ord(ch) < 32 for ch in candidate)
+        ):
+            return candidate
     return ""
 
 
@@ -7120,13 +7752,15 @@ def _file_write_chunk_hint(tools):
     if not has_write:
         return ""
     return (
-        "Large-file rule: keep each file-write `content` payload at or below "
-        f"{TOOL_WRITE_CHUNK_MAX_CHARS} characters. For a larger file, first "
+        "Large-file rule: target each file-write `content` payload at or "
+        f"below {TOOL_WRITE_CHUNK_TARGET_CHARS} characters; the hard parser "
+        f"ceiling is {TOOL_WRITE_CHUNK_MAX_CHARS}. For a larger file, first "
         "write a small valid working scaffold, then continue in later turns "
         "with focused Edit calls or bounded append operations. Never attempt "
         "the entire large file in one Write call. Do not bypass this limit "
         "with a large Bash heredoc, printf, tee, base64, or shell-embedded "
-        "file body; use the provided Write and Edit tools in bounded stages."
+        "file body; use the provided Write and Edit tools in bounded stages. "
+        "Never pass bare Python or other source code as a Bash command."
     )
 
 
@@ -7199,19 +7833,27 @@ def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loo
             )
         hint = "\n\n".join(part for part in hint_parts if part)
     steer = _tool_loop_steering_text(tool_loop_diag)
-    if not hint:
-        if not steer:
-            return processed_messages
-        hint = steer
-    elif steer:
-        hint = f"{hint}\n\n{steer}"
-    for message in processed_messages:
+    if not hint and not steer:
+        return processed_messages
+    patched = list(processed_messages)
+    for message in patched:
         if not isinstance(message, dict) or message.get("role") not in {"system", "developer"}:
             continue
         content = message.get("content")
-        if isinstance(content, str) and hint in content:
-            return processed_messages
-    return [{"role": "system", "content": hint}, *processed_messages]
+        if hint and isinstance(content, str) and hint in content:
+            hint = ""
+        if steer and isinstance(content, str) and steer in content:
+            steer = ""
+    if hint:
+        patched.insert(0, {"role": "system", "content": hint})
+    if steer:
+        # A loop hint prepended before a long agent transcript is too remote:
+        # MiniMax can keep copying the latest successful command even though
+        # the instruction is technically present. Keep the static primer at
+        # the front for cache stability, but put dynamic recovery immediately
+        # before generation so the next action changes without removing tools.
+        patched.append({"role": "system", "content": steer})
+    return patched
 
 
 def _load_tool_parser(processor):
@@ -7320,6 +7962,19 @@ def _looks_like_raw_tool_fragment(text, tool_module):
     return bool(re.match(r"\s*(<?[A-Za-z_][\w.-]{0,40}>?\s*)?\{", rest))
 
 
+def _has_empty_native_invoke(text):
+    """Recognize MiniMax's name-less native invocation failure."""
+    if not isinstance(text, str) or "invoke" not in text.lower():
+        return False
+    compact = text.replace("]<]minimax[>[", "")
+    compact = re.sub(r"\s+", " ", compact)
+    return bool(re.search(
+        r"(?:<invoke\s*>|(?<![A-Za-z0-9_])invoke\s*:?)\s*</invoke>",
+        compact,
+        flags=re.IGNORECASE,
+    ))
+
+
 def _looks_like_degenerate_repetition(text, min_cycles=10):
     """Flavor-agnostic copy-spiral detector on the decode tail.
 
@@ -7375,6 +8030,17 @@ def _tool_fragment_looks_degenerate(text, tool_module):
     if open_pos >= 0 and "</tool_call" in fragment[open_pos:]:
         # Last block is closed; the final parse judges it, not the guard.
         return False
+    # A Todo/plan array prefixes every nested field tag with the MiniMax
+    # namespace. Eight ordinary items easily exceed 32 markers before the
+    # closing tag, so marker count alone truncated valid ZCode TodoWrite calls
+    # mid-item and manufactured the retry loop it was meant to prevent.
+    if re.search(
+        rf"{re.escape(ns_token)}<(?P<array>todos|plan|items|tasks)>.*?"
+        rf"{re.escape(ns_token)}<item>",
+        fragment,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        return False
     # 32, not 16: a legitimate many-parameter loose call can pass 16 prefixed
     # segments while still open; true spam re-emits the marker per token and
     # blows past 32 within the same silent window (2026-07-06 audit).
@@ -7415,11 +8081,17 @@ def _canonical_tool_name(name, name_map):
         "terminal": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
         "command": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
         "exec": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
+        "todo": ("todowrite", "update_plan"),
+        "todos": ("todowrite", "update_plan"),
         "cmd": ("bash", "shell", "run_command", "execute_command", "exec_command", "invoke_command", "terminal"),
         "invoke_command": ("bash", "shell", "run_command", "execute_command", "exec_command", "terminal"),
         "exec_command": ("bash", "shell", "run_command", "execute_command", "invoke_command", "terminal"),
         "read": ("read_file", "readfile", "open_file", "view_file", "read"),
+        "read_file": ("read", "readfile", "open_file", "view_file"),
+        "readfile": ("read", "read_file", "open_file", "view_file"),
         "write": ("write_file", "writefile", "edit_file", "write"),
+        "write_file": ("write", "writefile", "edit_file"),
+        "writefile": ("write", "write_file", "edit_file"),
         "exec_stdin": ("write_stdin", "stdin", "send_stdin", "send_input", "write_input"),
         "stdin": ("write_stdin", "exec_stdin", "send_stdin", "send_input", "write_input"),
         "send_stdin": ("write_stdin", "exec_stdin", "stdin", "send_input", "write_input"),
@@ -7467,6 +8139,62 @@ def _tool_schema_property_names(tools, name):
     return list(props.keys()) if isinstance(props, dict) else []
 
 
+def _tool_schema_property_specs(tools, name):
+    params = _tool_parameters_for_name(tools, name)
+    props = params.get("properties") if isinstance(params, dict) else None
+    return props if isinstance(props, dict) else {}
+
+
+def _tool_schema_type_mismatches(arguments, tools, name):
+    """Return arguments whose value or one array item violates JSON Schema."""
+    if not isinstance(arguments, dict):
+        return []
+    specs = _tool_schema_property_specs(tools, name)
+    type_map = {
+        "array": lambda value: isinstance(value, list),
+        "object": lambda value: isinstance(value, dict),
+        "string": lambda value: isinstance(value, str),
+        "boolean": lambda value: isinstance(value, bool),
+        "integer": lambda value: isinstance(value, int) and not isinstance(value, bool),
+        "number": lambda value: (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+        ),
+        "null": lambda value: value is None,
+    }
+    mismatches = []
+    for key, value in arguments.items():
+        spec = specs.get(key)
+        expected = spec.get("type") if isinstance(spec, dict) else None
+        expected_types = expected if isinstance(expected, list) else [expected]
+        checks = [type_map[item] for item in expected_types if item in type_map]
+        if checks and not any(check(value) for check in checks):
+            mismatches.append(key)
+            continue
+        if not isinstance(value, list) or not isinstance(spec, dict):
+            continue
+        item_spec = spec.get("items")
+        if not isinstance(item_spec, dict) or item_spec.get("type") != "object":
+            continue
+        required = item_spec.get("required")
+        required = required if isinstance(required, list) else []
+        for item_index, item in enumerate(value):
+            if not isinstance(item, dict):
+                mismatches.append(f"{key}[{item_index}]")
+                continue
+            for child_key in required:
+                if (
+                    isinstance(child_key, str)
+                    and (
+                        child_key not in item
+                        or item.get(child_key) in (None, "")
+                    )
+                ):
+                    mismatches.append(
+                        f"{key}[{item_index}].{child_key}"
+                    )
+    return mismatches
+
+
 def _tool_schema_required_names(tools, name):
     params = _tool_parameters_for_name(tools, name)
     required = params.get("required") if isinstance(params, dict) else None
@@ -7500,6 +8228,10 @@ def _tool_names_with_property(tools, property_name):
 def _infer_tool_name_from_body(attrs, body, tools, name_map):
     """Infer a missing malformed MiniMax <invoke ...> name from schema + args."""
     haystack = f"{attrs or ''}\n{body or ''}"
+    if re.search(r"</?(?:todos|todo)\b", haystack, flags=re.IGNORECASE):
+        todo_tools = _tool_names_with_property(tools, "todos")
+        if len(todo_tools) == 1:
+            return todo_tools[0]
     for match in re.finditer(r'\{\s*"name"\s*:\s*"(?P<name>(?:\\.|[^"])*)"', haystack):
         candidate = _canonical_tool_name(_loads_json_string_fragment(match.group("name")), name_map)
         if candidate:
@@ -7609,7 +8341,7 @@ def _canonicalize_tool_argument_keys(arguments, tools, name):
         ),
         "new_string": (
             "new_string", "newString", "new_text", "newText", "after",
-            "to", "replace", "replacement",
+            "new_value", "newValue", "to", "replace", "replacement",
         ),
         "old_text": (
             "old_text", "oldText", "old_string", "oldString", "before",
@@ -7617,7 +8349,7 @@ def _canonicalize_tool_argument_keys(arguments, tools, name):
         ),
         "new_text": (
             "new_text", "newText", "new_string", "newString", "after",
-            "to", "replace", "replacement",
+            "new_value", "newValue", "to", "replace", "replacement",
         ),
         "content": (
             "content", "text", "input", "data", "body", "value",
@@ -7651,7 +8383,7 @@ def _canonicalize_tool_argument_keys(arguments, tools, name):
             leftovers[key] = value
 
     for prop in props:
-        if prop in result:
+        if prop in result and result[prop] not in (None, ""):
             continue
         lowered_prop = prop.lower()
         compact_prop = re.sub(r"[^a-z0-9]", "", lowered_prop)
@@ -7732,6 +8464,40 @@ def _coerce_codex_control_tool_arguments(arguments, tools, name):
     if not isinstance(arguments, dict):
         return {}
     result = dict(arguments)
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if normalized_name == "todowrite" and isinstance(result.get("todos"), list):
+        spec = _tool_schema_property_specs(tools, name).get("todos") or {}
+        item_spec = spec.get("items") if isinstance(spec, dict) else {}
+        item_spec = item_spec if isinstance(item_spec, dict) else {}
+        child_props = item_spec.get("properties")
+        child_props = child_props if isinstance(child_props, dict) else {}
+        child_required = item_spec.get("required")
+        child_required = set(child_required) if isinstance(child_required, list) else set()
+        normalized_todos = []
+        for item in result["todos"]:
+            if not isinstance(item, dict):
+                normalized_todos.append(item)
+                continue
+            normalized = dict(item)
+            if (
+                "activeForm" in child_required
+                and not normalized.get("activeForm")
+                and normalized.get("content")
+            ):
+                normalized["activeForm"] = str(normalized["content"])
+            if "status" in child_required and not normalized.get("status"):
+                status_spec = child_props.get("status") or {}
+                allowed = status_spec.get("enum") if isinstance(status_spec, dict) else None
+                if not allowed or "pending" in allowed:
+                    normalized["status"] = "pending"
+            if "priority" in child_required and not normalized.get("priority"):
+                priority_spec = child_props.get("priority") or {}
+                allowed = priority_spec.get("enum") if isinstance(priority_spec, dict) else None
+                if not allowed or "medium" in allowed:
+                    normalized["priority"] = "medium"
+            normalized_todos.append(normalized)
+        result["todos"] = normalized_todos
+        return result
     if name != "update_plan" or "plan" not in _tool_schema_property_names(tools, name):
         return result
     plan = result.get("plan")
@@ -7763,6 +8529,77 @@ def _coerce_codex_control_tool_arguments(arguments, tools, name):
     elif plan not in (None, ""):
         item = normalize_item(plan)
         result["plan"] = [item] if item else []
+    return result
+
+
+def _coerce_json_encoded_schema_values(arguments, tools, name):
+    """Coerce unambiguous XML strings to their advertised JSON types.
+
+    MiniMax occasionally emits a valid JSON array as the string value of an
+    array-typed argument (observed with OpenCode ``todowrite.todos``). Strict
+    clients reject that call even though all information is present. XML tool
+    output also represents booleans and numbers as text. Keep native values
+    unchanged unless the schema asks for a non-string type and conversion is
+    exact and lossless.
+    """
+    if not isinstance(arguments, dict):
+        return {}
+    specs = _tool_schema_property_specs(tools, name)
+    if not specs:
+        return dict(arguments)
+    result = dict(arguments)
+    container_types = {
+        "array": list,
+        "object": dict,
+    }
+    for key, value in list(result.items()):
+        spec = specs.get(key)
+        expected = spec.get("type") if isinstance(spec, dict) else None
+        expected_set = set(expected) if isinstance(expected, list) else {expected}
+        if not isinstance(value, str):
+            continue
+        stripped = value.strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if "boolean" in expected_set and lowered in {"true", "false"}:
+            result[key] = lowered == "true"
+            continue
+        if "integer" in expected_set and re.fullmatch(r"[-+]?\d+", stripped):
+            try:
+                result[key] = int(stripped)
+            except ValueError:
+                pass
+            continue
+        if "number" in expected_set and re.fullmatch(
+            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?",
+            stripped,
+        ):
+            try:
+                result[key] = float(stripped)
+            except ValueError:
+                pass
+            continue
+        py_type = next(
+            (container_types[item] for item in expected_set if item in container_types),
+            None,
+        )
+        if py_type is None:
+            continue
+        marker = "]<]minimax[>["
+        while stripped.startswith(marker):
+            stripped = stripped[len(marker):].lstrip()
+        if not stripped or stripped[0] not in "[{":
+            continue
+        try:
+            decoded = json.loads(stripped)
+        except (TypeError, ValueError):
+            try:
+                decoded = json.loads(stripped, strict=False)
+            except (TypeError, ValueError):
+                continue
+        if isinstance(decoded, py_type):
+            result[key] = decoded
     return result
 
 
@@ -8033,6 +8870,179 @@ def _command_tool_name_from_schema(tools):
     return None
 
 
+def _command_tool_payload_violation(tool_name, arguments, tools):
+    """Reject fragments that cannot be an executable shell command.
+
+    This protects a native-parser edge where a malformed Edit retry was
+    assigned to Bash with an entire Python function as ``command``.  Normal
+    shell commands, Python ``-c`` calls, and explicit heredocs remain valid.
+    """
+    if not isinstance(arguments, dict):
+        return ""
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name or tool_name != command_name:
+        return ""
+    command = next(
+        (
+            arguments.get(key)
+            for key in ("command", "cmd", "input")
+            if isinstance(arguments.get(key), str)
+        ),
+        "",
+    )
+    text = command.strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"[0-9]+", text):
+        return "command is a bare numeric fragment"
+    # MiniMax can nest a malformed Edit invocation inside Bash and leave the
+    # parser with a command beginning ``Edit</name><parameter ...>``. That is
+    # tool protocol, not shell input. Reject only protocol-shaped prefixes so
+    # legitimate commands that grep logs for marker text remain available.
+    if (
+        text.startswith("]<]minimax[>[")
+        or re.match(r"(?is)^\s*<(?:tool_call|invoke|parameter)\b", text)
+        or re.match(
+            r"(?is)^\s*[A-Za-z_][A-Za-z0-9_.:-]*\s*</name>\s*"
+            r"<parameter\b",
+            text,
+        )
+    ):
+        return "command begins with embedded tool-call markup"
+    # A complete XML tool block can still carry an incomplete shell heredoc.
+    # Executing it lets the client runner's own status trailer become file
+    # content (observed in ZCode as ``__zcode_status=$?`` inside a .py file).
+    # Require every advertised delimiter to appear on a line by itself before
+    # the command is allowed to leave the server.
+    heredoc_re = re.compile(
+        r"(?<!<)<<(?P<strip>-)?\s*"
+        r"(?:(?P<quote>['\"])(?P<quoted>[A-Za-z_][A-Za-z0-9_]*)"
+        r"(?P=quote)|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))"
+    )
+    for heredoc in heredoc_re.finditer(text):
+        delimiter = heredoc.group("quoted") or heredoc.group("bare")
+        body = text[heredoc.end():]
+        indent = r"\t*" if heredoc.group("strip") else ""
+        if not re.search(
+            rf"(?:^|\r?\n){indent}{re.escape(delimiter)}(?:\r?\n|$)",
+            body,
+        ):
+            return "command contains an unterminated heredoc"
+    first_line = next(
+        (line.strip() for line in text.splitlines() if line.strip()),
+        "",
+    )
+    if re.match(
+        r"^(?:async\s+def|def|class|from\s+\S+\s+import|import\s+\S+|"
+        r"@[A-Za-z_]|#!\s*/.*python)\b",
+        first_line,
+    ):
+        return "command is bare Python source without an interpreter or heredoc"
+    if first_line.startswith(('"""', "'''")):
+        return "command is bare source code beginning with a module docstring"
+    # A quoted multiline program passed to an explicit interpreter is still
+    # one executable shell command.  The source-line heuristic below used to
+    # count the Python statements inside ``python3 -c "..."`` and reject a
+    # perfectly valid ZCode Bash call after long tool runs.  Check only the
+    # shell-bearing first line so prose that merely mentions ``python -c`` in
+    # a later source line cannot bypass the malformed-command guard.
+    if re.search(
+        r"(?:^|(?:&&|\|\||;|\|)\s*)"
+        r"(?:env\s+)?(?:[^\s;&|]*/)?python(?:3(?:\.\d+)*)?\s+"
+        r"(?:-[A-Za-z]+\s+)*-c(?:\s|$)",
+        first_line,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    if re.search(r"<<-?\s*(?:['\"])?[A-Za-z_][A-Za-z0-9_]*(?:['\"])?", first_line):
+        return ""
+    source_lines = sum(
+        bool(re.match(
+            r"\s*(?:async\s+def|def|class|from\s+\S+\s+import|import\s+\S+|"
+            r"if\s+__name__\s*==|@[A-Za-z_])\b",
+            line,
+        ))
+        for line in text.splitlines()
+    )
+    if source_lines >= 2:
+        return "command contains bare Python source without an interpreter or heredoc"
+    return ""
+
+
+def _repair_non_executable_python_command(
+    tool_name,
+    arguments,
+    tools,
+    processed_messages,
+):
+    """Run a proven non-executable ``*.py`` command through Python.
+
+    This is only applied after the client returned ``permission denied`` for
+    that exact one-token command, so first attempts and executable scripts are
+    untouched.
+    """
+    if not isinstance(arguments, dict):
+        return arguments, None
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name or tool_name != command_name:
+        return arguments, None
+    command_key = next(
+        (
+            key for key in ("command", "cmd", "input")
+            if isinstance(arguments.get(key), str)
+        ),
+        "",
+    )
+    command = arguments.get(command_key, "").strip() if command_key else ""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return arguments, None
+    if len(parts) != 1 or not parts[0].lower().endswith(".py"):
+        return arguments, None
+    path = parts[0]
+
+    calls_by_id = {}
+    for message in processed_messages or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            if isinstance(call, dict) and call.get("id"):
+                calls_by_id[str(call["id"])] = call
+    proven_failure = False
+    for message in reversed(processed_messages or []):
+        if not isinstance(message, dict) or message.get("role") not in {
+            "tool", "function"
+        }:
+            continue
+        call = calls_by_id.get(str(message.get("tool_call_id") or ""))
+        if not call or _tool_call_name_for_loop(call) != command_name:
+            continue
+        prior_args = _tool_call_arguments_dict(call)
+        prior_command = next(
+            (
+                prior_args.get(key)
+                for key in ("command", "cmd", "input")
+                if isinstance(prior_args.get(key), str)
+            ),
+            "",
+        ).strip()
+        if prior_command != command:
+            continue
+        proven_failure = "permission denied" in _tool_message_text(message).lower()
+        break
+    if not proven_failure:
+        return arguments, None
+
+    repaired = dict(arguments)
+    repaired[command_key] = f"python3 {shlex.quote(path)}"
+    return repaired, {
+        "key": command_key,
+        "source": command,
+        "target": repaired[command_key],
+    }
+
+
 def _last_user_text(processed_messages):
     for message in reversed(processed_messages or []):
         if isinstance(message, dict) and message.get("role") == "user":
@@ -8060,7 +9070,7 @@ def _last_user_instruction_text(processed_messages):
 _TOOL_ACTION_VERBS = (
     "add|audit|build|check|copy|create|delete|edit|execute|explore|fetch|"
     "find|fix|implement|inspect|install|list|make|modify|move|open|patch|"
-    "read|remove|rename|review|rewrite|run|save|search|test|update|validate|"
+    "read|remove|rename|review|rewrite|run|save|search|strip|test|update|validate|"
     "verify|write"
 )
 
@@ -8139,6 +9149,36 @@ def _tool_call_started(text, tool_module):
     return any(marker in text for marker in markers)
 
 
+def _tool_invocation_match(text, tool_name):
+    """Match a valid or narrowly malformed invocation for one known tool.
+
+    MiniMax occasionally moves the tool name outside the ``name=`` attribute,
+    for example ``<invoke>edit\">{...}``.  Recognizing that opener lets the
+    bounded-write guard stop a giant malformed payload early.  The match is
+    deliberately tied to an advertised tool name and an invocation marker;
+    it does not make the malformed call executable.
+    """
+    if not isinstance(text, str) or not text or not tool_name:
+        return None
+    escaped = re.escape(str(tool_name))
+    patterns = (
+        rf"(?is)<invoke\s+name\s*=\s*[\"']{escaped}[\"']",
+        rf"(?is)<invoke\s+name\s+[\"']{escaped}[\"']",
+        rf"(?is)<invoke\s*=\s*[\"']{escaped}[\"']",
+        rf"(?is)<invoke\s+{escaped}\s*>",
+        rf"(?is)<invoke\s*>\s*[\"']?{escaped}[\"']?\s*(?:[>:]|\{{)",
+        rf"(?is)\[tool\s+call:\s*{escaped}\b",
+        rf"(?is)<tool_name>{escaped}</tool_name>",
+        # MiniMax's native parser also emits the advertised tool name as the
+        # invocation element itself: <tool_call><write>...</write>. This form
+        # must participate in the early payload guard just like <invoke>.
+        rf"(?is)<{escaped}\s*>",
+    )
+    matches = [re.search(pattern, text) for pattern in patterns]
+    matches = [match for match in matches if match]
+    return min(matches, key=lambda match: match.start()) if matches else None
+
+
 def _file_write_payload_chars(text, tools):
     """Characters emitted after a file-write invocation starts, or zero."""
     if not isinstance(text, str) or not text:
@@ -8148,12 +9188,7 @@ def _file_write_payload_chars(text, tools):
         normalized = re.sub(r"[^a-z0-9]", "", name.lower())
         if normalized not in _MUTATING_FILE_TOOL_NAMES:
             continue
-        escaped = re.escape(name)
-        match = re.search(
-            rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
-            rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
-            text,
-        )
+        match = _tool_invocation_match(text, name)
         if match:
             return len(text) - match.end()
     return 0
@@ -8239,7 +9274,7 @@ def _tool_intent_without_call(text):
     if normalized.startswith("```"):
         return True
     return bool(re.search(
-        rf"(?:^|[.!?]\s+)(?:let me|now i(?:'ll| will| need to| should)?|"
+        rf"(?:^|[.!?]\s+)(?:let me|now\s+let me|now i(?:'ll| will| need to| should)?|"
         rf"i(?:'ll| will| need to| should)|next i(?:'ll| will)?)\s+"
         rf"(?:carefully\s+|quickly\s+)?(?:{_TOOL_ACTION_VERBS})\b",
         normalized,
@@ -8254,6 +9289,12 @@ _MUTATING_FILE_TOOL_NAMES = {
     "multiedit",
     "write",
     "writefile",
+}
+_WORKSPACE_FILE_TOOL_NAMES = {
+    "openfile",
+    "read",
+    "readfile",
+    "viewfile",
 }
 _WRITE_FILE_TOOL_NAMES = {
     "makefile",
@@ -8270,6 +9311,64 @@ _FILE_PATH_ARGUMENT_KEYS = (
 )
 
 
+def _strip_minimax_closing_tags_from_paths(arguments):
+    """Remove a parser-leaked MiniMax closing tag from path-only arguments."""
+    if not isinstance(arguments, dict):
+        return arguments, []
+    cleaned = dict(arguments)
+    changes = []
+    suffix = re.compile(
+        r"(?is)(?:\]<\]minimax\[>\[)?"
+        r"</(?:parameter|file_?path|filepath|filename|path|file)>\s*$"
+    )
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        value = cleaned.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        repaired = value
+        while True:
+            next_value = suffix.sub("", repaired).rstrip()
+            if next_value == repaired:
+                break
+            repaired = next_value
+        if repaired != value and repaired:
+            cleaned[key] = repaired
+            changes.append((key, value, repaired))
+    return cleaned, changes
+
+
+def _strip_minimax_closing_tags_from_payloads(tool_name, arguments):
+    """Remove only parser-leaked closing fragments at mutation payload ends."""
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if (
+        normalized_name not in _MUTATING_FILE_TOOL_NAMES
+        or not isinstance(arguments, dict)
+    ):
+        return arguments, []
+    cleaned = dict(arguments)
+    changes = []
+    suffix = re.compile(
+        r"(?is)(?:\s*\]<\]minimax\[>\[\s*"
+        r"<?/?(?:parameter|content|contents|text|data|new_?string|"
+        r"newtext|patch|command|cmd|input|invoke|tool_?call)>?)+\s*$"
+    )
+    for key in (
+        "content", "contents", "text", "data", "newString", "new_string",
+        "newText", "new_text", "replacement", "patch", "patch_text",
+        "patchText",
+    ):
+        value = cleaned.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if not suffix.search(value):
+            continue
+        repaired = suffix.sub("", value).rstrip()
+        if repaired != value:
+            cleaned[key] = repaired
+            changes.append((key, len(value), len(repaired)))
+    return cleaned, changes
+
+
 def _file_write_path(arguments):
     if not isinstance(arguments, dict):
         return ""
@@ -8278,6 +9377,67 @@ def _file_write_path(arguments):
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _repair_reversed_write_path_and_content(tool_name, arguments):
+    """Swap a Write path/payload pair only when their shapes prove inversion.
+
+    A malformed MiniMax XML closer can make the parser put a multiline source
+    payload in ``file_path`` and the absolute destination in ``content``.
+    Strictly require those opposite shapes; a normal path or ordinary prose is
+    never rewritten.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _WRITE_FILE_TOOL_NAMES:
+        return arguments, None
+    if not isinstance(arguments, dict):
+        return arguments, None
+    path_key = next(
+        (
+            key for key in _FILE_PATH_ARGUMENT_KEYS
+            if isinstance(arguments.get(key), str) and arguments.get(key).strip()
+        ),
+        "",
+    )
+    content_key = next(
+        (
+            key for key in ("content", "contents", "text", "data", "body")
+            if isinstance(arguments.get(key), str) and arguments.get(key).strip()
+        ),
+        "",
+    )
+    if not path_key or not content_key:
+        return arguments, None
+    path_value = arguments[path_key].strip()
+    content_value = arguments[content_key].strip()
+    content_is_path = bool(
+        (content_value.startswith("/") or content_value.startswith("~/"))
+        and "\n" not in content_value
+        and len(content_value) < 2048
+    )
+    path_is_payload = bool(
+        "\n" in path_value
+        or (
+            len(path_value) >= 256
+            and re.search(
+                r"(?:\b(?:def|class|import|from|return|const|function)\b|"
+                r"[{};]|```|^#\s)",
+                path_value,
+                flags=re.MULTILINE,
+            )
+        )
+    )
+    if not (content_is_path and path_is_payload):
+        return arguments, None
+    repaired = dict(arguments)
+    repaired[path_key] = content_value
+    repaired[content_key] = path_value
+    return repaired, {
+        "path_key": path_key,
+        "content_key": content_key,
+        "path": content_value,
+        "payload_chars": len(path_value),
+    }
 
 
 def _tool_message_text(message):
@@ -8444,6 +9604,32 @@ def _file_write_content_key(arguments):
     return ""
 
 
+def _oversized_mutating_file_payload(tool_name, arguments):
+    """Return the largest oversized edit/patch string, if one exists.
+
+    Complete calls need the same bounded-write policy as unterminated calls.
+    Write calls are handled by ``_bound_large_file_write_arguments``; edits
+    cannot be truncated or scaffolded safely because doing so changes their
+    replacement semantics, so they must be retried instead.
+    """
+    if TOOL_WRITE_CHUNK_MAX_CHARS <= 0 or not isinstance(arguments, dict):
+        return None
+    normalized = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized not in _MUTATING_FILE_TOOL_NAMES:
+        return None
+    candidates = (
+        "newString", "new_string", "newText", "new_text", "replacement",
+        "patch", "patch_text", "patchText",
+    )
+    oversized = [
+        (key, len(arguments[key]))
+        for key in candidates
+        if isinstance(arguments.get(key), str)
+        and len(arguments[key]) > TOOL_WRITE_CHUNK_MAX_CHARS
+    ]
+    return max(oversized, key=lambda item: item[1]) if oversized else None
+
+
 def _small_file_scaffold(path):
     """Return a valid, intentionally tiny first stage for a large file."""
     extension = os.path.splitext(str(path or ""))[1].lower()
@@ -8541,12 +9727,7 @@ def _synthesize_bounded_write_scaffold_text(full_output, tools):
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
             if normalized not in _WRITE_FILE_TOOL_NAMES:
                 continue
-            escaped = re.escape(name)
-            if re.search(
-                rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
-                rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
-                full_output or "",
-            ):
+            if _tool_invocation_match(full_output or "", name):
                 selected_name = _canonical_tool_name(name, name_map) or name
                 path = _extract_incomplete_file_write_path(
                     full_output,
@@ -8592,11 +9773,56 @@ _RELATIVE_MUTATION_TARGET_RE = re.compile(
 )
 
 
+def _named_proven_file_target(raw_output, processed_messages, working_directory):
+    """Return one same-turn, tool-proven file named in pre-tool intent.
+
+    A successful Read is the strongest evidence. A successful Write/Edit from
+    the same user turn is also authoritative for a bounded retry: MiniMax can
+    preserve the basename while dropping an intermediate directory on the
+    next call. We still require exactly one mentioned basename and keep the
+    target inside the client working directory.
+    """
+    if not isinstance(raw_output, str) or not raw_output or not working_directory:
+        return ""
+    intent = re.split(
+        r"(?is)<tool_call|\[tool\s+call\s*:",
+        raw_output,
+        maxsplit=1,
+    )[0]
+    mentioned = []
+    proven_paths = [
+        *_successful_read_paths_after_last_user(processed_messages),
+        *_successful_mutating_paths_after_last_user(processed_messages),
+    ]
+    for proven_path in proven_paths:
+        proven = os.path.normpath(proven_path)
+        if not os.path.isabs(proven):
+            proven = os.path.normpath(os.path.join(working_directory, proven))
+        basename = os.path.basename(proven)
+        if not basename or not re.search(
+            rf"(?<![A-Za-z0-9_.-]){re.escape(basename)}"
+            rf"(?![A-Za-z0-9_.-])",
+            intent,
+        ):
+            continue
+        try:
+            inside = (
+                os.path.commonpath([working_directory, proven])
+                == working_directory
+            )
+        except ValueError:
+            inside = False
+        if inside and proven not in mentioned:
+            mentioned.append(proven)
+    return mentioned[0] if len(mentioned) == 1 else ""
+
+
 def _fill_missing_mutating_tool_path(
     tool_name,
     arguments,
     tools,
     processed_messages,
+    raw_output=None,
 ):
     """Fill one missing required path from one explicit relative user target.
 
@@ -8625,10 +9851,10 @@ def _fill_missing_mutating_tool_path(
         processed_messages
     )
     instruction = _last_user_instruction_text(processed_messages)
-    if not working_directory or not instruction:
+    if not working_directory:
         return arguments, []
     targets = []
-    for match in _RELATIVE_MUTATION_TARGET_RE.finditer(instruction):
+    for match in _RELATIVE_MUTATION_TARGET_RE.finditer(instruction or ""):
         target = os.path.normpath(match.group("path").strip())
         if (
             target
@@ -8637,9 +9863,23 @@ def _fill_missing_mutating_tool_path(
             and target not in targets
         ):
             targets.append(target)
-    if len(targets) != 1:
+    candidate = ""
+    if len(targets) == 1:
+        candidate = os.path.normpath(
+            os.path.join(working_directory, targets[0])
+        )
+    elif isinstance(raw_output, str) and raw_output:
+        # A bounded retry can correctly emit Write content while dropping only
+        # its path. Recover that path solely from an exact filename named in
+        # the model's pre-tool intent and proven by a successful Read in this
+        # same user turn. This avoids guessing among multi-file agent tasks.
+        candidate = _named_proven_file_target(
+            raw_output,
+            processed_messages,
+            working_directory,
+        )
+    if not candidate:
         return arguments, []
-    candidate = os.path.normpath(os.path.join(working_directory, targets[0]))
     try:
         inside = os.path.commonpath([working_directory, candidate]) == working_directory
     except ValueError:
@@ -8650,6 +9890,160 @@ def _fill_missing_mutating_tool_path(
     repaired = dict(arguments)
     repaired[key] = candidate
     return repaired, [(key, candidate)]
+
+
+def _anchor_mutating_tool_path_from_named_read(
+    tool_name,
+    arguments,
+    processed_messages,
+    raw_output,
+):
+    """Repair a drifted mutation path from one named, tool-proven file."""
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _MUTATING_FILE_TOOL_NAMES:
+        return arguments, []
+    if not isinstance(arguments, dict):
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(processed_messages)
+    target = _named_proven_file_target(
+        raw_output,
+        processed_messages,
+        working_directory,
+    )
+    if not target:
+        return arguments, []
+    user_text = _last_user_instruction_text(processed_messages)
+    anchored = dict(arguments)
+    changes = []
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        source = anchored.get(key)
+        if not isinstance(source, str) or not source.strip():
+            continue
+        source = os.path.normpath(source.strip())
+        if source == target or source in user_text:
+            continue
+        anchored[key] = target
+        changes.append((key, source, target))
+    return anchored, changes
+
+
+def _anchor_mutating_tool_path_from_read_basename(
+    tool_name,
+    arguments,
+    processed_messages,
+):
+    """Anchor a drifted mutation to one same-basename successful Read.
+
+    Some MiniMax retries emit no pre-tool prose, so the intent-name anchor has
+    nothing to inspect. A unique successful Read of the same basename in the
+    current user turn is still exact evidence; ambiguous reads and explicit
+    absolute user targets remain untouched.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _MUTATING_FILE_TOOL_NAMES:
+        return arguments, []
+    if not isinstance(arguments, dict):
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(processed_messages)
+    user_text = _last_user_instruction_text(processed_messages)
+    read_paths = _successful_read_paths_after_last_user(processed_messages)
+    anchored = dict(arguments)
+    changes = []
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        source = anchored.get(key)
+        if not isinstance(source, str) or not source.strip():
+            continue
+        source = os.path.normpath(source.strip())
+        if os.path.isabs(source) and source in user_text:
+            continue
+        basename = os.path.basename(source)
+        if not basename:
+            continue
+        candidates = []
+        for read_path in read_paths:
+            target = os.path.normpath(read_path)
+            if not os.path.isabs(target):
+                # Preserve the exact relative path that the client already
+                # executed successfully. ZCode can advertise the desktop
+                # process home as its cwd while resolving file tools against
+                # the selected workspace. Expanding ``word_stats.py`` against
+                # that misleading home turned a proven relative target into a
+                # wrong absolute path and fed the model a failure loop.
+                if ".." in target.split(os.sep):
+                    continue
+            if os.path.basename(target) != basename:
+                continue
+            if working_directory and os.path.isabs(target):
+                try:
+                    if os.path.commonpath([working_directory, target]) != working_directory:
+                        continue
+                except ValueError:
+                    continue
+            if target not in candidates:
+                candidates.append(target)
+        if len(candidates) != 1 or candidates[0] == source:
+            continue
+        anchored[key] = candidates[0]
+        changes.append((key, source, candidates[0]))
+    return anchored, changes
+
+
+def _anchor_file_tool_path_to_user_relative_target(
+    tool_name,
+    arguments,
+    processed_messages,
+):
+    """Keep an explicitly user-named workspace file relative for the client.
+
+    ZCode's provider metadata can advertise the desktop process home while its
+    file tools resolve relative paths inside the selected workspace. MiniMax
+    then expands ``word_stats.py`` to that home (or a memorized example home),
+    even though the user's relative target is unambiguous. Preserve that exact
+    relative spelling for Read-family calls; later mutations can then reuse
+    that exact client-proven path through the successful-Read anchor. The
+    client that owns the workspace remains the authority that resolves it.
+    """
+    normalized_name = re.sub(r"[^a-z0-9]", "", str(tool_name or "").lower())
+    if normalized_name not in _WORKSPACE_FILE_TOOL_NAMES:
+        return arguments, []
+    if not isinstance(arguments, dict):
+        return arguments, []
+    user_text = _last_user_instruction_text(processed_messages)
+    if not user_text:
+        return arguments, []
+
+    anchored = dict(arguments)
+    changes = []
+    for key in _FILE_PATH_ARGUMENT_KEYS:
+        source = anchored.get(key)
+        if not isinstance(source, str) or not os.path.isabs(source):
+            continue
+        source = os.path.normpath(source.strip())
+        if source in user_text:
+            continue
+        basename = os.path.basename(source)
+        if not basename or basename in {".", ".."}:
+            continue
+        relative_pattern = re.compile(
+            rf"(?<![A-Za-z0-9_./-])"
+            rf"(?P<path>(?:[A-Za-z0-9_.-]+/)*{re.escape(basename)})"
+            r"(?=$|[\s,;:!?)}\]'\"`]|[.](?=\s|$))"
+        )
+        candidates = []
+        for match in relative_pattern.finditer(user_text):
+            candidate = os.path.normpath(match.group("path"))
+            if (
+                candidate
+                and not os.path.isabs(candidate)
+                and ".." not in candidate.split(os.sep)
+                and candidate not in candidates
+            ):
+                candidates.append(candidate)
+        if len(candidates) != 1:
+            continue
+        anchored[key] = candidates[0]
+        changes.append((key, source, candidates[0]))
+    return anchored, changes
 
 
 def _anchor_mutating_tool_paths(tool_name, arguments, processed_messages):
@@ -8723,6 +10117,145 @@ def _anchor_mutating_tool_paths(tool_name, arguments, processed_messages):
     return anchored, changes
 
 
+def _successful_read_paths_after_last_user(processed_messages):
+    latest_user_index = max(
+        (
+            index for index, message in enumerate(processed_messages or [])
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        default=-1,
+    )
+    read_calls = {}
+    successful_paths = []
+    for message in (processed_messages or [])[latest_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_name = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    _tool_call_name_for_loop(call).lower(),
+                )
+                if call_name not in {"read", "readfile", "openfile", "viewfile"}:
+                    continue
+                call_id = str(call.get("id") or "").strip()
+                call_path = _file_write_path(_tool_call_arguments_dict(call))
+                if call_id and call_path:
+                    read_calls[call_id] = call_path
+        elif message.get("role") in {"tool", "function"}:
+            call_id = str(message.get("tool_call_id") or "").strip()
+            call_path = read_calls.get(call_id)
+            if not call_path:
+                continue
+            result_text = _tool_message_text(message)
+            if re.search(
+                r"(?i)(?:file not found|no such file|not_found|error:|failed)",
+                result_text,
+            ):
+                continue
+            successful_paths.append(call_path)
+    return successful_paths
+
+
+def _successful_mutating_paths_after_last_user(processed_messages):
+    """Return file targets successfully mutated after the latest user turn."""
+    latest_user_index = max(
+        (
+            index for index, message in enumerate(processed_messages or [])
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        default=-1,
+    )
+    mutating_calls = {}
+    successful_paths = []
+    for message in (processed_messages or [])[latest_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_name = re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    _tool_call_name_for_loop(call).lower(),
+                )
+                if call_name not in _MUTATING_FILE_TOOL_NAMES:
+                    continue
+                call_id = str(call.get("id") or "").strip()
+                call_path = _file_write_path(_tool_call_arguments_dict(call))
+                if call_id and call_path:
+                    mutating_calls[call_id] = call_path
+        elif message.get("role") in {"tool", "function"}:
+            call_id = str(message.get("tool_call_id") or "").strip()
+            call_path = mutating_calls.get(call_id)
+            if not call_path:
+                continue
+            result_text = _tool_message_text(message)
+            if re.search(
+                r"(?i)(?:file not found|no such file|not_found|error:|failed|"
+                r"permission denied|was not applied|did not match)",
+                result_text,
+            ):
+                continue
+            successful_paths.append(call_path)
+    return successful_paths
+
+
+def _successful_command_workdirs_after_last_user(processed_messages, command_name):
+    """Return explicit workdirs from successful same-turn command calls."""
+    latest_user_index = max(
+        (
+            index for index, message in enumerate(processed_messages or [])
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        default=-1,
+    )
+    calls = {}
+    successful = []
+    for message in (processed_messages or [])[latest_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                if _tool_call_name_for_loop(call) != command_name:
+                    continue
+                args = _tool_call_arguments_dict(call)
+                workdir = next(
+                    (
+                        args.get(key).strip()
+                        for key in (
+                            "workdir", "cwd", "working_directory",
+                            "workingDirectory", "directory",
+                        )
+                        if isinstance(args.get(key), str) and args.get(key).strip()
+                    ),
+                    "",
+                )
+                call_id = str(call.get("id") or "").strip()
+                if call_id and os.path.isabs(workdir):
+                    calls[call_id] = os.path.normpath(workdir)
+        elif message.get("role") in {"tool", "function"}:
+            workdir = calls.get(str(message.get("tool_call_id") or "").strip())
+            if not workdir:
+                continue
+            result_text = _tool_message_text(message)
+            if re.search(
+                r"(?i)(?:notfound|no such file|permission denied|error:|failed|"
+                r"traceback)",
+                result_text,
+            ):
+                continue
+            if workdir not in successful:
+                successful.append(workdir)
+    return successful
+
+
 def _anchor_command_working_directory(
     tool_name,
     arguments,
@@ -8743,9 +10276,17 @@ def _anchor_command_working_directory(
     command_name = _command_tool_name_from_schema(tools)
     if not command_name or tool_name != command_name:
         return arguments, []
+    proven_workdirs = _successful_command_workdirs_after_last_user(
+        processed_messages,
+        command_name,
+    )
     working_directory = _tool_working_directory_from_messages(
         processed_messages
     )
+    history_only_workdir = False
+    if not working_directory and len(proven_workdirs) == 1:
+        working_directory = proven_workdirs[0]
+        history_only_workdir = True
     if not working_directory:
         return arguments, []
     user_text = _last_user_instruction_text(processed_messages)
@@ -8764,6 +10305,64 @@ def _anchor_command_working_directory(
         raw_path = os.path.normpath(raw_value.strip())
         if not os.path.isabs(raw_path):
             continue
+        within_working_directory = False
+        try:
+            within_working_directory = (
+                os.path.commonpath([working_directory, raw_path])
+                == working_directory
+            )
+        except ValueError:
+            pass
+        if within_working_directory and not (
+            history_only_workdir
+            and len(proven_workdirs) == 1
+            and not os.path.exists(raw_path)
+        ):
+            continue
+        if raw_path in user_text:
+            continue
+        raw_base = os.path.basename(raw_path)
+        working_base = os.path.basename(working_directory)
+        same_parent = (
+            os.path.dirname(raw_path) == os.path.dirname(working_directory)
+        )
+        near_match = bool(
+            same_parent
+            and abs(len(raw_base) - len(working_base)) <= 3
+            and difflib.SequenceMatcher(
+                None,
+                raw_base,
+                working_base,
+            ).ratio() >= 0.90
+        )
+        anchor_target = working_directory
+        if raw_base != working_base and not near_match:
+            if (
+                len(proven_workdirs) != 1
+                or os.path.exists(raw_path)
+                or not os.path.isdir(proven_workdirs[0])
+            ):
+                continue
+            anchor_target = proven_workdirs[0]
+        anchored[key] = anchor_target
+        changes.append((key, raw_path, anchor_target))
+    # Some schemas (notably ZCode's Bash tool) carry no separate workdir and
+    # put it in a leading ``cd ... &&``.  Repair only a direct child named in
+    # the latest user instruction, anchored below the exact advertised root.
+    # This caught ``...-20260712/build`` after the model dropped ``-2335``.
+    for key in ("command", "cmd", "input"):
+        command = anchored.get(key)
+        if not isinstance(command, str) or not command.strip():
+            continue
+        cd_match = re.match(
+            r"^(?P<prefix>\s*cd\s+)(?P<quote>['\"]?)"
+            r"(?P<path>/.*?)(?P=quote)(?P<separator>\s*(?:&&|;))",
+            command,
+            flags=re.DOTALL,
+        )
+        if not cd_match:
+            continue
+        raw_path = os.path.normpath(cd_match.group("path").strip())
         try:
             if os.path.commonpath([working_directory, raw_path]) == working_directory:
                 continue
@@ -8771,10 +10370,140 @@ def _anchor_command_working_directory(
             pass
         if raw_path in user_text:
             continue
-        if os.path.basename(raw_path) != os.path.basename(working_directory):
+        child = os.path.basename(raw_path)
+        if (
+            not child
+            or child in {".", ".."}
+            or not re.search(
+                rf"(?<![A-Za-z0-9_.-]){re.escape(child)}(?:/|\b)",
+                user_text,
+            )
+        ):
             continue
-        anchored[key] = working_directory
-        changes.append((key, raw_path, working_directory))
+        candidate = os.path.normpath(os.path.join(working_directory, child))
+        try:
+            if os.path.commonpath([working_directory, candidate]) != working_directory:
+                continue
+        except ValueError:
+            continue
+        quote = cd_match.group("quote")
+        replacement = (
+            cd_match.group("prefix")
+            + quote
+            + candidate
+            + quote
+            + cd_match.group("separator")
+        )
+        repaired_command = replacement + command[cd_match.end():]
+        anchored[key] = repaired_command
+        changes.append((key, raw_path, candidate))
+    # Repair a near-matching sibling root embedded in a read-only command such
+    # as ``ls /tmp/task-20260712/build``. This remains scoped to an exact
+    # client working-directory directive and only rewrites a sibling whose
+    # basename is a close/prefix drift of that root.
+    working_parent = os.path.dirname(working_directory)
+    working_base = os.path.basename(working_directory)
+    for key in ("command", "cmd", "input"):
+        command = anchored.get(key)
+        if not isinstance(command, str) or not command:
+            continue
+        rewritten = command
+        raw_tokens = sorted(
+            set(re.findall(r"/[A-Za-z0-9_./-]+", rewritten)),
+            key=len,
+            reverse=True,
+        )
+        for raw_token in raw_tokens:
+            token = raw_token.rstrip(".,:)")
+            normalized = os.path.normpath(token)
+            try:
+                if os.path.commonpath([working_directory, normalized]) == working_directory:
+                    continue
+            except ValueError:
+                pass
+            if token in user_text:
+                continue
+            cursor = normalized
+            sibling_root = ""
+            while cursor and cursor != os.path.dirname(cursor):
+                if os.path.dirname(cursor) == working_parent:
+                    candidate_base = os.path.basename(cursor)
+                    length_delta = abs(len(candidate_base) - len(working_base))
+                    near_match = bool(
+                        candidate_base != working_base
+                        and length_delta <= 16
+                        and (
+                            working_base.startswith(candidate_base)
+                            or difflib.SequenceMatcher(
+                                None,
+                                candidate_base,
+                                working_base,
+                            ).ratio() >= 0.88
+                        )
+                    )
+                    if near_match:
+                        sibling_root = cursor
+                    break
+                cursor = os.path.dirname(cursor)
+            if not sibling_root:
+                continue
+            suffix = os.path.relpath(normalized, sibling_root)
+            replacement = working_directory
+            if suffix != ".":
+                replacement = os.path.join(working_directory, suffix)
+            if raw_token.endswith("/"):
+                replacement += "/"
+            rewritten = rewritten.replace(raw_token, replacement)
+            changes.append((key, sibling_root, replacement.rstrip("/")))
+        anchored[key] = rewritten
+    return anchored, changes
+
+
+def _anchor_command_paths_from_read_history(
+    tool_name,
+    arguments,
+    tools,
+    processed_messages,
+):
+    """Repair a shell path only when it matches a proven read target suffix."""
+    if not isinstance(arguments, dict):
+        return arguments, []
+    command_name = _command_tool_name_from_schema(tools)
+    if not command_name or tool_name != command_name:
+        return arguments, []
+    working_directory = _tool_working_directory_from_messages(processed_messages)
+    if not working_directory:
+        return arguments, []
+    successful_paths = _successful_read_paths_after_last_user(processed_messages)
+    if not successful_paths:
+        return arguments, []
+    anchored = dict(arguments)
+    changes = []
+    user_text = _last_user_instruction_text(processed_messages)
+    for key in ("command", "cmd", "input"):
+        command = anchored.get(key)
+        if not isinstance(command, str) or not command:
+            continue
+        rewritten = command
+        for successful_path in successful_paths:
+            known = os.path.normpath(successful_path)
+            if not os.path.isabs(known):
+                known = os.path.normpath(os.path.join(working_directory, known))
+            try:
+                relative = os.path.relpath(known, working_directory)
+            except ValueError:
+                continue
+            if relative.startswith(".."):
+                continue
+            for candidate in set(re.findall(r"/[A-Za-z0-9_./-]+", rewritten)):
+                candidate = candidate.rstrip(".,:)")
+                if candidate == known or candidate in user_text:
+                    continue
+                if not candidate.endswith(os.sep + relative):
+                    continue
+                rewritten = rewritten.replace(candidate, known)
+                changes.append((key, candidate, known))
+        anchored[key] = rewritten
     return anchored, changes
 
 
@@ -8900,6 +10629,163 @@ def _synthesize_write_command_tool_call(processed_messages, tools, dropped_tool_
     return _openai_tool_call(command_name, args, 0)
 
 
+def _synthesize_explicit_read_tool_call(processed_messages, tools):
+    """Build one read call only from an explicit path in the user request."""
+    user_text = _last_user_instruction_text(processed_messages)
+    if not user_text:
+        return None
+    matches = list(re.finditer(
+        r"(?i)\bread\s+(?:the\s+)?(?:existing\s+)?(?:file\s+)?"
+        r"(?P<quote>[`\"']?)"
+        r"(?P<path>(?:/|\.?\.?/)?[A-Za-z0-9_.-]+"
+        r"(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9][A-Za-z0-9._-]*)"
+        r"(?P=quote)",
+        user_text,
+    ))
+    if not matches:
+        return None
+    path = matches[-1].group("path").strip()
+    if not path or len(path) > 1024 or any(ord(ch) < 32 for ch in path):
+        return None
+    successful_paths = _successful_read_paths_after_last_user(
+        processed_messages
+    )
+    desired_suffix = os.path.normpath(path).lstrip("./")
+    for successful_path in successful_paths:
+        normalized = os.path.normpath(successful_path)
+        if (
+            normalized == os.path.normpath(path)
+            or normalized.endswith(os.sep + desired_suffix)
+        ):
+            # The client has already completed this explicit read in the
+            # current user turn. Do not synthesize it again when the next
+            # write/edit call is malformed.
+            return None
+    read_name = ""
+    for name in _tool_names_from_schema(tools):
+        normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+        if normalized not in {"read", "readfile", "openfile", "viewfile"}:
+            continue
+        props = {
+            re.sub(r"[^a-z0-9]", "", prop.lower())
+            for prop in _tool_schema_property_names(tools, name)
+        }
+        if props & {"path", "filepath", "file", "filename"}:
+            read_name = name
+            break
+    if not read_name:
+        return None
+    args = _canonicalize_tool_argument_keys(
+        {
+            "path": path,
+            "file_path": path,
+            "filePath": path,
+            "filename": path,
+        },
+        tools,
+        read_name,
+    )
+    if _tool_schema_type_mismatches(args, tools, read_name):
+        return None
+    required = _tool_schema_required_names(tools, read_name)
+    if any(args.get(key) in (None, "") for key in required):
+        return None
+    return _openai_tool_call(read_name, args, 0)
+
+
+def _recover_named_empty_read_tool_call(text, tools):
+    """Recover one non-mutating read named in a complete empty invocation.
+
+    MiniMax occasionally reasons ``read `file.py` `` and then emits a named
+    but argument-less ``<invoke name="Read"></invoke>``. A retry can repeat
+    that deterministic omission. Recover only a declared read-like tool and
+    only when the immediately preceding reasoning contains one unambiguous
+    backtick-quoted file path. Mutating tools are never synthesized here.
+    """
+    if not isinstance(text, str) or "invoke" not in text.lower():
+        return []
+    compact = text.replace("]<]minimax[>[", "")
+    matches = list(re.finditer(
+        r"(?is)<invoke\s+name\s*=\s*[\"']"
+        r"(?P<name>[A-Za-z_$][\w:.$-]*)[\"']\s*>\s*</invoke>",
+        compact,
+    ))
+    if not matches:
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    match = matches[-1]
+    name = _canonical_tool_name(match.group("name"), name_map)
+    normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    if normalized not in {"read", "readfile", "openfile", "viewfile"}:
+        return []
+    required = set(_tool_schema_required_names(tools, name))
+    path_props = [
+        prop for prop in _tool_schema_property_names(tools, name)
+        if re.sub(r"[^a-z0-9]", "", prop.lower())
+        in {"path", "filepath", "file", "filename"}
+    ]
+    required_paths = [prop for prop in path_props if prop in required]
+    if len(required_paths) != 1:
+        return []
+    planning_tail = compact[max(0, match.start() - 1200):match.start()]
+    if not re.search(r"\bread\b", planning_tail, flags=re.IGNORECASE):
+        return []
+    candidates = []
+    for raw_path in re.findall(r"`([^`\r\n]{1,1024})`", planning_tail):
+        path = raw_path.strip()
+        basename = os.path.basename(path)
+        if (
+            not path
+            or "." not in basename
+            or any(ord(ch) < 32 for ch in path)
+            or any(marker in path for marker in ("<", ">", "\x00"))
+        ):
+            continue
+        candidates.append(path)
+    candidates = list(dict.fromkeys(candidates))
+    if len(candidates) != 1:
+        return []
+    args = _canonicalize_tool_argument_keys(
+        {
+            "path": candidates[0],
+            "file_path": candidates[0],
+            "filePath": candidates[0],
+            "filename": candidates[0],
+        },
+        tools,
+        name,
+    )
+    if _tool_schema_type_mismatches(args, tools, name):
+        return []
+    if any(args.get(key) in (None, "") for key in required):
+        return []
+    logger.warning(
+        "recovered named empty %s invocation from explicit reasoning path %r",
+        name,
+        candidates[0],
+    )
+    return [_openai_tool_call(name, args, 0)]
+
+
+def _tool_call_as_display_text(tool_call):
+    if not isinstance(tool_call, dict):
+        return ""
+    fn = tool_call.get("function")
+    if not isinstance(fn, dict) or not fn.get("name"):
+        return ""
+    arguments = fn.get("arguments") or "{}"
+    try:
+        decoded = json.loads(arguments) if isinstance(arguments, str) else arguments
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(decoded, dict):
+        return ""
+    return (
+        f"[Tool call: {fn['name']}]\n"
+        + json.dumps(decoded, ensure_ascii=False)
+    )
+
+
 def _tool_retry_gen_params(gen_params, attempt):
     """Sampling nudge for a tool retry; a temp-0 replay would be deterministic."""
     retry = dict(gen_params or {})
@@ -8914,7 +10800,12 @@ def _tool_retry_gen_params(gen_params, attempt):
     return retry
 
 
-def _tool_retry_recovery_hint(full_output, tool_module, tools):
+def _tool_retry_recovery_hint(
+    full_output,
+    tool_module,
+    tools,
+    processed_messages=None,
+):
     """Return targeted feedback for a structurally invalid tool call."""
     def _mutation_hint(name, required, reason):
         normalized = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
@@ -8926,11 +10817,13 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
                if required_text else ". ")
         )
         if normalized in {"edit", "editfile", "multiedit", "applypatch"}:
-            size_limit = (
-                f" at or below {TOOL_WRITE_CHUNK_MAX_CHARS} characters"
-                if TOOL_WRITE_CHUNK_MAX_CHARS > 0
-                else ""
-            )
+            size_limit = ""
+            if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
+                size_limit = (
+                    f" targeting at most {TOOL_WRITE_CHUNK_TARGET_CHARS} "
+                    "characters and never exceeding the hard ceiling of "
+                    f"{TOOL_WRITE_CHUNK_MAX_CHARS} characters"
+                )
             return base + (
                 "Make one focused replacement only. Use the exact existing "
                 "text as the old/target argument and a bounded replacement "
@@ -8940,8 +10833,10 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
         if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
             return base + (
                 "Create only a small working scaffold and keep the file "
-                f"content at or below {TOOL_WRITE_CHUNK_MAX_CHARS} "
-                "characters. Do not attempt the complete large file in this "
+                f"content near {TOOL_WRITE_CHUNK_TARGET_CHARS} characters "
+                "and below the hard ceiling of "
+                f"{TOOL_WRITE_CHUNK_MAX_CHARS} characters. Do not attempt "
+                "the complete large file in this "
                 "retry; continue with focused Edit or bounded append calls "
                 "after the client executes the scaffold."
             )
@@ -8949,6 +10844,50 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
             "Emit a complete atomic call. For a large file, create a small "
             "working scaffold first, then continue with focused Edit or "
             "bounded append calls after the client executes it."
+        )
+
+    def _unknown_invoke_hint(raw_output):
+        advertised = [
+            _tool_function_name(tool)
+            for tool in (tools or [])
+            if _tool_function_name(tool)
+        ]
+        advertised_by_normalized = {
+            re.sub(r"[^a-z0-9]", "", name.lower()): name
+            for name in advertised
+        }
+        candidates = []
+        for match in re.finditer(
+            r"(?is)<invoke(?:\s+name\s*=\s*[\"']([^\"']+)[\"']|"
+            r"\s+([A-Za-z_][A-Za-z0-9_.:-]*))",
+            raw_output or "",
+        ):
+            candidate = (match.group(1) or match.group(2) or "").strip()
+            if candidate:
+                candidates.append(candidate)
+        if not candidates:
+            return ""
+        normalized_candidates = [
+            re.sub(r"[^a-z0-9]", "", candidate.lower())
+            for candidate in candidates
+        ]
+        # If the malformed wrapper still names a real advertised tool, the
+        # schema-specific recovery paths should guide that call instead of
+        # blaming an outer pseudo-wrapper such as `function_calls`.
+        if any(name in advertised_by_normalized for name in normalized_candidates):
+            return ""
+        unknown = candidates[0]
+        available = ", ".join(f"`{name}`" for name in advertised[:24])
+        command_name = _command_tool_name_from_schema(tools)
+        command_hint = (
+            f" For filesystem search or inspection, use `{command_name}` with "
+            "a concrete shell command."
+            if command_name else ""
+        )
+        return (
+            f"Tool-call recovery: `{unknown}` is not an advertised tool for "
+            f"this request. Emit exactly one complete call using one of: "
+            f"{available}.{command_hint} Do not emit `{unknown}` again."
         )
 
     tool_calls, _ = _parse_tool_calls(full_output or "", tool_module, tools)
@@ -8959,6 +10898,40 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
             continue
         arguments = _tool_call_arguments_dict(tool_call)
         required = set(_tool_schema_required_names(tools, name))
+        oversized = _oversized_mutating_file_payload(name, arguments)
+        if oversized:
+            return _mutation_hint(
+                name,
+                required,
+                f"exceeded the bounded payload limit in `{oversized[0]}` "
+                f"({oversized[1]} characters)",
+            )
+        command_violation = _command_tool_payload_violation(
+            name,
+            arguments,
+            tools,
+        )
+        if command_violation:
+            write_tools = [
+                _tool_function_name(tool)
+                for tool in (tools or [])
+                if re.sub(
+                    r"[^a-z0-9]",
+                    "",
+                    _tool_function_name(tool).lower(),
+                ) in _WRITE_FILE_TOOL_NAMES
+            ]
+            write_instruction = (
+                f" Use `{write_tools[0]}` with an explicit path and bounded "
+                "content, or use one focused Edit call."
+                if write_tools else
+                " Use an explicit interpreter command or a proper file tool."
+            )
+            return (
+                f"Tool-call recovery: the previous `{name}` call was invalid "
+                f"because {command_violation}.{write_instruction} Emit exactly "
+                "one complete advertised tool call and no prose."
+            )
         missing = [
             key for key in sorted(required)
             if arguments.get(key) in (None, "")
@@ -8971,25 +10944,171 @@ def _tool_retry_recovery_hint(full_output, tool_module, tools):
                 + ", ".join(f"`{key}`" for key in missing)
                 + " were missing",
             )
+        type_mismatches = _tool_schema_type_mismatches(
+            arguments,
+            tools,
+            name,
+        )
+        if type_mismatches:
+            specs = _tool_schema_property_specs(tools, name)
+            expected = []
+            for key in type_mismatches:
+                spec = specs.get(key) if isinstance(specs, dict) else None
+                schema_type = spec.get("type") if isinstance(spec, dict) else None
+                expected.append(
+                    f"`{key}` as JSON {schema_type or 'the advertised type'}"
+                )
+            return _mutation_hint(
+                name,
+                required,
+                "was invalid because it must provide "
+                + ", ".join(expected)
+                + " rather than arrays, objects, or nested tags",
+            )
     raw_output = full_output or ""
+    if _has_empty_native_invoke(raw_output):
+        # Empty native invocations often follow perfectly explicit planning,
+        # for example "continue with focused Edit calls" followed by
+        # `<invoke:></invoke>`. Ground the retry in that advertised schema
+        # instead of giving MiniMax a broad list of every available tool.
+        for tool in tools or []:
+            name = _tool_function_name(tool)
+            normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+            if normalized not in _MUTATING_FILE_TOOL_NAMES:
+                continue
+            if not re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(name)}"
+                r"(?:\s+(?:tool|call))?s?(?![A-Za-z0-9_])",
+                raw_output,
+                flags=re.IGNORECASE,
+            ):
+                continue
+            return _mutation_hint(
+                name,
+                set(_tool_schema_required_names(tools, name)),
+                "was named in the plan but omitted from the empty invocation",
+            )
+    explicit_read = _synthesize_explicit_read_tool_call(
+        processed_messages,
+        tools,
+    )
+    if explicit_read and (
+        re.search(r"\bread\b", raw_output, flags=re.IGNORECASE)
+        or "<invoke" in raw_output
+    ):
+        fn = explicit_read["function"]
+        return (
+            "Tool-call recovery: the previous response did not execute the "
+            "explicit read. Emit exactly one complete "
+            f"`{fn['name']}` call with arguments {fn['arguments']}. "
+            "Do not narrate or change the path."
+        )
+    unknown_hint = _unknown_invoke_hint(raw_output)
+    if unknown_hint:
+        return unknown_hint
     if _looks_like_raw_tool_fragment(raw_output, tool_module):
         for tool in tools or []:
             name = _tool_function_name(tool)
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
             if normalized not in _MUTATING_FILE_TOOL_NAMES:
                 continue
-            escaped = re.escape(name)
-            if re.search(
-                rf"(?is)(?:<invoke\s+name=[\"']{escaped}[\"']|"
-                rf"\[tool\s+call:\s*{escaped}\b|<tool_name>{escaped}</tool_name>)",
-                raw_output,
-            ):
+            if _tool_invocation_match(raw_output, name):
                 return _mutation_hint(
                     name,
                     set(_tool_schema_required_names(tools, name)),
                     "did not close before the generation budget ended",
                 )
+    if _tool_intent_without_call(raw_output):
+        if explicit_read:
+            fn = explicit_read["function"]
+            return (
+                "Tool-call recovery: the previous response promised the "
+                "explicit read but emitted an empty invocation. Emit exactly "
+                f"one complete `{fn['name']}` call with arguments "
+                f"{fn['arguments']}. Do not narrate or change the path."
+            )
+        advertised = [
+            _tool_function_name(tool)
+            for tool in (tools or [])
+            if _tool_function_name(tool)
+        ]
+        available = ", ".join(f"`{name}`" for name in advertised[:24])
+        return (
+            "Tool-call recovery: the previous response promised an action "
+            "but emitted no executable call. Emit exactly one complete tool "
+            f"call now using one of: {available}. Do not narrate, plan, ask "
+            "the user to run it, or repeat the promise; execute the next "
+            "concrete step with an advertised tool."
+        )
     return ""
+
+
+def _tool_retry_messages(processed_messages, recovery_hint):
+    """Append retry guidance without invalidating the cached transcript.
+
+    Prepending a new system message makes the rendered retry diverge near
+    token zero. At long context that can leave the completed KV resident while
+    MLX allocates a second near-full cache for the retry, exhausting the
+    smaller rank. A final user turn preserves the complete conversation prefix
+    and turns recovery into the small incremental prefill it should be.
+    """
+    return [
+        *[dict(message) for message in processed_messages],
+        {"role": "user", "content": recovery_hint},
+    ]
+
+
+def _tool_retry_prefix_safety(original_token_ids, retry_token_ids, *,
+                              min_context_tokens=8192,
+                              min_reuse_ratio=0.50):
+    """Describe whether a long retry must release its incompatible RAM KV.
+
+    The normal appended retry should retain almost the full token prefix. If a
+    tokenizer/template change unexpectedly collapses that overlap, explicitly
+    release RAM caches on both ranks before retrying. This is a rare stability
+    fallback; SSD metadata remains available for later session restoration.
+    """
+    original = list(original_token_ids or [])
+    retry = list(retry_token_ids or [])
+    comparable = min(len(original), len(retry))
+    common = _common_prefix_len(original, retry)
+    ratio = (common / comparable) if comparable else 0.0
+    reset = bool(
+        comparable >= max(1, int(min_context_tokens or 0))
+        and ratio < float(min_reuse_ratio)
+    )
+    return {
+        "reset": reset,
+        "original_tokens": len(original),
+        "retry_tokens": len(retry),
+        "common_prefix_tokens": common,
+        "reuse_ratio": ratio,
+    }
+
+
+def _tool_retry_thinking_mode(thinking_mode, prefer_no_think=None):
+    """Select the MiniMax template for a bounded malformed-tool retry.
+
+    Normal retries retain the request's mode so the long KV prefix remains
+    reusable. A caller may explicitly request the native no-thinking template
+    for a final recovery attempt; prefix-safety then cold-rebuilds if that
+    template switch invalidates the resident KV.
+    """
+    prefer_no_think = (
+        TOOL_RETRY_NO_THINK if prefer_no_think is None else bool(prefer_no_think)
+    )
+    if prefer_no_think and _enable_thinking_for_generation(thinking_mode):
+        return "disabled"
+    return thinking_mode
+
+
+def _tool_retry_prefers_no_think(thinking_mode, attempt, total_attempts):
+    """Use the incompatible no-thinking template only as the last resort."""
+    return bool(
+        TOOL_RETRY_NO_THINK
+        and _enable_thinking_for_generation(thinking_mode)
+        and int(attempt or 0) >= max(1, int(total_attempts or 0))
+    )
 
 
 def _render_tool_retry_prompt(model, processor, processed_messages, tools,
@@ -8998,10 +11117,7 @@ def _render_tool_retry_prompt(model, processor, processed_messages, tools,
         return None
     from mlx_vlm.prompt_utils import apply_chat_template
 
-    retry_messages = [
-        {"role": "system", "content": recovery_hint},
-        *[dict(message) for message in processed_messages],
-    ]
+    retry_messages = _tool_retry_messages(processed_messages, recovery_hint)
     template_kwargs = _thinking_template_kwargs(
         model.config,
         enable_thinking=(retry_thinking_mode == "enabled"),
@@ -9042,6 +11158,7 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
             return_dropped=True,
             return_dropped_names=True,
             processed_messages=processed_messages,
+            raw_output=full_output,
         )
         if validated:
             return True
@@ -9094,6 +11211,38 @@ def _usable_tool_turn(full_output, tool_module, tools, processed_messages,
     return bool(content) and not _looks_like_leaked_reasoning_content(content)
 
 
+def _buffered_tool_reasoning(full_output, tool_module, thinking_mode):
+    """Return reasoning that is safe to emit after a tool turn validates."""
+    reasoning, _ = split_thinking_text(
+        full_output or "",
+        assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
+    )
+    reasoning = _strip_raw_tool_blocks(reasoning or "", tool_module)
+    reasoning = _strip_thinking_control_markers(reasoning).strip()
+    if not reasoning or _looks_like_raw_tool_fragment(reasoning, tool_module):
+        return ""
+    return reasoning
+
+
+def _remaining_tool_reasoning(buffered_reasoning, live_reasoning):
+    """Return only reasoning not already emitted by the live stream.
+
+    A malformed first attempt can be replaced by an in-place retry. In that
+    case its reasoning will differ from the already-visible prefix; suppress
+    the retry's private reasoning instead of duplicating or interleaving two
+    plans before the recovered tool call.
+    """
+    buffered = buffered_reasoning or ""
+    live = live_reasoning or ""
+    if not buffered:
+        return ""
+    if not live:
+        return buffered
+    if buffered.startswith(live):
+        return buffered[len(live):]
+    return ""
+
+
 def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                              rank_request, prompt, max_tokens, thinking_mode,
                              gen_params, image_path, token_ids, session_id,
@@ -9130,6 +11279,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         full_output,
         tools,
     )
+    scaffold_fallback = ""
     if bounded_scaffold and _usable_tool_turn(
         bounded_scaffold,
         tool_module,
@@ -9138,17 +11288,18 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         thinking_mode,
         require_call=require_call,
     ):
+        scaffold_fallback = bounded_scaffold
         logger.warning(
-            "[rank 0] %s %s replaced an oversized incomplete Write with "
-            "a bounded scaffold tool call",
+            "[rank 0] %s %s prepared a bounded scaffold fallback for an "
+            "oversized incomplete Write; attempting a focused retry first",
             label,
             req_id,
         )
-        return bounded_scaffold
     ceiling = MAX_TOKENS_CEILING if MAX_TOKENS_CEILING > 0 else 16384
     retry_max_tokens = min(ceiling, max(int(max_tokens or 0), 2048) * 2)
     if TOOL_UNUSABLE_RETRY_MAX_TOKENS > 0:
         retry_max_tokens = min(retry_max_tokens, TOOL_UNUSABLE_RETRY_MAX_TOKENS)
+    logged_no_think_recovery = False
     for attempt in range(1, TOOL_UNUSABLE_RETRY_ATTEMPTS + 1):
         if should_abort and should_abort():
             return full_output
@@ -9161,17 +11312,35 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             retry_params.get("temperature"), retry_max_tokens,
             snippet[:200], snippet[-160:],
         )
-        # No-Think retry (set on BOTH the broadcast request and the local
-        # call so rank 1 mirrors the same mode — a mismatch desyncs the
-        # pipeline). Fast + reliable: goes straight to the call instead of
-        # re-entering the reasoning ramble that botched it.
-        retry_thinking_mode = "disabled" if TOOL_RETRY_NO_THINK else thinking_mode
+        # Preserve the original thinking template for the cheap recovery
+        # attempts so the long prompt prefix remains reusable. Their separate
+        # no-call guard keeps duplicate private reasoning bounded. Switch to
+        # native no-thinking only for the final fallback, where prefix safety
+        # deliberately releases incompatible RAM KV before a cold rebuild.
+        hidden_no_think_recovery = _tool_retry_prefers_no_think(
+            thinking_mode,
+            attempt,
+            TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        )
+        retry_thinking_mode = _tool_retry_thinking_mode(
+            thinking_mode,
+            prefer_no_think=hidden_no_think_recovery,
+        )
+        if hidden_no_think_recovery and not logged_no_think_recovery:
+            logger.warning(
+                "[rank 0] %s %s bounded hidden tool retries are using the "
+                "no-thinking template after the visible thinking attempt",
+                label,
+                req_id,
+            )
+            logged_no_think_recovery = True
         retry_prompt = prompt
         retry_token_ids = token_ids
         recovery_hint = _tool_retry_recovery_hint(
             full_output,
             tool_module,
             tools,
+            processed_messages,
         )
         if recovery_hint and not image_path:
             try:
@@ -9192,14 +11361,43 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                         "targeted retry prompt tokenization returned no ids"
                     )
                 retry_token_ids = rendered_token_ids
+                retry_prefix = _tool_retry_prefix_safety(
+                    token_ids,
+                    retry_token_ids,
+                )
                 logger.warning(
                     "[rank 0] %s %s tool retry %d using targeted "
-                    "large-write recovery guidance (%d prompt tokens)",
+                    "large-write recovery guidance (%d prompt tokens, "
+                    "prefix=%d, reuse=%.4f)",
                     label,
                     req_id,
                     attempt,
                     len(retry_token_ids),
+                    retry_prefix["common_prefix_tokens"],
+                    retry_prefix["reuse_ratio"],
                 )
+                if retry_prefix["reset"]:
+                    logger.error(
+                        "[rank 0] %s %s tool retry %d unexpectedly collapsed "
+                        "a long prompt prefix (%d/%d, ratio=%.4f); releasing "
+                        "distributed RAM KV before cold retry",
+                        label,
+                        req_id,
+                        attempt,
+                        retry_prefix["common_prefix_tokens"],
+                        min(
+                            retry_prefix["original_tokens"],
+                            retry_prefix["retry_tokens"],
+                        ),
+                        retry_prefix["reuse_ratio"],
+                    )
+                    _reset_prompt_cache_on_all_ranks(
+                        rank,
+                        reason="tool retry prefix collapse",
+                        clear_memory=True,
+                        clear_manifest=False,
+                        clear_resident=True,
+                    )
             except Exception as e:
                 logger.warning(
                     "[rank 0] %s %s could not render targeted tool retry "
@@ -9214,6 +11412,9 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         retry_request["thinking_mode"] = retry_thinking_mode
         retry_request["prompt"] = retry_prompt
         retry_request["token_ids"] = retry_token_ids
+        retry_request["no_call_token_budget"] = (
+            TOOL_RETRY_NO_CALL_TOKEN_BUDGET
+        )
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 tool retry")
         _bcast(retry_request, rank)
@@ -9228,6 +11429,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 tool_module=tool_module, tools=tools,
                 require_tool_call=require_call,
                 action_tool_task=action_tool_task,
+                no_call_token_budget=TOOL_RETRY_NO_CALL_TOKEN_BUDGET,
             )
         except Exception as e:
             logger.error(
@@ -9235,6 +11437,38 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 label, req_id, attempt, e,
             )
             return full_output
+        retry_scaffold = _synthesize_bounded_write_scaffold_text(
+            full_output,
+            tools,
+        )
+        if retry_scaffold and _usable_tool_turn(
+            retry_scaffold,
+            tool_module,
+            tools,
+            processed_messages,
+            retry_thinking_mode,
+            require_call=require_call,
+        ):
+            scaffold_fallback = retry_scaffold
+            if attempt >= TOOL_UNUSABLE_RETRY_ATTEMPTS:
+                logger.warning(
+                    "[rank 0] %s %s tool retry %d/%d exhausted focused "
+                    "recovery; returning the bounded scaffold fallback",
+                    label,
+                    req_id,
+                    attempt,
+                    TOOL_UNUSABLE_RETRY_ATTEMPTS,
+                )
+                return retry_scaffold
+            logger.warning(
+                "[rank 0] %s %s tool retry %d/%d was still an oversized "
+                "Write; keeping its scaffold only as a fallback and "
+                "retrying one smaller focused action",
+                label,
+                req_id,
+                attempt,
+                TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            )
         if _usable_tool_turn(full_output, tool_module, tools,
                              processed_messages, retry_thinking_mode,
                              require_call=require_call):
@@ -9245,6 +11479,51 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 retry_thinking_mode,
             )
             return full_output
+        if attempt < TOOL_UNUSABLE_RETRY_ATTEMPTS:
+            # rank 1 returns to its request loop between mirrored retries and
+            # clears transient Metal allocations there. Rank 0 stays inside
+            # this helper, so give it the same cleanup cadence without touching
+            # the live prompt cache backing arrays.
+            try:
+                mx.clear_cache()
+            except Exception as e:
+                logger.debug(
+                    "[rank 0] %s %s tool retry transient cleanup failed: %s",
+                    label,
+                    req_id,
+                    e,
+                )
+            gc.collect()
+    if scaffold_fallback:
+        logger.warning(
+            "[rank 0] %s %s returning bounded scaffold after %d focused "
+            "tool retries",
+            label,
+            req_id,
+            TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        )
+        return scaffold_fallback
+    explicit_read = _synthesize_explicit_read_tool_call(
+        processed_messages,
+        tools,
+    )
+    explicit_read_text = _tool_call_as_display_text(explicit_read)
+    if explicit_read_text and _usable_tool_turn(
+        explicit_read_text,
+        tool_module,
+        tools,
+        processed_messages,
+        thinking_mode,
+        require_call=require_call,
+    ):
+        logger.warning(
+            "[rank 0] %s %s synthesized the explicit user-requested read "
+            "after %d malformed retries",
+            label,
+            req_id,
+            TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        )
+        return explicit_read_text
     snippet = re.sub(r"\s+", " ", full_output or "")
     logger.warning(
         "[rank 0] %s %s tool turn still unusable after %d retries; "
@@ -9274,6 +11553,7 @@ def _validate_outgoing_tool_calls(
     return_dropped=False,
     return_dropped_names=False,
     processed_messages=None,
+    raw_output=None,
 ):
     """Return OpenAI tool_calls that match the submitted schema exactly.
 
@@ -9319,12 +11599,67 @@ def _validate_outgoing_tool_calls(
             if not isinstance(decoded, dict):
                 decoded = {}
             decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
+            decoded = _coerce_json_encoded_schema_values(decoded, tools, name)
             decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+            decoded, stripped_path_tags = _strip_minimax_closing_tags_from_paths(
+                decoded
+            )
+            for key, source, target in stripped_path_tags:
+                logger.warning(
+                    "stripped MiniMax closing tag from outgoing %s.%s: %r -> %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
+            decoded, stripped_payload_tags = (
+                _strip_minimax_closing_tags_from_payloads(name, decoded)
+            )
+            for key, source_len, target_len in stripped_payload_tags:
+                logger.warning(
+                    "stripped MiniMax closing fragment from outgoing %s.%s "
+                    "(%d -> %d characters)",
+                    name,
+                    key,
+                    source_len,
+                    target_len,
+                )
+            decoded, reversed_write = _repair_reversed_write_path_and_content(
+                name,
+                decoded,
+            )
+            if reversed_write:
+                logger.warning(
+                    "swapped reversed outgoing %s %s/%s arguments for %r "
+                    "(%d payload characters)",
+                    name,
+                    reversed_write["path_key"],
+                    reversed_write["content_key"],
+                    reversed_write["path"],
+                    reversed_write["payload_chars"],
+                )
+            decoded, relative_user_paths = (
+                _anchor_file_tool_path_to_user_relative_target(
+                    name,
+                    decoded,
+                    processed_messages,
+                )
+            )
+            for key, source, target in relative_user_paths:
+                logger.warning(
+                    "anchored outgoing %s.%s from %r to user workspace "
+                    "relative path %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
             decoded, filled_paths = _fill_missing_mutating_tool_path(
                 name,
                 decoded,
                 tools,
                 processed_messages,
+                raw_output,
             )
             for key, target in filled_paths:
                 logger.warning(
@@ -9332,6 +11667,37 @@ def _validate_outgoing_tool_calls(
                     "target %r",
                     name,
                     key,
+                    target,
+                )
+            decoded, intent_anchored_paths = (
+                _anchor_mutating_tool_path_from_named_read(
+                    name,
+                    decoded,
+                    processed_messages,
+                    raw_output,
+                )
+            )
+            for key, source, target in intent_anchored_paths:
+                logger.warning(
+                    "anchored outgoing %s.%s from %r to named read target %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
+            decoded, basename_anchored_paths = (
+                _anchor_mutating_tool_path_from_read_basename(
+                    name,
+                    decoded,
+                    processed_messages,
+                )
+            )
+            for key, source, target in basename_anchored_paths:
+                logger.warning(
+                    "anchored outgoing %s.%s from %r to unique read target %r",
+                    name,
+                    key,
+                    source,
                     target,
                 )
             decoded, anchored_paths = _anchor_mutating_tool_paths(
@@ -9362,6 +11728,36 @@ def _validate_outgoing_tool_calls(
                     source,
                     target,
                 )
+            decoded, anchored_command_paths = _anchor_command_paths_from_read_history(
+                name,
+                decoded,
+                tools,
+                processed_messages,
+            )
+            for key, source, target in anchored_command_paths:
+                logger.warning(
+                    "anchored outgoing %s.%s path from %r to proven read "
+                    "target %r",
+                    name,
+                    key,
+                    source,
+                    target,
+                )
+            decoded, repaired_python_command = _repair_non_executable_python_command(
+                name,
+                decoded,
+                tools,
+                processed_messages,
+            )
+            if repaired_python_command:
+                logger.warning(
+                    "repaired outgoing %s.%s from %r to %r after proven "
+                    "permission-denied result",
+                    name,
+                    repaired_python_command["key"],
+                    repaired_python_command["source"],
+                    repaired_python_command["target"],
+                )
             decoded, oversized_write_chars = _bound_large_file_write_arguments(
                 name,
                 decoded,
@@ -9373,6 +11769,21 @@ def _validate_outgoing_tool_calls(
                     name,
                     oversized_write_chars,
                 )
+            type_mismatches = _tool_schema_type_mismatches(
+                decoded,
+                tools,
+                name,
+            )
+            if type_mismatches:
+                logger.warning(
+                    "dropping outgoing %s tool call with schema type "
+                    "mismatches=%s",
+                    name,
+                    type_mismatches,
+                )
+                dropped += 1
+                dropped_names.append(str(name))
+                continue
             required = _tool_schema_required_names(tools, name)
             missing_required = [
                 key for key in required
@@ -9387,6 +11798,33 @@ def _validate_outgoing_tool_calls(
                 dropped += 1
                 if name:
                     dropped_names.append(str(name))
+                continue
+            oversized_mutation = _oversized_mutating_file_payload(name, decoded)
+            if oversized_mutation:
+                logger.warning(
+                    "dropping outgoing %s tool call with oversized %s=%d "
+                    "characters (budget=%d)",
+                    name,
+                    oversized_mutation[0],
+                    oversized_mutation[1],
+                    TOOL_WRITE_CHUNK_MAX_CHARS,
+                )
+                dropped += 1
+                dropped_names.append(str(name))
+                continue
+            command_violation = _command_tool_payload_violation(
+                name,
+                decoded,
+                tools,
+            )
+            if command_violation:
+                logger.warning(
+                    "dropping outgoing %s tool call: %s",
+                    name,
+                    command_violation,
+                )
+                dropped += 1
+                dropped_names.append(str(name))
                 continue
             if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
                 logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
@@ -9441,7 +11879,61 @@ def _validate_outgoing_tool_calls(
                     dropped_names.append(str(raw_name))
                 continue
         decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
+        decoded = _coerce_json_encoded_schema_values(decoded, tools, name)
         decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
+        decoded, stripped_path_tags = _strip_minimax_closing_tags_from_paths(
+            decoded
+        )
+        for key, source, target in stripped_path_tags:
+            logger.warning(
+                "stripped MiniMax closing tag from outgoing %s.%s: %r -> %r",
+                name,
+                key,
+                source,
+                target,
+            )
+        decoded, stripped_payload_tags = (
+            _strip_minimax_closing_tags_from_payloads(name, decoded)
+        )
+        for key, source_len, target_len in stripped_payload_tags:
+            logger.warning(
+                "stripped MiniMax closing fragment from outgoing %s.%s "
+                "(%d -> %d characters)",
+                name,
+                key,
+                source_len,
+                target_len,
+            )
+        decoded, reversed_write = _repair_reversed_write_path_and_content(
+            name,
+            decoded,
+        )
+        if reversed_write:
+            logger.warning(
+                "swapped reversed outgoing %s %s/%s arguments for %r "
+                "(%d payload characters)",
+                name,
+                reversed_write["path_key"],
+                reversed_write["content_key"],
+                reversed_write["path"],
+                reversed_write["payload_chars"],
+            )
+        decoded, relative_user_paths = (
+            _anchor_file_tool_path_to_user_relative_target(
+                name,
+                decoded,
+                processed_messages,
+            )
+        )
+        for key, source, target in relative_user_paths:
+            logger.warning(
+                "anchored outgoing %s.%s from %r to user workspace relative "
+                "path %r",
+                name,
+                key,
+                source,
+                target,
+            )
         decoded, reversed_edit = _repair_reversed_edit_arguments_after_failure(
             name,
             decoded,
@@ -9461,6 +11953,7 @@ def _validate_outgoing_tool_calls(
             decoded,
             tools,
             processed_messages,
+            raw_output,
         )
         for key, target in filled_paths:
             logger.warning(
@@ -9468,6 +11961,35 @@ def _validate_outgoing_tool_calls(
                 "target %r",
                 name,
                 key,
+                target,
+            )
+        decoded, intent_anchored_paths = _anchor_mutating_tool_path_from_named_read(
+            name,
+            decoded,
+            processed_messages,
+            raw_output,
+        )
+        for key, source, target in intent_anchored_paths:
+            logger.warning(
+                "anchored outgoing %s.%s from %r to named read target %r",
+                name,
+                key,
+                source,
+                target,
+            )
+        decoded, basename_anchored_paths = (
+            _anchor_mutating_tool_path_from_read_basename(
+                name,
+                decoded,
+                processed_messages,
+            )
+        )
+        for key, source, target in basename_anchored_paths:
+            logger.warning(
+                "anchored outgoing %s.%s from %r to unique read target %r",
+                name,
+                key,
+                source,
                 target,
             )
         decoded, anchored_paths = _anchor_mutating_tool_paths(
@@ -9498,6 +12020,36 @@ def _validate_outgoing_tool_calls(
                 source,
                 target,
             )
+        decoded, anchored_command_paths = _anchor_command_paths_from_read_history(
+            name,
+            decoded,
+            tools,
+            processed_messages,
+        )
+        for key, source, target in anchored_command_paths:
+            logger.warning(
+                "anchored outgoing %s.%s path from %r to proven read "
+                "target %r",
+                name,
+                key,
+                source,
+                target,
+            )
+        decoded, repaired_python_command = _repair_non_executable_python_command(
+            name,
+            decoded,
+            tools,
+            processed_messages,
+        )
+        if repaired_python_command:
+            logger.warning(
+                "repaired outgoing %s.%s from %r to %r after proven "
+                "permission-denied result",
+                name,
+                repaired_python_command["key"],
+                repaired_python_command["source"],
+                repaired_python_command["target"],
+            )
         decoded, oversized_write_chars = _bound_large_file_write_arguments(
             name,
             decoded,
@@ -9509,6 +12061,21 @@ def _validate_outgoing_tool_calls(
                 name,
                 oversized_write_chars,
             )
+        type_mismatches = _tool_schema_type_mismatches(
+            decoded,
+            tools,
+            name,
+        )
+        if type_mismatches:
+            logger.warning(
+                "dropping outgoing %s tool call with schema type "
+                "mismatches=%s",
+                name,
+                type_mismatches,
+            )
+            dropped += 1
+            dropped_names.append(str(name))
+            continue
         if not decoded and _tool_schema_expects_arguments(tools, name):
             logger.warning("dropping outgoing %s tool call with empty arguments", name)
             dropped += 1
@@ -9529,6 +12096,33 @@ def _validate_outgoing_tool_calls(
             dropped += 1
             if name:
                 dropped_names.append(str(name))
+            continue
+        oversized_mutation = _oversized_mutating_file_payload(name, decoded)
+        if oversized_mutation:
+            logger.warning(
+                "dropping outgoing %s tool call with oversized %s=%d "
+                "characters (budget=%d)",
+                name,
+                oversized_mutation[0],
+                oversized_mutation[1],
+                TOOL_WRITE_CHUNK_MAX_CHARS,
+            )
+            dropped += 1
+            dropped_names.append(str(name))
+            continue
+        command_violation = _command_tool_payload_violation(
+            name,
+            decoded,
+            tools,
+        )
+        if command_violation:
+            logger.warning(
+                "dropping outgoing %s tool call: %s",
+                name,
+                command_violation,
+            )
+            dropped += 1
+            dropped_names.append(str(name))
             continue
         if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
             coerced_name, coerced_args = _exec_write_from_malformed_patch(decoded, tools)
@@ -9725,6 +12319,206 @@ def _loose_shell_command_is_complete(cmd):
 _NS_ARG_TAG_RE = re.compile(r"<(?P<close>/)?(?P<tag>[A-Za-z_$][\w:.$-]*)\s*>")
 
 
+def _nested_array_args_from_ns_tags(raw_body, ns_token, tools, name):
+    """Recover one schema-declared array of XML ``<item>`` objects.
+
+    MiniMax/OpenCode sometimes emits ``<invoke=\"todowrite\">`` followed by
+    ``<todos><item><content>...`` instead of JSON. Keep this schema-driven:
+    only explicit array/object properties and their declared child fields are
+    accepted, so arbitrary nested markup cannot become a tool invocation.
+    """
+    if not raw_body or not ns_token:
+        return None
+    specs = _tool_schema_property_specs(tools, name)
+    array_props = [
+        (key, spec)
+        for key, spec in specs.items()
+        if isinstance(spec, dict)
+        and spec.get("type") == "array"
+        and isinstance(spec.get("items"), dict)
+        and spec["items"].get("type") == "object"
+    ]
+    if len(array_props) != 1:
+        return None
+    prop, spec = array_props[0]
+    open_tag = f"{ns_token}<{prop}>"
+    close_tag = f"{ns_token}</{prop}>"
+    item_open = f"{ns_token}<item>"
+    item_close = f"{ns_token}</item>"
+    start = raw_body.find(open_tag)
+    opener_len = len(open_tag)
+    end = raw_body.find(close_tag, start + opener_len) if start >= 0 else -1
+    if start < 0:
+        # Real ZCode long-turn drift observed 2026-07-12: the array opener
+        # alone was reversed (``</todos>``), while its item objects and the
+        # final array close remained complete. Require two explicit container
+        # closers with an item boundary between them; a lone close can never
+        # be promoted into an opener.
+        first_close = raw_body.find(close_tag)
+        second_close = (
+            raw_body.find(close_tag, first_close + len(close_tag))
+            if first_close >= 0 else -1
+        )
+        between = (
+            raw_body[first_close + len(close_tag):second_close]
+            if second_close >= 0 else ""
+        )
+        if second_close >= 0 and (item_open in between or item_close in between):
+            start = first_close
+            opener_len = len(close_tag)
+            end = second_close
+    if start < 0 or end < 0:
+        return None
+    container = raw_body[start + opener_len:end]
+    item_spec = spec.get("items") or {}
+    child_specs = item_spec.get("properties")
+    child_specs = child_specs if isinstance(child_specs, dict) else {}
+    child_required = item_spec.get("required")
+    child_required = (
+        [key for key in child_required if isinstance(key, str)]
+        if isinstance(child_required, list) else []
+    )
+    if not child_specs:
+        return None
+    item_bodies = []
+    if item_open in container:
+        cursor = 0
+        while True:
+            item_start = container.find(item_open, cursor)
+            if item_start < 0:
+                break
+            item_end = container.find(item_close, item_start + len(item_open))
+            if item_end < 0:
+                return None
+            item_bodies.append(
+                container[item_start + len(item_open):item_end]
+            )
+            cursor = item_end + len(item_close)
+    elif item_close in container:
+        # ZCode long-turn wire form observed 2026-07-12: MiniMax reversed
+        # every ``<item>`` opener to ``</item>`` while preserving complete,
+        # schema-named child fields and the final container close. Splitting
+        # between those explicit structural closers recovers the same atomic
+        # objects without guessing any content.
+        child_names = {str(key).lower() for key in child_specs}
+        for candidate in container.split(item_close):
+            structural_names = {
+                match.group("tag").lower()
+                for match in re.finditer(
+                    rf"{re.escape(ns_token)}<(?P<tag>[A-Za-z_$][\w:.$-]*)\s*>",
+                    candidate,
+                )
+            }
+            if structural_names & child_names:
+                item_bodies.append(candidate)
+    if not item_bodies:
+        return None
+
+    items = []
+    for item_body in item_bodies:
+        item = {}
+        for child, child_spec in child_specs.items():
+            child_open = re.search(
+                rf"{re.escape(ns_token)}<{re.escape(child)}\s*>",
+                item_body,
+                flags=re.IGNORECASE,
+            )
+            if child_open is None:
+                continue
+            child_close = re.search(
+                rf"{re.escape(ns_token)}</{re.escape(child)}\s*>",
+                item_body[child_open.end():],
+                flags=re.IGNORECASE,
+            )
+            if child_close is None:
+                continue
+            value = item_body[
+                child_open.end():child_open.end() + child_close.start()
+            ].strip()
+            expected = child_spec.get("type") if isinstance(child_spec, dict) else None
+            if expected == "integer":
+                try:
+                    value = int(value)
+                except ValueError:
+                    continue
+            elif expected == "number":
+                try:
+                    value = float(value)
+                except ValueError:
+                    continue
+            elif expected == "boolean":
+                lowered = value.lower()
+                if lowered not in {"true", "false"}:
+                    continue
+                value = lowered == "true"
+            item[child] = value
+        # ZCode occasionally omits only the display-oriented activeForm on a
+        # later todo item while still emitting complete content/status. Its
+        # own schema requires activeForm, so derive that label from content
+        # rather than dropping the entire otherwise valid todo array.
+        for child in child_required:
+            if item.get(child) not in (None, ""):
+                continue
+            compact = re.sub(r"[^a-z0-9]", "", child.lower())
+            if compact == "activeform" and item.get("content"):
+                item[child] = str(item["content"])
+            elif compact == "status":
+                child_spec = child_specs.get(child) or {}
+                allowed = (
+                    child_spec.get("enum")
+                    if isinstance(child_spec, dict) else None
+                )
+                if not allowed or "pending" in allowed:
+                    item[child] = "pending"
+            elif compact == "priority":
+                child_spec = child_specs.get(child) or {}
+                allowed = (
+                    child_spec.get("enum")
+                    if isinstance(child_spec, dict) else None
+                )
+                if not allowed or "medium" in allowed:
+                    item[child] = "medium"
+        if any(item.get(key) in (None, "") for key in child_required):
+            return None
+        if item:
+            items.append(item)
+    return {prop: items} if items else None
+
+
+def _labeled_json_array_args_from_body(raw_body, tools, name):
+    """Recover ``property: [...]`` for one schema-declared array field."""
+    if not raw_body:
+        return None
+    specs = _tool_schema_property_specs(tools, name)
+    array_props = [
+        key for key, spec in specs.items()
+        if isinstance(spec, dict) and spec.get("type") == "array"
+    ]
+    if len(array_props) != 1:
+        return None
+    prop = array_props[0]
+    label = re.search(
+        rf"(?i)(?:^|[\s>{{]){re.escape(prop)}\s*:\s*",
+        raw_body,
+    )
+    if label is None:
+        return None
+    start = raw_body.find("[", label.end())
+    if start < 0:
+        return None
+    end = _json_balanced_end(raw_body, start)
+    if end <= start:
+        return None
+    try:
+        value = json.loads(raw_body[start:end])
+    except json.JSONDecodeError:
+        try:
+            value = json.loads(raw_body[start:end], strict=False)
+        except json.JSONDecodeError:
+            return None
+    return {prop: value} if isinstance(value, list) else None
+
+
 def _arguments_from_ns_arg_tags(raw_body, ns_token, tools, name):
     """Drift-tolerant extractor for MiniMax-M3 direct arg tags.
 
@@ -9786,6 +12580,44 @@ def _arguments_from_ns_arg_tags(raw_body, ns_token, tools, name):
     if not matched or matched < len(args) / 2:
         return None
     return args
+
+
+def _positional_recovery_is_underspecified(raw_body, ns_token, tools, name):
+    """Reject positional XML recovery that cannot cover required fields.
+
+    The MLX-VLM parser can map a lone ``param-1`` payload onto more than one
+    required Edit argument. That creates a superficially valid call whose
+    old/new strings were never both emitted, so strict clients execute a bad
+    edit and enter a repair loop. Explicitly named required fields plus the
+    number of positional values must be sufficient before this permissive
+    recovery path is allowed to run.
+    """
+    if not raw_body or not ns_token:
+        return False
+    required = _tool_schema_required_names(tools, name)
+    if len(required) <= 1:
+        return False
+    positional_tags = re.findall(
+        rf"{re.escape(ns_token)}<param(?:eter)?[-_]?\d+\b[^>]*>",
+        raw_body,
+        flags=re.IGNORECASE,
+    )
+    if not positional_tags:
+        return False
+    required_by_compact = {
+        re.sub(r"[^a-z0-9]", "", field.lower()): field
+        for field in required
+    }
+    explicit_required = set()
+    for match in re.finditer(
+        rf"{re.escape(ns_token)}<(?P<tag>[A-Za-z_$][\w:.$-]*)\b[^>]*>",
+        raw_body,
+    ):
+        compact = re.sub(r"[^a-z0-9]", "", match.group("tag").lower())
+        field = required_by_compact.get(compact)
+        if field:
+            explicit_required.add(field)
+    return len(explicit_required) + len(positional_tags) < len(required)
 
 
 def _arguments_from_loose_segments(body, ns_token, tools, name):
@@ -9910,12 +12742,92 @@ def _tool_call_from_json_object(obj, tools, name_map, index):
     arguments = (
         obj.get("arguments")
         if "arguments" in obj
-        else obj.get("args", obj.get("parameters", {}))
+        else obj.get("args", obj.get("parameters", obj.get("input", {})))
     )
     arguments = _coerce_tool_arguments(arguments)
+    arguments = _canonicalize_tool_argument_keys(arguments, tools, name)
     if not arguments and _tool_schema_expects_arguments(tools, name):
         return None
     return _openai_tool_call(name, arguments, index)
+
+
+def _recover_complete_json_unclosed_tool_call(text, tool_module, tools):
+    """Recover an atomic JSON call whose outer MiniMax tags were truncated.
+
+    A complete self-describing JSON object is an atomic tool payload even when
+    MiniMax omits the surrounding ``</invoke></tool_call>`` markers. Accept
+    only a declared tool plus a balanced object at the end of the open block;
+    partial JSON and any substantive trailing bytes remain retry-only.
+    """
+    if not text or tool_module is None:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    marker_at = text.rfind(start) if start else -1
+    if marker_at < 0:
+        return []
+    tail = text[marker_at:]
+    ns_token = start.removesuffix("<tool_call>")
+    name_map = _tool_name_map_from_schema(tools)
+    pos = 0
+    while True:
+        obj_start = tail.find("{", pos)
+        if obj_start < 0:
+            return []
+        obj_end = _json_balanced_end(tail, obj_start)
+        if obj_end <= obj_start:
+            return []
+        payload = tail[obj_start:obj_end]
+        obj = None
+        for strict in (True, False):
+            try:
+                obj = json.loads(payload, strict=strict)
+                break
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(obj, dict):
+            pos = obj_end
+            continue
+        trailing = tail[obj_end:]
+        if ns_token:
+            trailing = trailing.replace(ns_token, "")
+        trailing = trailing.replace("```", "")
+        if re.sub(r"[\s\[\]<>/]+", "", trailing):
+            pos = obj_end
+            continue
+        # Prefer a self-describing object. MiniMax also emits a fully balanced
+        # flat argument object after placing the tool name in the immediately
+        # preceding invoke tag. Accept that atomic variant only when the name
+        # is advertised and every object key maps to an advertised property.
+        self_describing = (
+            isinstance(obj.get("name"), str)
+            and any(
+                key in obj
+                for key in ("arguments", "args", "parameters", "input")
+            )
+        )
+        if not self_describing:
+            before = text[max(0, marker_at - 2048):marker_at]
+            invoke_names = re.findall(
+                r"(?is)<invoke\b[^>]*?\bname\s*=\s*[\"']([^\"']+)[\"']",
+                before,
+            )
+            inferred = (
+                _canonical_tool_name(invoke_names[-1], name_map)
+                if invoke_names else ""
+            )
+            props = _tool_schema_property_names(tools, inferred) if inferred else []
+            prop_keys = {
+                re.sub(r"[^a-z0-9]", "", key.lower()) for key in props
+            }
+            object_keys = {
+                re.sub(r"[^a-z0-9]", "", str(key).lower()) for key in obj
+            }
+            if not inferred or not object_keys or not object_keys.issubset(prop_keys):
+                pos = obj_end
+                continue
+            obj = {"name": inferred, "arguments": obj}
+        call = _tool_call_from_json_object(obj, tools, name_map, 0)
+        return [call] if call is not None else []
 
 
 def _split_pseudo_tool_args(arg_text):
@@ -10060,6 +12972,112 @@ def _recover_display_tool_calls(text, tools):
     return calls
 
 
+def _recover_bare_xml_argument_tool_calls(text, tool_module, tools):
+    """Recover a complete tool block with a bare name and XML arguments.
+
+    ZCode/MiniMax can emit ``<tool_call> Edit <file_path>...`` with a trailing
+    ``</Edit></invoke>`` instead of an opening ``<invoke name="Edit">``. This
+    rung remains schema-grounded: the name must be advertised and every
+    required argument must be explicitly present in a matching XML tag.
+    """
+    if not text or tool_module is None:
+        return []
+    blocks = _tool_call_blocks(text, tool_module)
+    if not blocks:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    calls = []
+    for block in blocks:
+        flat = block.replace(ns_token, "") if ns_token else block
+        attr_match = re.search(
+            r"(?is)^\s*<invoke\b[^>]*\bname\s*=\s*[\"']"
+            r"(?P<name>[A-Za-z_$][\w:.$-]*)[\"'][^>]*>",
+            flat,
+        )
+        bare_match = re.search(
+            r"(?is)^\s*(?P<name>[A-Za-z_$][\w:.$-]*)\s*(?:\n|<)",
+            flat,
+        )
+        raw_name = (
+            attr_match.group("name") if attr_match
+            else bare_match.group("name") if bare_match
+            else ""
+        )
+        name = _canonical_tool_name(raw_name, name_map)
+        if not name or (allowed and name not in allowed):
+            continue
+        props = _tool_schema_property_names(tools, name)
+        specs = _tool_schema_property_specs(tools, name)
+        aliases = {
+            "file_path": ("file_path", "filePath", "path", "filename"),
+            "old_string": ("old_string", "oldString", "old_text", "oldText"),
+            "new_string": ("new_string", "newString", "new_text", "newText"),
+            "old_text": ("old_text", "oldText", "old_string", "oldString"),
+            "new_text": ("new_text", "newText", "new_string", "newString"),
+            "replace_all": ("replace_all", "replaceAll"),
+            "content": ("content", "text", "body"),
+            "command": ("command", "cmd"),
+        }
+        raw_args = {}
+        for prop in props:
+            variants = aliases.get(prop, (prop,))
+            value_match = None
+            for variant in variants:
+                value_match = re.search(
+                    rf"(?is)<{re.escape(variant)}\b[^>]*>"
+                    rf"(?P<value>.*?)</{re.escape(variant)}\s*>",
+                    flat,
+                )
+                if value_match:
+                    break
+            if not value_match:
+                continue
+            value = value_match.group("value")
+            spec = specs.get(prop) if isinstance(specs, dict) else None
+            schema_type = spec.get("type") if isinstance(spec, dict) else None
+            if schema_type == "boolean":
+                lowered = value.strip().lower()
+                if lowered not in {"true", "false"}:
+                    continue
+                value = lowered == "true"
+            elif schema_type == "integer":
+                try:
+                    value = int(value.strip())
+                except ValueError:
+                    continue
+            elif schema_type == "number":
+                try:
+                    value = float(value.strip())
+                except ValueError:
+                    continue
+            elif schema_type in {"array", "object"}:
+                try:
+                    value = json.loads(value.strip())
+                except json.JSONDecodeError:
+                    continue
+            elif re.sub(r"[^a-z0-9]", "", prop.lower()) in {
+                "path", "filepath", "filename"
+            }:
+                value = value.strip()
+            raw_args[prop] = value
+        args = _canonicalize_tool_argument_keys(raw_args, tools, name)
+        required = _tool_schema_required_names(tools, name)
+        if any(args.get(key) in (None, "") for key in required):
+            continue
+        if _tool_schema_type_mismatches(args, tools, name):
+            continue
+        calls.append(_openai_tool_call(name, args, len(calls)))
+    if calls:
+        logger.warning(
+            "recovered %d bare-XML-argument tool call(s)",
+            len(calls),
+        )
+    return calls
+
+
 def _looks_like_codex_pseudo_tool_call(text):
     return bool(
         isinstance(text, str)
@@ -10148,6 +13166,75 @@ def _recover_attr_invoke_tool_calls(text, tool_module, tools):
     if calls:
         logger.warning(
             "recovered %d attribute-invoke tool call(s) (id=/name= + attr args)",
+            len(calls),
+        )
+    return calls
+
+
+def _recover_function_syntax_invoke_tool_calls(text, tool_module, tools):
+    """Recover ``<invoke name=\"read_file(path=\"...\")]>`` drift.
+
+    OpenCode/MiniMax occasionally places a whole one-argument function call
+    inside the XML ``name`` attribute. Require a closed native tool block, one
+    declared function alias, and one schema-mappable string argument.
+    """
+    if not text or tool_module is None:
+        return []
+    start, _ = _tool_call_markers(tool_module)
+    if not start or start not in text or not _tool_block_emission_finished(
+        text,
+        tool_module,
+    ):
+        return []
+    name_map = _tool_name_map_from_schema(tools)
+    allowed = set(name_map.values())
+    patterns = [
+        re.compile(
+            r'''<invoke\s+name="(?P<name>[A-Za-z_$][\w:.$-]*)'''
+            r'''\((?P<key>[A-Za-z_$][\w:.$-]*)="(?P<value>[^"]+)"'''
+            r'''\)\]?''',
+            flags=re.DOTALL,
+        ),
+        re.compile(
+            r"""<invoke\s+name='(?P<name>[A-Za-z_$][\w:.$-]*)"""
+            r"""\((?P<key>[A-Za-z_$][\w:.$-]*)='(?P<value>[^']+)'"""
+            r"""\)\]?""",
+            flags=re.DOTALL,
+        ),
+        re.compile(
+            r'''<invoke>\s*(?P<name>[A-Za-z_$][\w:.$-]*)'''
+            r'''\((?P<key>[A-Za-z_$][\w:.$-]*)="(?P<value>[^"]+)"'''
+            r'''\)\]?''',
+            flags=re.DOTALL,
+        ),
+        re.compile(
+            r"""<invoke>\s*(?P<name>[A-Za-z_$][\w:.$-]*)"""
+            r"""\((?P<key>[A-Za-z_$][\w:.$-]*)='(?P<value>[^']+)'"""
+            r"""\)\]?""",
+            flags=re.DOTALL,
+        ),
+    ]
+    calls = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            name = _canonical_tool_name(match.group("name"), name_map)
+            if not name or (allowed and name not in allowed):
+                continue
+            args = _canonicalize_tool_argument_keys(
+                {match.group("key"): match.group("value")},
+                tools,
+                name,
+            )
+            args = _coerce_json_encoded_schema_values(args, tools, name)
+            if _tool_schema_type_mismatches(args, tools, name):
+                continue
+            required = _tool_schema_required_names(tools, name)
+            if any(args.get(key) in (None, "") for key in required):
+                continue
+            calls.append(_openai_tool_call(name, args, len(calls)))
+    if calls:
+        logger.warning(
+            "recovered %d function-syntax invoke tool call(s)",
             len(calls),
         )
     return calls
@@ -10418,13 +13505,18 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
 
     name_map = _tool_name_map_from_schema(tools)
     allowed = set(name_map.values())
+    # The outer <tool_call> marker already proves this block is tool-shaped.
+    # MiniMax can place the nested <invoke> opener directly after it, without
+    # repeating the namespace token, while still namespacing every argument
+    # and closing tag. Accept that one missing boundary marker here.
+    invoke_opener = rf"(?:{re.escape(ns_token)}\s*<?invoke\b|<invoke\b)"
     invoke_re = re.compile(
-        rf"{re.escape(ns_token)}\s*<?invoke\b(?P<attrs>[^>]*)>"
+        rf"{invoke_opener}(?P<attrs>[^>]*)>"
         rf"(?P<body>.*?){re.escape(ns_token)}</invoke>",
         flags=re.DOTALL,
     )
     loose_invoke_re = re.compile(
-        rf"{re.escape(ns_token)}\s*<?invoke\b(?P<attrs>[^>]*)>"
+        rf"{invoke_opener}(?P<attrs>[^>]*)>"
         rf"(?P<body>.*?)(?:{re.escape(ns_token)}</tool_call>|$)",
         flags=re.DOTALL,
     )
@@ -10442,7 +13534,11 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
         flags=re.DOTALL,
     )
     positional_name_re = re.compile(
-        r"""^\s*(?P<name>[A-Za-z_$][\w:.$-]*)\s*$""",
+        r"""^\s*(?P<name>[A-Za-z_$][\w:.$-]*)\s*[\"'}\]),;:]*\s*$""",
+        flags=re.DOTALL,
+    )
+    equals_name_re = re.compile(
+        r"""^\s*=\s*(?:(['\"])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))\s*$""",
         flags=re.DOTALL,
     )
     calls = []
@@ -10472,17 +13568,83 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                 # validate it against the declared OpenAI tool schema below.
                 positional = positional_name_re.match(attrs or "")
                 raw_name = positional.group("name") if positional else None
+            if not raw_name:
+                # OpenCode thinking turn observed 2026-07-12:
+                # ``<invoke="todowrite">``. The upstream parser treated the
+                # todo array as Bash.command. Recover the explicit function
+                # name before any body-based inference.
+                equals_name = equals_name_re.match(attrs or "")
+                raw_name = (
+                    equals_name.group("quoted") or equals_name.group("bare")
+                    if equals_name else None
+                )
             name = _canonical_tool_name(raw_name, name_map)
             if not name or (allowed and name not in allowed):
                 name = _infer_tool_name_from_body(attrs, match.group("body"), tools, name_map)
             if allowed and name not in allowed:
                 continue
             raw_body = match.group("body") or ""
+            path_props = [
+                prop for prop in _tool_schema_property_names(tools, name)
+                if re.sub(r"[^a-z0-9]", "", prop.lower())
+                in {"path", "filepath", "filename"}
+            ]
+            required_paths = [
+                prop for prop in path_props
+                if prop in _tool_schema_required_names(tools, name)
+            ]
+            if len(required_paths) == 1 and not any(
+                re.search(
+                    rf"{re.escape(ns_token)}<{re.escape(prop)}\s*>",
+                    raw_body,
+                    flags=re.IGNORECASE,
+                )
+                for prop in path_props
+            ):
+                attr_paths = list(dict.fromkeys(re.findall(
+                    r"(?<![A-Za-z0-9_])(/[^\s<>\"']+)",
+                    attrs,
+                )))
+                if len(attr_paths) == 1:
+                    calls.append(_openai_tool_call(
+                        name,
+                        json.dumps(
+                            {required_paths[0]: attr_paths[0]},
+                            ensure_ascii=False,
+                        ),
+                        len(calls),
+                    ))
+                    continue
             # Bound for the empty-args salvage at the bottom of the loop: the
             # fast paths skip the repair branch that otherwise assigns it
             # (UnboundLocalError wedge, 2026-07-09 — rank1 died, cache
             # diverged, next request deadlocked).
             body = raw_body
+            labeled_array_args = _labeled_json_array_args_from_body(
+                raw_body,
+                tools,
+                name,
+            )
+            if labeled_array_args:
+                calls.append(_openai_tool_call(
+                    name,
+                    json.dumps(labeled_array_args, ensure_ascii=False),
+                    len(calls),
+                ))
+                continue
+            nested_array_args = _nested_array_args_from_ns_tags(
+                raw_body,
+                ns_token,
+                tools,
+                name,
+            )
+            if nested_array_args:
+                calls.append(_openai_tool_call(
+                    name,
+                    json.dumps(nested_array_args, ensure_ascii=False),
+                    len(calls),
+                ))
+                continue
             # Payload-safe fast path: when the body carries one balanced JSON
             # object, take it verbatim. The repair chain below rewrites tags
             # (_normalize_body) and slices on tag-like boundaries
@@ -10517,6 +13679,18 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                                 len(calls),
                             ))
                             continue
+            if _positional_recovery_is_underspecified(
+                raw_body,
+                ns_token,
+                tools,
+                name,
+            ):
+                logger.warning(
+                    "refusing under-specified positional recovery for %s; "
+                    "required schema fields were not all emitted",
+                    name,
+                )
+                continue
             # XML-args fast paths (2026-07-06 audit): _normalize_body
             # prefixes EVERY tag with the namespace token — including markup
             # INSIDE argument values — the same corruption class as the
@@ -10618,18 +13792,98 @@ def _parse_tool_calls(text, tool_module, tools):
         and not _tool_block_emission_finished(text, tool_module)
         and "</invoke" not in open_tail
     ):
+        recovered = _recover_complete_json_unclosed_tool_call(
+            text, tool_module, tools
+        )
+        if recovered:
+            logger.warning(
+                "recovered complete JSON tool payload from unclosed native block"
+            )
+            visible_prefix = text[:text.find(start)]
+            visible_prefix = re.sub(
+                r"(?is)(?:\]<\]minimax\[>\[)?<invoke\b[^>]*>?\s*$",
+                "",
+                visible_prefix,
+            )
+            return recovered, visible_prefix.rstrip()
         logger.warning(
             "native tool invocation ended before its closing tag; refusing "
             "partial tool execution and requesting regeneration"
         )
         return [], text[:text.find(start)].rstrip()
+    ns_token = start.removesuffix("<tool_call>") if start else ""
+    if (
+        TOOL_COMPAT_OVERLAY
+        and ns_token
+        and re.search(
+            rf"{re.escape(ns_token)}\s*<invoke\s*=",
+            text,
+            flags=re.IGNORECASE,
+        )
+    ):
+        recovered = _recover_malformed_xml_tool_calls(
+            text,
+            tool_module,
+            tools,
+        )
+        if recovered:
+            logger.warning(
+                "recovered equals-name MiniMax invoke before native parsing"
+            )
+            return recovered, _strip_raw_tool_blocks(text, tool_module)
+    if TOOL_COMPAT_OVERLAY:
+        recovered = _recover_function_syntax_invoke_tool_calls(
+            text,
+            tool_module,
+            tools,
+        )
+        if recovered:
+            return recovered, _strip_raw_tool_blocks(text, tool_module)
+        recovered = _recover_named_empty_read_tool_call(text, tools)
+        if recovered:
+            return recovered, _strip_raw_tool_blocks(text, tool_module)
     try:
         from mlx_vlm.server.responses_state import process_tool_calls
 
         parsed = process_tool_calls(text, tool_module, tools)
         calls = parsed.get("calls") or []
         remaining = parsed.get("remaining_text") or ""
+        if TOOL_COMPAT_OVERLAY and len(calls) == 1:
+            parsed_name = _tool_call_name_for_loop(calls[0])
+            if _positional_recovery_is_underspecified(
+                text,
+                ns_token,
+                tools,
+                parsed_name,
+            ):
+                logger.warning(
+                    "discarding native %s parse backed by too few positional "
+                    "arguments for its required schema",
+                    parsed_name,
+                )
+                calls = []
         if calls:
+            if TOOL_COMPAT_OVERLAY:
+                native_validated, native_dropped = _validate_outgoing_tool_calls(
+                    calls,
+                    tools,
+                    return_dropped=True,
+                )
+                if native_dropped and not native_validated:
+                    recovered = _recover_malformed_xml_tool_calls(
+                        text,
+                        tool_module,
+                        tools,
+                    )
+                    if recovered:
+                        logger.warning(
+                            "replaced schema-invalid native tool parse with "
+                            "schema-grounded XML recovery"
+                        )
+                        return recovered, _strip_raw_tool_blocks(
+                            text,
+                            tool_module,
+                        )
             return calls, remaining
         if not TOOL_COMPAT_OVERLAY:
             if start and start in text:
@@ -10655,9 +13909,17 @@ def _parse_tool_calls(text, tool_module, tools):
             if not recovered:
                 recovered = _recover_display_tool_calls(text, tools)
             if not recovered:
+                recovered = _recover_bare_xml_argument_tool_calls(
+                    text,
+                    tool_module,
+                    tools,
+                )
+            if not recovered:
                 recovered = _recover_loose_segment_tool_calls(text, tool_module, tools)
             if not recovered:
                 recovered = _recover_malformed_xml_tool_calls(text, tool_module, tools)
+            if not recovered:
+                recovered = _recover_named_empty_read_tool_call(text, tools)
             if recovered:
                 return recovered, _strip_raw_tool_blocks(text, tool_module)
             logger.warning(
@@ -10742,6 +14004,12 @@ def _tool_call_complete_for_stop(text, tool_module, tools):
         return False
     calls = _recover_jsonish_tool_calls(text, tool_module, tools)
     if not calls:
+        calls = _recover_bare_xml_argument_tool_calls(
+            text,
+            tool_module,
+            tools,
+        )
+    if not calls:
         calls = _recover_loose_segment_tool_calls(text, tool_module, tools)
     if not calls:
         calls = _recover_malformed_xml_tool_calls(text, tool_module, tools)
@@ -10792,6 +14060,9 @@ def _tool_call_contains_complete_but_invalid(text, tool_module, tools):
     if not TOOL_COMPAT_OVERLAY:
         return False
     candidates.extend(_recover_jsonish_tool_calls(text, tool_module, tools))
+    candidates.extend(
+        _recover_bare_xml_argument_tool_calls(text, tool_module, tools)
+    )
     candidates.extend(_recover_loose_segment_tool_calls(text, tool_module, tools))
     candidates.extend(_recover_malformed_xml_tool_calls(text, tool_module, tools))
     if not candidates:
@@ -11181,7 +14452,8 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    reset_incomplete_thinking_on_limit=True,
                    tool_module=None, tools=None,
                    require_tool_call=False,
-                   action_tool_task=False):
+                   action_tool_task=False,
+                   no_call_token_budget=None):
     """Both ranks run stream_generate in lockstep. On ANY error, raise so the
     caller can signal the partner and release memory.
 
@@ -11213,7 +14485,11 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     cached_suffix_ids = None
     cache_marked_in_use = False
     cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
-    cache_allowed = _prompt_cache_allowed_for_request(thinking_mode, token_ids)
+    cache_allowed = _prompt_cache_allowed_for_generation(
+        thinking_mode,
+        token_ids,
+        image,
+    )
     if cache_allowed:
         _expire_idle_prompt_cache()
         _mark_prompt_cache_in_use(True)
@@ -11224,6 +14500,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 session_id=session_id,
                 session_source=session_source,
                 thinking_mode=thinking_mode,
+                append_reserve_tokens=max_tokens,
             )
             if (
                 PROMPT_CACHE_DIRECT_SUFFIX_IDS
@@ -11257,11 +14534,11 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         gen_kwargs["image"] = image
     if gen_params:
         gen_kwargs.update(gen_params)
-    if prefill_progress_cb is not None or UNSAFE_INFLIGHT_STOP:
+    if prefill_progress_cb is not None or SAFE_DECODE_STOP:
         def _prefill_progress(processed_tokens, total_tokens):
             if prefill_progress_cb is not None:
                 prefill_progress_cb(processed_tokens, total_tokens)
-            if UNSAFE_INFLIGHT_STOP:
+            if SAFE_DECODE_STOP:
                 _check_prefill_stop(rank, processed_tokens, total_tokens)
 
         gen_kwargs["prefill_progress_callback"] = _prefill_progress
@@ -11282,13 +14559,16 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
         if tools else THINKING_RUNAWAY_TOKEN_BUDGET
     )
-    no_call_budget = (
-        TOOL_NO_CALL_TOKEN_BUDGET
-        if require_tool_call
-        else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
-        if action_tool_task
-        else TOOL_NO_CALL_TOKEN_BUDGET
-    )
+    if no_call_token_budget is not None:
+        no_call_budget = max(0, int(no_call_token_budget))
+    else:
+        no_call_budget = (
+            TOOL_NO_CALL_TOKEN_BUDGET
+            if require_tool_call
+            else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
+            if action_tool_task
+            else TOOL_NO_CALL_TOKEN_BUDGET
+        )
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -11515,7 +14795,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         n,
                     )
                     break
-                tool_stop_ready = _tool_call_complete_for_stop(
+                tool_stop_ready = tool_complete_seen or _tool_call_complete_for_stop(
                     tool_accumulated, tool_module, tools
                 )
                 if tool_stop_ready:
@@ -11671,7 +14951,11 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     cached_suffix_ids = None
     cache_marked_in_use = False
     cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
-    cache_allowed = _prompt_cache_allowed_for_request(thinking_mode, token_ids)
+    cache_allowed = _prompt_cache_allowed_for_generation(
+        thinking_mode,
+        token_ids,
+        image,
+    )
     timing = {
         "cache_prepare_started_at": None,
         "cache_prepare_finished_at": None,
@@ -11691,6 +14975,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 session_id=session_id,
                 session_source=session_source,
                 thinking_mode=thinking_mode,
+                append_reserve_tokens=max_tokens,
             )
             if (
                 PROMPT_CACHE_DIRECT_SUFFIX_IDS
@@ -11725,11 +15010,11 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         gen_kwargs["image"] = image
     if gen_params:
         gen_kwargs.update(gen_params)
-    if prefill_progress_cb is not None or UNSAFE_INFLIGHT_STOP:
+    if prefill_progress_cb is not None or SAFE_DECODE_STOP:
         def _prefill_progress(processed_tokens, total_tokens):
             if prefill_progress_cb is not None:
                 prefill_progress_cb(processed_tokens, total_tokens)
-            if UNSAFE_INFLIGHT_STOP:
+            if SAFE_DECODE_STOP:
                 _check_prefill_stop(rank, processed_tokens, total_tokens)
 
         gen_kwargs["prefill_progress_callback"] = _prefill_progress
@@ -12068,7 +15353,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         n,
                     ):
                         stopped = True
-                tool_stop_ready = _tool_call_complete_for_stop(
+                tool_stop_ready = tool_complete_seen or _tool_call_complete_for_stop(
                     tool_guard_text if tools else accumulated,
                     tool_module,
                     tools,
@@ -13491,7 +16776,14 @@ def run_http_server(model, processor, rank):
     @app.get("/v1/models")
     async def models():
         return {"object": "list", "data": [
-            {"id": model_id, "object": "model", "created": 1, "owned_by": "mlx-vlm"}
+            {
+                "id": model_id,
+                "object": "model",
+                "created": 1,
+                "owned_by": "mlx-vlm",
+                "max_model_len": ADVERTISED_MAX_MODEL_LEN,
+                "native_context_window": MAX_KV_SIZE,
+            }
             for model_id in VISIBLE_MODEL_IDS
         ]}
 
@@ -14104,7 +17396,11 @@ def run_http_server(model, processor, rank):
                 ",".join(tool_loop_diag.get("filtered_tools") or []),
                 request.get("_tool_source"),
             )
-        tool_module = _load_tool_parser(processor) if tools else None
+        loop_force_final = (
+            request.get("_tool_source") == "tools_loop_force_final"
+        )
+        parser_needed = bool(tools or loop_force_final)
+        tool_module = _load_tool_parser(processor) if parser_needed else None
         gen_params = _request_generation_params(request, tools=tools)
 
         # Preserve OpenAI message roles/content for the model's native chat
@@ -14246,7 +17542,16 @@ def run_http_server(model, processor, rank):
         image_sources = images or None
         image_path = None
         if image_sources:
-            if requested_max_tokens is None and IMAGE_DEFAULT_MAX_TOKENS > 0:
+            if (
+                requested_max_tokens is None
+                and IMAGE_DEFAULT_MAX_TOKENS > 0
+                # A compact image-chat answer can use the image default, but
+                # tool clients may need thousands of tokens to emit an atomic
+                # Write/Edit after inspecting an image. The 768-token chat cap
+                # truncated those calls on every first attempt; structured
+                # write guards already bound their payload safely.
+                and not tools
+            ):
                 logger.info(
                     "using image default max_tokens=%s instead of text default %s",
                     IMAGE_DEFAULT_MAX_TOKENS,
@@ -14307,6 +17612,31 @@ def run_http_server(model, processor, rank):
             logger.info(
                 "prompt-cache: tokenized prompt -> %d tokens", len(request_token_ids)
             )
+            if (
+                HARD_MAX_INPUT_TOKENS > 0
+                and len(request_token_ids) > HARD_MAX_INPUT_TOKENS
+            ):
+                logger.warning(
+                    "rejecting %d-token input above safe cluster ceiling %d",
+                    len(request_token_ids),
+                    HARD_MAX_INPUT_TOKENS,
+                )
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "message": (
+                                "This request has "
+                                f"{len(request_token_ids)} input tokens, above "
+                                f"the cluster's safe limit of {HARD_MAX_INPUT_TOKENS}. "
+                                "Compact the conversation and retry."
+                            ),
+                            "type": "invalid_request_error",
+                            "param": "messages",
+                            "code": "context_length_exceeded",
+                        }
+                    },
+                )
         elif PROMPT_CACHE_ENABLED and _enable_thinking_for_generation(thinking_mode):
             with _prompt_cache_lock:
                 _set_prompt_cache_event(
@@ -14590,13 +17920,35 @@ def run_http_server(model, processor, rank):
                             # but do not queue more SSE chunks.
                             if not client_connected.is_set():
                                 continue
-                            # Tool-bearing requests: reasoning deltas stream
-                            # live (oMLX parity); raw tool XML is still parsed
-                            # only at the final step so it never leaks as text.
-                            # With MLX_M3_TOOL_STREAM_CONTENT=1, plain visible
-                            # content also streams live (holdback tail so
-                            # markup can never leak; silent once marker risk
-                            # appears).
+                            # Tool-bearing requests are transaction-buffered by
+                            # default. Native XML may be repairable only after
+                            # EOS. Reasoning is a separate channel and ends
+                            # before native tool XML begins, so it can stream
+                            # live while visible content and tool markup remain
+                            # buffered for validation.
+                            if parser_needed and TOOL_STREAM_BUFFER_ALL:
+                                r_piece = chunk.get("reasoning") or ""
+                                if r_piece and EMIT_TOOL_REASONING:
+                                    reasoning_chars += len(r_piece)
+                                    tool_reasoning_live += r_piece
+                                    if not active.get("first_visible_delta_s"):
+                                        metric_updates["first_visible_delta_s"] = round(
+                                            time.time() - active["started"], 3
+                                        )
+                                        update_generation_slot(active, **metric_updates)
+                                    _put_sse({
+                                        "id": req_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created,
+                                        "model": response_model,
+                                        "choices": [{
+                                            "index": 0,
+                                            "delta": {"reasoning_content": r_piece},
+                                            "finish_reason": None,
+                                        }],
+                                    })
+                                continue
+                            # Legacy live tool-delta path, explicitly opt-in.
                             if tools:
                                 # Thinking streams live on tool turns exactly
                                 # like oMLX: the splitter routes tool markup to
@@ -14788,8 +18140,23 @@ def run_http_server(model, processor, rank):
                                 remaining_text or full_output or "",
                                 tool_module,
                             )
-                            if tools else (remaining_text or full_output or "")
+                            if tool_module else (remaining_text or full_output or "")
                         )
+                        if loop_force_final and tool_calls:
+                            logger.warning(
+                                "[rank 0] stream %s suppressed a repeated tool "
+                                "call on a forced-final loop turn",
+                                req_id,
+                            )
+                            tool_calls = []
+                            safe_remaining_text = _strip_raw_tool_blocks(
+                                remaining_text or full_output or "",
+                                tool_module,
+                            ).strip()
+                            if not safe_remaining_text:
+                                safe_remaining_text = (
+                                    _tool_loop_forced_final_fallback(tool_loop_diag)
+                                )
                         raw_tool_marker_only = bool(
                             tools
                             and not tool_calls
@@ -14834,6 +18201,7 @@ def run_http_server(model, processor, rank):
                                         return_dropped=True,
                                         return_dropped_names=True,
                                         processed_messages=processed_messages,
+                                        raw_output=full_output,
                                     )
                                 )
                             if not tool_calls and dropped_invalid_tool_calls:
@@ -14854,6 +18222,31 @@ def run_http_server(model, processor, rank):
                                     dropped_invalid_tool_calls = 0
                                     dropped_invalid_tool_names = []
                             if tool_calls:
+                                if EMIT_TOOL_REASONING:
+                                    buffered_reasoning = _buffered_tool_reasoning(
+                                        full_output,
+                                        tool_module,
+                                        thinking_mode,
+                                    )
+                                    buffered_reasoning = _remaining_tool_reasoning(
+                                        buffered_reasoning,
+                                        tool_reasoning_live,
+                                    )
+                                    if buffered_reasoning:
+                                        reasoning_chars += len(buffered_reasoning)
+                                        _put_sse({
+                                            "id": req_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": created,
+                                            "model": response_model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {
+                                                    "reasoning_content": buffered_reasoning,
+                                                },
+                                                "finish_reason": None,
+                                            }],
+                                        })
                                 reasoning_recall_stored = _remember_assistant_reasoning(
                                     cache_session_id,
                                     visible_output,
@@ -14876,6 +18269,30 @@ def run_http_server(model, processor, rank):
                                                            "tool_calls": tool_calls},
                                                 "finish_reason": "tool_calls"}],
                                 })
+                            elif loop_force_final:
+                                content = _strip_thinking_control_markers(
+                                    safe_remaining_text or ""
+                                ).strip()
+                                if (
+                                    not content
+                                    or _looks_like_leaked_reasoning_content(content)
+                                ):
+                                    content = _tool_loop_forced_final_fallback(
+                                        tool_loop_diag
+                                    )
+                                visible_output += content
+                                content_chars += len(content)
+                                _put_sse({
+                                    "id": req_id,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": response_model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": content},
+                                        "finish_reason": None,
+                                    }],
+                                })
                             elif tools:
                                 reasoning, content = split_thinking_text(
                                     safe_remaining_text,
@@ -14884,17 +18301,10 @@ def run_http_server(model, processor, rank):
                                     ),
                                 )
                                 if reasoning and tool_reasoning_live:
-                                    # live deltas already delivered a prefix;
-                                    # send only the remainder (or separator +
-                                    # full text when an in-place retry rewrote
-                                    # the turn)
-                                    if reasoning.startswith(tool_reasoning_live):
-                                        reasoning = (
-                                            reasoning[len(tool_reasoning_live):]
-                                            or None
-                                        )
-                                    else:
-                                        reasoning = "\n" + reasoning
+                                    reasoning = _remaining_tool_reasoning(
+                                        reasoning,
+                                        tool_reasoning_live,
+                                    ) or None
                                 if content:
                                     content = _scrub_goal_state_echo(content)
                                 if content and _looks_like_leaked_reasoning_content(content):
@@ -14927,6 +18337,19 @@ def run_http_server(model, processor, rank):
                                             processed_messages,
                                             dropped_tool_names=dropped_invalid_tool_names,
                                             available_tool_names=_tool_names_from_schema(tools),
+                                        )
+                                    elif _looks_like_raw_tool_fragment(
+                                        full_output,
+                                        tool_module,
+                                    ):
+                                        # Never promote a malformed tool
+                                        # turn's planning text into assistant
+                                        # content. It was already emitted, if
+                                        # requested, through reasoning_content.
+                                        fallback = _tool_request_fallback_content(
+                                            processed_messages,
+                                            empty_tool_markers=True,
+                                            thinking_mode=thinking_mode,
                                         )
                                     else:
                                         fallback = _strip_raw_tool_blocks(
@@ -15412,6 +18835,19 @@ def run_http_server(model, processor, rank):
             tool_calls, remaining_text = _parse_tool_calls(text or "", tool_module, tools)
             dropped_invalid_tool_calls = 0
             dropped_invalid_tool_names = []
+            if loop_force_final and tool_calls:
+                logger.warning(
+                    "[rank 0] non-stream %s suppressed a repeated tool call "
+                    "on a forced-final loop turn",
+                    req_id,
+                )
+                tool_calls = []
+                text = _strip_raw_tool_blocks(
+                    remaining_text or text or "",
+                    tool_module,
+                ).strip()
+                if not text:
+                    text = _tool_loop_forced_final_fallback(tool_loop_diag)
             if tool_calls:
                 (
                     tool_calls,
@@ -15423,6 +18859,7 @@ def run_http_server(model, processor, rank):
                     return_dropped=True,
                     return_dropped_names=True,
                     processed_messages=processed_messages,
+                    raw_output=text,
                 )
             if not tool_calls and dropped_invalid_tool_calls:
                 synthesized = _synthesize_write_command_tool_call(
@@ -15457,7 +18894,7 @@ def run_http_server(model, processor, rank):
                     tool_calls=tool_calls,
                 )
                 text = remaining_text
-            elif tools:
+            elif tool_module:
                 text = _strip_raw_tool_blocks(
                     remaining_text or text or "",
                     tool_module,
@@ -15476,6 +18913,8 @@ def run_http_server(model, processor, rank):
                 text or "",
                 assume_in_thinking=_enable_thinking_for_generation(thinking_mode),
             )
+            if loop_force_final and not content:
+                content = _tool_loop_forced_final_fallback(tool_loop_diag)
             if tools and content and _looks_like_leaked_reasoning_content(content):
                 content = None
             emit_reasoning_fields = _should_emit_reasoning_fields(tools)
@@ -15709,6 +19148,9 @@ def run_mirror(model, processor, rank):
                            ),
                            action_tool_task=bool(
                                req.get("action_tool_task", False)
+                           ),
+                           no_call_token_budget=req.get(
+                               "no_call_token_budget"
                            ))
             if CLEAR_CACHE_AFTER_REQUEST:
                 mx.clear_cache()

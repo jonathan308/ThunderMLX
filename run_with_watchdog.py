@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env mlx-python
 """
 run_with_watchdog.py — wraps sharded_server.py with a heartbeat watchdog.
 
@@ -286,6 +286,7 @@ def start_watchdog():
                         os.path.dirname(os.path.abspath(__file__)),
                         "ops", "logs", "watchdog_stall_breadcrumb",
                     )
+                    os.makedirs(os.path.dirname(_bc), exist_ok=True)
                     with open(_bc, "a") as bf:
                         bf.write(
                             f"{time.time():.0f} stall={stall:.0f} cap_at={STALL_CAPTURE_AT} "
@@ -316,6 +317,7 @@ def start_watchdog():
                     log_path = os.path.join(
                         os.path.dirname(capture), "logs", "autostall_capture.log"
                     )
+                    os.makedirs(os.path.dirname(log_path), exist_ok=True)
                     with open(log_path, "a") as lf:
                         lf.write(
                             f"[{time.strftime('%F %T')}] spawning wedge "
@@ -358,6 +360,7 @@ def start_watchdog():
                         "ops", "logs",
                         time.strftime("crash_%Y%m%d_%H%M%S.txt"),
                     )
+                    os.makedirs(os.path.dirname(_crash), exist_ok=True)
                     with open(_crash, "w") as cf:
                         cf.write(
                             f"watchdog fatal: stall={stall:.0f}s kind={stall_kind}\n"
@@ -385,6 +388,12 @@ def start_watchdog():
 
 def main():
     install_signal_handlers()
+    rank = os.environ.get("MLX_RANK", "").strip()
+    if rank:
+        for name in ("MLX_MINIMAX_MSA_NATIVE_TOPK",):
+            scoped = os.environ.get(f"{name}_RANK{rank}")
+            if scoped not in (None, ""):
+                os.environ[name] = scoped
     cluster_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, cluster_dir)
     import sharded_server

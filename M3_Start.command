@@ -45,6 +45,14 @@ else
   exit 2
 fi
 
+# Reuse the project's unattended privilege helper when available. This keeps
+# double-click and remote starts from blocking on an interactive sudo prompt;
+# the helper prefers NOPASSWD and otherwise reads the private 0600 password
+# file through stdin without printing it.
+if [[ -f "$CLUSTER/ops/priv.sh" ]]; then
+  source "$CLUSTER/ops/priv.sh"
+fi
+
 API_HOST="${MLX_M3_HOST:-0.0.0.0}"
 API_PORT="${MLX_M3_PORT:-8080}"
 GUI_HOST="${M3_GUI_HOST:-0.0.0.0}"
@@ -273,22 +281,33 @@ fi
 
 echo "Applying optional host performance tune..."
 if [[ "${M3_ENABLE_PERFORMANCE_TUNE:-0}" == "1" ]]; then
-  if [[ -t 0 && "${M3_RANK0_IOGPU_WIRED_LIMIT_MB:-0}" != "0" ]]; then
+  if [[ "${M3_RANK0_IOGPU_WIRED_LIMIT_MB:-0}" != "0" ]] && whence priv_run >/dev/null 2>&1; then
+    priv_run sysctl "iogpu.wired_limit_mb=${M3_RANK0_IOGPU_WIRED_LIMIT_MB}" >/dev/null 2>&1 || true
+  elif [[ -t 0 && "${M3_RANK0_IOGPU_WIRED_LIMIT_MB:-0}" != "0" ]]; then
     sudo sysctl "iogpu.wired_limit_mb=${M3_RANK0_IOGPU_WIRED_LIMIT_MB}" >/dev/null 2>&1 || true
   elif [[ ! -t 0 ]]; then
     echo "  noninteractive start; skipping privileged local wired-limit tune"
   fi
   if [[ -n "${PEER:-}" && "${M3_RANK1_IOGPU_WIRED_LIMIT_MB:-0}" != "0" ]]; then
-    ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
-      "sudo -n sysctl iogpu.wired_limit_mb=${M3_RANK1_IOGPU_WIRED_LIMIT_MB} >/dev/null 2>&1 || true" \
-      >/dev/null 2>&1 || true
+    if whence priv_run_rank1 >/dev/null 2>&1; then
+      priv_run_rank1 sysctl "iogpu.wired_limit_mb=${M3_RANK1_IOGPU_WIRED_LIMIT_MB}" >/dev/null 2>&1 || true
+    else
+      ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
+        "sudo -n sysctl iogpu.wired_limit_mb=${M3_RANK1_IOGPU_WIRED_LIMIT_MB} >/dev/null 2>&1 || true" \
+        >/dev/null 2>&1 || true
+    fi
   fi
   echo "  performance tune attempted"
 else
   echo "  disabled (set M3_ENABLE_PERFORMANCE_TUNE=1 to opt in)"
 fi
 if [[ "${M3_ENABLE_MACOS_NOISE_REDUCTION:-0}" == "1" ]]; then
-  if [[ -t 0 ]]; then
+  if whence priv_run >/dev/null 2>&1; then
+    priv_run mdutil -a -i off >/dev/null 2>&1 || true
+    priv_run killall mds 2>/dev/null || true
+    priv_run killall mds_stores 2>/dev/null || true
+    priv_run killall corespotlightd 2>/dev/null || true
+  elif [[ -t 0 ]]; then
     sudo mdutil -a -i off >/dev/null 2>&1 || true
     sudo killall mds 2>/dev/null || true
     sudo killall mds_stores 2>/dev/null || true

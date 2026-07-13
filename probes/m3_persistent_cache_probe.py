@@ -88,6 +88,9 @@ def compact_prompt_cache_for_log(pcache):
         "loaded": pcache.get("loaded"),
         "in_use": pcache.get("in_use"),
         "cache_len": pcache.get("cache_len"),
+        "cache_physical_tokens": pcache.get("cache_physical_tokens"),
+        "cache_capacity_tokens": pcache.get("cache_capacity_tokens"),
+        "cache_spare_tokens": pcache.get("cache_spare_tokens"),
         "key_tokens": pcache.get("key_tokens"),
         "session_id": pcache.get("session_id"),
         "session_source": pcache.get("session_source"),
@@ -115,6 +118,10 @@ def compact_prompt_cache_for_log(pcache):
             "total_bytes": ssd.get("total_bytes"),
             "last_saved_tokens": ssd.get("last_saved_tokens"),
             "last_restored_tokens": ssd.get("last_restored_tokens"),
+            "last_restore_target_capacity": ssd.get("last_restore_target_capacity"),
+            "last_restore_append_reserve_tokens": ssd.get(
+                "last_restore_append_reserve_tokens"
+            ),
             "last_restore_miss_reason": ssd.get("last_restore_miss_reason"),
             "last_error": ssd.get("last_error"),
         },
@@ -223,6 +230,7 @@ def stream_chat(name, messages, *, model, session_id, max_tokens, timeout=1800,
                     reasoning.append(r)
     final = wait_idle(before, timeout=timeout)
     last = final.get("last_request") or {}
+    prompt_cache = final.get("prompt_cache") or {}
     request_shape = last.get("request_shape") or {}
     prepare = last.get("prompt_cache_prepare") or {}
     reasoning_text = "".join(reasoning)
@@ -255,6 +263,11 @@ def stream_chat(name, messages, *, model, session_id, max_tokens, timeout=1800,
             prepare.get("restored_ssd_cache") or prepare.get("restored_ssd")
         ),
         "ssd_session_hash": prepare.get("ssd_session_hash"),
+        "ssd_restore_capacity": prepare.get("ssd_restore_capacity"),
+        "ssd_append_reserve_tokens": prepare.get("ssd_append_reserve_tokens"),
+        "cache_physical_tokens": prompt_cache.get("cache_physical_tokens"),
+        "cache_capacity_tokens": prompt_cache.get("cache_capacity_tokens"),
+        "cache_spare_tokens": prompt_cache.get("cache_spare_tokens"),
         "failed": final.get("requests_failed"),
     }
     log_row = dict(row)
@@ -487,6 +500,10 @@ def ssd_summary():
         "total_bytes": ssd.get("total_bytes"),
         "last_saved_tokens": ssd.get("last_saved_tokens"),
         "last_restored_tokens": ssd.get("last_restored_tokens"),
+        "last_restore_target_capacity": ssd.get("last_restore_target_capacity"),
+        "last_restore_append_reserve_tokens": ssd.get(
+            "last_restore_append_reserve_tokens"
+        ),
         "last_restore_miss_reason": ssd.get("last_restore_miss_reason"),
         "last_error": ssd.get("last_error"),
     }
@@ -632,7 +649,7 @@ def main():
                     {"reason": "persistent probe restore reset", "clear_memory": False},
                 ),
             )
-        restore, _ = stream_chat(
+        restore, restore_health = stream_chat(
             "restore_persistent_session",
             followup_messages(args.target_tokens, assistant_text, shape=args.shape),
             model=args.model,
@@ -648,6 +665,46 @@ def main():
             raise SystemExit(f"SSD restore not observed: {restore}")
         if float(restore.get("cache_reuse_ratio") or 0.0) < 0.90:
             raise SystemExit(f"SSD restore reuse too low: {restore}")
+        restore_capacity = int(restore.get("ssd_restore_capacity") or 0)
+        append_reserve = int(restore.get("ssd_append_reserve_tokens") or 0)
+        required_capacity = int(restore.get("cache_prompt_tokens") or 0) + max(
+            0, append_reserve
+        )
+        if restore_capacity < required_capacity:
+            raise SystemExit(
+                "SSD restore did not reserve its bounded append capacity: "
+                f"capacity={restore_capacity}, required={required_capacity}, "
+                f"row={restore}"
+            )
+        # Capacity is step-rounded, but must not silently expand back to the
+        # server's full output ceiling after generation. Tool-shaped requests
+        # may legitimately run one bounded internal recovery generation after
+        # a short first attempt emits no usable call. Account for that explicit
+        # recovery ceiling while still rejecting the old 32K over-reservation.
+        live_capacity = int(restore.get("cache_capacity_tokens") or 0)
+        defaults = restore_health.get("generation_defaults") or {}
+        bounded_generation_reserve = max(
+            int(args.followup_max_tokens or 0),
+            append_reserve,
+        )
+        if args.shape.endswith("tools"):
+            bounded_generation_reserve = max(
+                bounded_generation_reserve,
+                int(defaults.get("tool_action_no_call_token_budget") or 0),
+                int(defaults.get("tool_unusable_retry_max_tokens") or 0),
+            )
+        max_bounded_capacity = (
+            int(restore.get("cache_prompt_tokens") or 0)
+            + bounded_generation_reserve
+            + 4095
+        )
+        if live_capacity > max_bounded_capacity:
+            raise SystemExit(
+                "warm batch conversion re-expanded to the output ceiling: "
+                f"live_capacity={live_capacity}, bounded_max={max_bounded_capacity}, "
+                f"request_ceiling={args.followup_max_tokens}, "
+                f"bounded_recovery_ceiling={bounded_generation_reserve}, row={restore}"
+            )
         expected_file, _ = highest_file_for_target(args.target_tokens)
         restore_text = (
             (restore.get("content") or "")

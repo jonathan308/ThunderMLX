@@ -30,8 +30,14 @@ API_GUARD_INTERVAL=${M3_API_GUARD_INTERVAL_SECONDS:-15}
 API_GUARD_START_GRACE=${M3_API_GUARD_START_GRACE_SECONDS:-180}
 API_DOWN_GUARD_SECONDS=${M3_API_DOWN_GUARD_SECONDS:-75}
 ACTIVE_NO_START_GUARD_SECONDS=${M3_ACTIVE_NO_START_GUARD_SECONDS:-120}
+ACTIVE_NO_START_CONTEXT_TPS=${M3_ACTIVE_NO_START_CONTEXT_TPS:-1000}
+ACTIVE_NO_START_MARGIN_SECONDS=${M3_ACTIVE_NO_START_MARGIN_SECONDS:-120}
+ACTIVE_NO_START_MAX_SECONDS=${M3_ACTIVE_NO_START_MAX_SECONDS:-900}
+ACTIVE_NO_START_DRAIN_SECONDS=${M3_ACTIVE_NO_START_DRAIN_SECONDS:-600}
+GUARD_TERM_GRACE_SECONDS=${M3_GUARD_TERM_GRACE_SECONDS:-120}
 API_HEALTH_URL="${M3_API_HEALTH_URL:-http://127.0.0.1:${MLX_M3_PORT:-8080}/health}"
 API_SHUTDOWN_URL="${M3_API_SHUTDOWN_URL:-http://127.0.0.1:${MLX_M3_PORT:-8080}/admin/shutdown}"
+API_STOP_URL="${M3_API_STOP_URL:-http://127.0.0.1:${MLX_M3_PORT:-8080}/v1/stop}"
 
 mkdir -p "$LOG_DIR"
 
@@ -192,6 +198,58 @@ sys.exit(0 if ok else 1)
 ' >/dev/null 2>&1
 }
 
+guarded_cluster_shutdown() {
+  local launch_pid="$1"
+  local reason="$2"
+  local drain_limit="${3:-$ACTIVE_NO_START_DRAIN_SECONDS}"
+  local waited=0
+  local stop_response shutdown_response
+
+  echo "[$(date)] Guard requesting cooperative distributed stop before shutdown: ${reason}; drain_limit=${drain_limit}s." >> "$RESTART_LOG"
+  stop_response=$(curl -fsS --max-time 20 -X POST "$API_STOP_URL" 2>/dev/null || true)
+  shutdown_response=$(curl -fsS --max-time 20 -X POST "$API_SHUTDOWN_URL" 2>/dev/null || true)
+  echo "[$(date)] Guard stop response: ${stop_response:-unreachable}; shutdown response: ${shutdown_response:-unreachable}." >> "$RESTART_LOG"
+
+  # /admin/shutdown marks an active request for deferred shutdown. Give the
+  # distributed stop sentinel enough time to reach a prefill/decode boundary;
+  # killing a rank while Metal is evaluating is what strands wired memory.
+  while kill -0 "$launch_pid" 2>/dev/null && [[ "$waited" -lt "$drain_limit" ]]; do
+    sleep 5
+    waited=$(( waited + 5 ))
+    if api_idle; then
+      curl -fsS --max-time 20 -X POST "$API_SHUTDOWN_URL" >/dev/null 2>&1 || true
+    elif [[ $(( waited % 30 )) -eq 0 ]]; then
+      # Retry in case the event loop was temporarily occupied by a long Metal
+      # evaluation when the first stop/shutdown requests arrived.
+      curl -fsS --max-time 20 -X POST "$API_STOP_URL" >/dev/null 2>&1 || true
+      curl -fsS --max-time 20 -X POST "$API_SHUTDOWN_URL" >/dev/null 2>&1 || true
+    fi
+    if [[ $(( waited % 60 )) -eq 0 ]]; then
+      echo "[$(date)] Guard cooperative drain still waiting (${waited}/${drain_limit}s): ${reason}." >> "$RESTART_LOG"
+    fi
+  done
+
+  if ! kill -0 "$launch_pid" 2>/dev/null; then
+    echo "[$(date)] Guard cooperative drain exited launcher cleanly after ${waited}s: ${reason}." >> "$RESTART_LOG"
+    return 0
+  fi
+
+  echo "[$(date)] Guard cooperative drain timed out after ${waited}s; sending SIGTERM and allowing ${GUARD_TERM_GRACE_SECONDS}s for rank-local Metal release: ${reason}." >> "$RESTART_LOG"
+  kill -TERM "$launch_pid" 2>/dev/null || true
+  local term_waited=0
+  while kill -0 "$launch_pid" 2>/dev/null && [[ "$term_waited" -lt "$GUARD_TERM_GRACE_SECONDS" ]]; do
+    sleep 5
+    term_waited=$(( term_waited + 5 ))
+  done
+  if kill -0 "$launch_pid" 2>/dev/null; then
+    echo "[$(date)] WARNING: launcher survived cooperative drain plus SIGTERM grace; SIGKILL is the final recovery action and may require reboot if Metal is still evaluating: ${reason}." >> "$RESTART_LOG"
+    kill -KILL "$launch_pid" 2>/dev/null || true
+    cleanup_leftover_ranks hard
+  else
+    cleanup_leftover_ranks term
+  fi
+}
+
 launcher_rss_guard() {
   local launch_pid="$1"
   local over_since=0
@@ -249,7 +307,7 @@ api_liveness_guard() {
   local api_down_since=0
   local warmup_started=0
 
-  echo "[$(date)] API liveness guard armed for pid=${launch_pid}: start_grace=${API_GUARD_START_GRACE}s api_down=${API_DOWN_GUARD_SECONDS}s no_start=${ACTIVE_NO_START_GUARD_SECONDS}s interval=${API_GUARD_INTERVAL}s." >> "$RESTART_LOG"
+  echo "[$(date)] API liveness guard armed for pid=${launch_pid}: start_grace=${API_GUARD_START_GRACE}s api_down=${API_DOWN_GUARD_SECONDS}s no_start_base=${ACTIVE_NO_START_GUARD_SECONDS}s no_start_context_tps=${ACTIVE_NO_START_CONTEXT_TPS} no_start_max=${ACTIVE_NO_START_MAX_SECONDS}s drain=${ACTIVE_NO_START_DRAIN_SECONDS}s interval=${API_GUARD_INTERVAL}s." >> "$RESTART_LOG"
   while kill -0 "$launch_pid" 2>/dev/null; do
     sleep "$API_GUARD_INTERVAL"
     kill -0 "$launch_pid" 2>/dev/null || break
@@ -273,10 +331,7 @@ api_liveness_guard() {
       fi
       if [[ $(( now - api_down_since )) -ge "$API_DOWN_GUARD_SECONDS" ]]; then
         echo "[$(date)] API liveness guard recycling cluster: API down for $(( now - api_down_since ))s while launcher still alive." >> "$RESTART_LOG"
-        kill -TERM "$launch_pid" 2>/dev/null || true
-        sleep 20
-        kill -KILL "$launch_pid" 2>/dev/null || true
-        cleanup_leftover_ranks hard
+        guarded_cluster_shutdown "$launch_pid" "API down for $(( now - api_down_since ))s" "$ACTIVE_NO_START_DRAIN_SECONDS"
         return 0
       fi
       continue
@@ -297,7 +352,12 @@ api_liveness_guard() {
           nohup python3 m3_warmup.py > "$LOG_DIR/m3_warmup.log" 2>&1 & ) || true
     fi
 
-    guard_decision=$(printf '%s' "$health_json" | M3_ACTIVE_NO_START_GUARD_SECONDS="$ACTIVE_NO_START_GUARD_SECONDS" python3 -c '
+    guard_decision=$(printf '%s' "$health_json" | \
+      M3_ACTIVE_NO_START_GUARD_SECONDS="$ACTIVE_NO_START_GUARD_SECONDS" \
+      M3_ACTIVE_NO_START_CONTEXT_TPS="$ACTIVE_NO_START_CONTEXT_TPS" \
+      M3_ACTIVE_NO_START_MARGIN_SECONDS="$ACTIVE_NO_START_MARGIN_SECONDS" \
+      M3_ACTIVE_NO_START_MAX_SECONDS="$ACTIVE_NO_START_MAX_SECONDS" \
+      python3 -c '
 import json, os, sys
 try:
     h = json.load(sys.stdin)
@@ -313,9 +373,23 @@ try:
     total = int(active.get("prefill_total_tokens") or 0)
 except Exception:
     sys.exit(1)
-limit = float(os.environ.get("M3_ACTIVE_NO_START_GUARD_SECONDS", "120") or "120")
+shape = active.get("request_shape") or {}
+try:
+    prompt = int(
+        shape.get("full_prompt_tokens")
+        or active.get("prompt_tokens")
+        or active.get("prefill_total_tokens")
+        or 0
+    )
+except Exception:
+    prompt = 0
+base = float(os.environ.get("M3_ACTIVE_NO_START_GUARD_SECONDS", "120") or "120")
+context_tps = max(1.0, float(os.environ.get("M3_ACTIVE_NO_START_CONTEXT_TPS", "1000") or "1000"))
+margin = max(0.0, float(os.environ.get("M3_ACTIVE_NO_START_MARGIN_SECONDS", "120") or "120"))
+maximum = max(base, float(os.environ.get("M3_ACTIVE_NO_START_MAX_SECONDS", "900") or "900"))
+limit = max(base, min(maximum, margin + (prompt / context_tps)))
 if tokens == 0 and prefill == 0 and total == 0 and since >= limit:
-    print(f"{active.get('id')}:{since:.0f}")
+    print(f"{active.get('id')}:{since:.0f}:limit={limit:.0f}:prompt={prompt}")
     sys.exit(0)
 sys.exit(1)
 ' 2>/dev/null)
@@ -329,14 +403,7 @@ sys.exit(1)
         continue
       fi
       echo "[$(date)] API liveness guard recycling cluster: active request made no prefill/decode progress (${guard_decision})." >> "$RESTART_LOG"
-      curl -fsS --max-time 8 -X POST "$API_SHUTDOWN_URL" >/dev/null 2>&1 || true
-      sleep 20
-      if kill -0 "$launch_pid" 2>/dev/null; then
-        kill -TERM "$launch_pid" 2>/dev/null || true
-        sleep 20
-      fi
-      kill -KILL "$launch_pid" 2>/dev/null || true
-      cleanup_leftover_ranks hard
+      guarded_cluster_shutdown "$launch_pid" "active request made no progress (${guard_decision})" "$ACTIVE_NO_START_DRAIN_SECONDS"
       return 0
     fi
   done

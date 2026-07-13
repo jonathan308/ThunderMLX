@@ -7,6 +7,8 @@ import pathlib
 import sys
 import time
 
+import mlx.core as mx
+
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -23,6 +25,8 @@ os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_TOOL", "6")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS", "3")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_FORCE_FINAL_AFTER", "8")
 os.environ.setdefault("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "8192")
+os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000")
+os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_TARGET_CHARS", "4096")
 
 from sharded_server import (
     _BATCH_PATH_ACTIVE,
@@ -31,8 +35,11 @@ from sharded_server import (
     _add_tool_system_hint_if_needed,
     _assistant_content_for_template,
     _anchor_command_working_directory,
+    _anchor_command_paths_from_read_history,
     _repair_reversed_edit_arguments_after_failure,
     _bound_large_file_write_arguments,
+    _buffered_tool_reasoning,
+    _remaining_tool_reasoning,
     _date_context_for_session,
     _arm_rank0_semantic_eos,
     _filter_looping_control_tools,
@@ -42,22 +49,36 @@ from sharded_server import (
     _looks_like_tool_compat_fallback_content,
     _remember_assistant_reasoning,
     _tool_request_fallback_content,
+    _tool_intent_without_call,
+    _tool_retry_messages,
+    _tool_retry_prefix_safety,
+    _tool_retry_prefers_no_think,
+    _tool_retry_thinking_mode,
     _tool_retry_recovery_hint,
     _tool_loop_steering_diag,
     _usable_tool_turn,
     _parse_tool_calls,
+    _prompt_cache_allowed_for_generation,
+    _prompt_cache_ssd_backing_state,
+    _prompt_cache_ssd_restore_backing_state,
+    _prompt_cache_ssd_round_capacity,
+    _recover_malformed_xml_tool_calls,
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
     _shell_create_file_payload_info,
     _synthesize_bounded_write_scaffold_text,
+    _synthesize_explicit_read_tool_call,
     _synthesize_write_command_tool_call,
     _tool_call_complete_for_stop,
     _tool_call_contains_complete_but_invalid,
+    _tool_fragment_looks_degenerate,
     _validate_outgoing_tool_calls,
     split_stream_thinking_delta,
     split_thinking_text,
+    TOOL_WRITE_CHUNK_TARGET_CHARS,
 )
 from model_gateway import _openai_response_has_usable_content
+from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
 
 
 class FakeMiniMaxToolModule:
@@ -93,6 +114,85 @@ def check_complete_analysis_channel():
     )
     assert reasoning == "check cache", (reasoning, content)
     assert content == "final answer", (reasoning, content)
+
+
+def check_tool_retry_preserves_long_prompt_prefix():
+    messages = [
+        {"role": "system", "content": "native tool schema"},
+        {"role": "user", "content": "create the artifact"},
+        {"role": "assistant", "content": None, "tool_calls": []},
+        {"role": "tool", "content": "partial result", "tool_call_id": "x"},
+    ]
+    retry = _tool_retry_messages(messages, "Emit one complete tool call now.")
+    assert retry[:-1] == messages, retry
+    assert retry[-1] == {
+        "role": "user",
+        "content": "Emit one complete tool call now.",
+    }, retry[-1]
+    assert messages[0]["content"] == "native tool schema"
+
+    original = list(range(40000))
+    appended = original + [40000, 40001, 40002]
+    safe = _tool_retry_prefix_safety(original, appended)
+    assert not safe["reset"], safe
+    assert safe["common_prefix_tokens"] == len(original), safe
+    assert safe["reuse_ratio"] == 1.0, safe
+
+    collapsed = [*range(128), *range(90000, 129872)]
+    unsafe = _tool_retry_prefix_safety(original, collapsed)
+    assert unsafe["reset"], unsafe
+    assert unsafe["common_prefix_tokens"] == 128, unsafe
+
+    medium_original = list(range(26000))
+    medium_collapsed = [*range(127), *range(80000, 105873)]
+    medium_unsafe = _tool_retry_prefix_safety(
+        medium_original,
+        medium_collapsed,
+    )
+    assert medium_unsafe["reset"], medium_unsafe
+
+    short = _tool_retry_prefix_safety(
+        list(range(1024)),
+        [*range(8), *range(5000, 6016)],
+    )
+    assert not short["reset"], short
+    assert _tool_retry_thinking_mode("enabled", prefer_no_think=True) == "disabled"
+    assert _tool_retry_thinking_mode("disabled", prefer_no_think=True) == "disabled"
+    assert _tool_retry_thinking_mode("enabled", prefer_no_think=False) == "enabled"
+    assert not _tool_retry_prefers_no_think("enabled", 1, 3)
+    assert not _tool_retry_prefers_no_think("enabled", 2, 3)
+    assert _tool_retry_prefers_no_think("enabled", 3, 3)
+    assert not _tool_retry_prefers_no_think("disabled", 3, 3)
+
+    raw_tool_reasoning = (
+        "I will inspect the available PDF tools.</mm:think>"
+        "]<]minimax[>[<tool_call>"
+        "]<]minimax[>[<invoke name=\"terminal\">"
+        "]<]minimax[>[<command>which pandoc</command>"
+        "]<]minimax[>[</invoke>"
+        "]<]minimax[>[</tool_call>"
+    )
+    safe_reasoning = _buffered_tool_reasoning(
+        raw_tool_reasoning,
+        FakeMiniMaxToolModule,
+        "enabled",
+    )
+    assert safe_reasoning == "I will inspect the available PDF tools.", safe_reasoning
+    assert "tool_call" not in safe_reasoning and "minimax" not in safe_reasoning
+    assert _remaining_tool_reasoning("plan then call", "plan ") == "then call"
+    assert _remaining_tool_reasoning("retry plan", "original plan") == ""
+
+
+def check_file_cleanup_promise_requires_a_tool_call():
+    assert _tool_intent_without_call(
+        "I see - there is trailing garbage. Let me strip it and verify."
+    )
+    assert _tool_intent_without_call(
+        "All nine diagrams are generated. Now let me build the PDF script:"
+    )
+    assert not _tool_intent_without_call(
+        "I stripped the trailing garbage and verified the file."
+    )
 
 
 def check_stream_analysis_channel():
@@ -185,6 +285,291 @@ def check_malformed_positional_xml_tool_call_recovers():
     call = calls[0]
     assert call["function"]["name"] == "execute_search", call
     assert '"query": "obsidian vault location"' in call["function"]["arguments"], call
+
+
+def check_bare_nested_invoke_with_namespaced_args_recovers():
+    """Recover ZCode's missing namespace boundary before ``<invoke>``."""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        f"{ns}<tool_call>"
+        '<invoke name="Read">'
+        f"{ns}<file_path>word_stats.py{ns}</file_path>"
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "", remaining
+    assert len(calls) == 1, calls
+    call = calls[0]
+    assert call["function"]["name"] == "Read", call
+    assert json.loads(call["function"]["arguments"]) == {
+        "file_path": "word_stats.py",
+    }, call
+
+
+def check_named_empty_read_uses_unique_reasoning_path():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Read",
+            "description": "Read a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+                "required": ["file_path"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        "There's already a `test_word_stats.py`. Let me read it first."
+        "</mm:think>"
+        f"{ns}<tool_call>"
+        '<invoke name="Read">'
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == (
+        "There's already a `test_word_stats.py`. Let me read it first."
+        "</mm:think>"
+    ), remaining
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "Read", calls
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "file_path": "test_word_stats.py",
+    }, calls
+
+
+def check_bare_edit_name_with_xml_arguments_recovers():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "description": "Replace exact text in a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    old = '        self.assertEqual(top["dog"], 1)\n        stray()'
+    new = '        self.assertEqual(top["dog"], 1)'
+    text = (
+        "I'll fix the stray line.</mm:think>"
+        f"{ns}<tool_call>\n{ns}Edit\n"
+        "<file_path>/tmp/test_word_stats.py</file_path>\n"
+        f"<new_string>{new}</new_string>\n"
+        f"<old_text>{old}</old_text>\n"
+        "<replaceAll>false</replaceAll>\n"
+        f"</Edit>\n</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "I'll fix the stray line.</mm:think>", remaining
+    assert len(calls) == 1, calls
+    arguments = json.loads(calls[0]["function"]["arguments"])
+    assert calls[0]["function"]["name"] == "Edit", calls
+    assert arguments == {
+        "file_path": "/tmp/test_word_stats.py",
+        "old_string": old,
+        "new_string": new,
+        "replace_all": False,
+    }, arguments
+    assert _tool_call_complete_for_stop(text, FakeMiniMaxToolModule, tools)
+
+
+def check_quoted_positional_agent_call_recovers():
+    """Recover the exact ZCode thinking drift: ``<invoke agent\">``."""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Agent",
+            "description": "Run a focused subagent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "subagent_type": {"type": "string"},
+                },
+                "required": ["description", "prompt", "subagent_type"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        "Let me inspect the project.</mm:think>"
+        f"{ns}<tool_call>"
+        f'{ns}<invoke agent\">{{"description":"Find files",'
+        '"prompt":"Find word_stats.py and its tests.",'
+        '"subagent_type":"general-purpose"}'
+        f"{ns}</prompt}}"
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "Let me inspect the project.</mm:think>", remaining
+    assert len(calls) == 1, calls
+    call = calls[0]
+    assert call["function"]["name"] == "Agent", call
+    arguments = json.loads(call["function"]["arguments"])
+    assert arguments == {
+        "description": "Find files",
+        "prompt": "Find word_stats.py and its tests.",
+        "subagent_type": "general-purpose",
+    }, arguments
+
+
+def check_relative_read_path_stays_relative_when_home_cwd_is_misleading():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            },
+        },
+    ]
+    processed_messages = [
+        {
+            "role": "system",
+            "content": (
+                "<env>\nCurrent working directory: "
+                "/Users/tester\n</env>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Add a --min-length option to word_stats.py.",
+        },
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "read-relative",
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "arguments": json.dumps({"file_path": "word_stats.py"}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read-relative",
+            "content": "#!/usr/bin/env python3\n",
+        },
+    ]
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "arguments": {
+                    "file_path": "/Users/tester/word_stats.py",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages[:2],
+        raw_output="I'll read word_stats.py first.",
+    )
+    assert dropped == 0, dropped
+    read_arguments = json.loads(validated[0]["function"]["arguments"])
+    assert read_arguments["file_path"] == "word_stats.py", read_arguments
+
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "arguments": {
+                    "file_path": "/Users/example/word_stats.py",
+                    "old_string": "before",
+                    "new_string": "after",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+        raw_output="I'll update word_stats.py now.",
+    )
+    assert dropped == 0, dropped
+    arguments = json.loads(validated[0]["function"]["arguments"])
+    assert arguments["file_path"] == "word_stats.py", arguments
+
+
+def check_under_specified_positional_edit_is_rejected():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Edit">'
+        f"{ns}<file_path>word_stats.py{ns}</file_path>"
+        f"{ns}<param-1>replacement only{ns}</param-1>"
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    assert _recover_malformed_xml_tool_calls(
+        text,
+        FakeMiniMaxToolModule,
+        tools,
+    ) == []
+    calls, _ = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert calls == [], calls
 
 
 def check_malformed_command_tag_tool_calls_recover():
@@ -480,6 +865,81 @@ def check_incomplete_native_write_is_never_emitted():
     )
 
 
+def check_complete_json_call_survives_missing_outer_close():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    command = "mkdir -p /tmp/llm_guide && cd /tmp/llm_guide && pwd"
+    text = (
+        "I will create the working directory."
+        f"{ns}<tool_call> {ns}<invoke ```json "
+        + json.dumps({"name": "Bash", "input": {"command": command}})
+        + f" ```{ns} "
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "I will create the working directory.", remaining
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "Bash", calls
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"command": command}, args
+
+    # A balanced object followed by substantive bytes is not atomic and must
+    # stay on the bounded retry path.
+    unsafe = text + "and then append another argument"
+    calls, remaining = _parse_tool_calls(unsafe, FakeMiniMaxToolModule, tools)
+    assert calls == [], calls
+    assert remaining == "I will create the working directory.", remaining
+
+    write_tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    flat = (
+        "I'll write sections_a.py now."
+        f'{ns}<invoke name="Write", "file_path": "/tmp/wrong.py">'
+        f"{ns}<tool_call>"
+        + json.dumps({"file_path": "/tmp/wrong.py", "content": "print('ok')\n"})
+    )
+    calls, remaining = _parse_tool_calls(
+        flat,
+        FakeMiniMaxToolModule,
+        write_tools,
+    )
+    assert remaining == "I'll write sections_a.py now.", remaining
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "Write", calls
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"file_path": "/tmp/wrong.py", "content": "print('ok')\n"}, args
+
+    # Unknown flat keys must never become executable arguments.
+    unsafe_flat = flat.rsplit("{", 1)[0] + json.dumps({"payload": "no schema"})
+    calls, _ = _parse_tool_calls(
+        unsafe_flat,
+        FakeMiniMaxToolModule,
+        write_tools,
+    )
+    assert calls == [], calls
+
+
 def check_large_write_chunk_hint_and_retry_feedback():
     tools = [{
         "type": "function",
@@ -496,7 +956,8 @@ def check_large_write_chunk_hint_and_retry_feedback():
         },
     }]
     hint = _file_write_chunk_hint(tools)
-    assert "6000 characters" in hint, hint
+    assert f"below {TOOL_WRITE_CHUNK_TARGET_CHARS} characters" in hint, hint
+    assert "hard parser ceiling is 6000" in hint, hint
     assert "small valid working scaffold" in hint, hint
 
     ns = "]<]minimax[>["
@@ -543,9 +1004,89 @@ def check_large_write_chunk_hint_and_retry_feedback():
         edit_tools,
     )
     assert "exactly one valid `Edit` call" in edit_recovery, edit_recovery
+    assert "`file_path`" in edit_recovery, edit_recovery
     assert "`old_string`" in edit_recovery, edit_recovery
     assert "`new_string`" in edit_recovery, edit_recovery
     assert "one focused replacement" in edit_recovery, edit_recovery
+
+    class WrongTypeEditToolModule(FakeMiniMaxToolModule):
+        @staticmethod
+        def parse_tool_call(text, tools):
+            return {
+                "name": "Edit",
+                "arguments": json.dumps({
+                    "file_path": "word_stats.py",
+                    "old_string": ["old text"],
+                    "new_string": {"replacement": "new text"},
+                }),
+            }
+
+    wrong_type_edit = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Edit">'
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    type_recovery = _tool_retry_recovery_hint(
+        wrong_type_edit,
+        WrongTypeEditToolModule,
+        edit_tools,
+    )
+    assert "`old_string` as JSON string" in type_recovery, type_recovery
+    assert "`new_string` as JSON string" in type_recovery, type_recovery
+    assert "arrays, objects, or nested tags" in type_recovery, type_recovery
+
+    malformed_large_edit = (
+        "I will make one focused addition."
+        f"{ns}<tool_call>"
+        f'{ns}<invoke>edit\">{{"filePath":"/tmp/snake.html",'
+        '"newText":"'
+        + ("x" * 7000)
+        + '","old_text":""}'
+    )
+    assert _file_write_payload_chars(
+        malformed_large_edit,
+        edit_tools,
+    ) > 6000, "malformed edit invocation was not bounded"
+    malformed_edit_recovery = _tool_retry_recovery_hint(
+        malformed_large_edit,
+        FakeMiniMaxToolModule,
+        edit_tools,
+    )
+    assert "exactly one valid `Edit` call" in malformed_edit_recovery, (
+        malformed_edit_recovery
+    )
+    assert "exact existing text" in malformed_edit_recovery, (
+        malformed_edit_recovery
+    )
+    malformed_space_name_edit = (
+        f"{ns}<tool_call>{ns}<invoke edit>"
+        f"{ns}<filePath>/tmp/snake.html{ns}</filePath>"
+        f"{ns}<newString>" + ("x" * 7000)
+    )
+    assert _file_write_payload_chars(
+        malformed_space_name_edit,
+        edit_tools,
+    ) > 6000, "space-name edit invocation was not bounded"
+
+    oversized_valid_edit = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "arguments": {
+                "file_path": "/tmp/snake.html",
+                "old_string": "anchor",
+                "new_string": "x" * 7000,
+            },
+        },
+    }]
+    bounded_edits, dropped_edits = _validate_outgoing_tool_calls(
+        oversized_valid_edit,
+        edit_tools,
+        return_dropped=True,
+    )
+    assert bounded_edits == [], bounded_edits
+    assert dropped_edits == 1, dropped_edits
 
     import sharded_server as server
 
@@ -599,6 +1140,34 @@ def check_large_write_chunk_hint_and_retry_feedback():
     assert "THUNDERMLX_CONTINUE" in args["content"], args
     assert len(args["content"]) < 6000, args
 
+    # Native MiniMax shorthand uses the advertised tool name as the element
+    # itself. It must hit the same early size guard as <invoke name="Write">.
+    incomplete_native_short = (
+        f"{ns}<tool_call>"
+        f"{ns}<write>"
+        f"{ns}<file_path>/tmp/native-short.py{ns}</file_path>"
+        f"{ns}<content>"
+        + ("x" * 7000)
+    )
+    assert _file_write_payload_chars(
+        incomplete_native_short,
+        tools,
+    ) > 6000, "native <write> shorthand was not bounded"
+    native_short_scaffold = _synthesize_bounded_write_scaffold_text(
+        incomplete_native_short,
+        tools,
+    )
+    calls, remaining = _parse_tool_calls(
+        native_short_scaffold,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert len(calls) == 1, calls
+    assert remaining == "", remaining
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args["file_path"] == "/tmp/native-short.py", args
+    assert "THUNDERMLX_CONTINUE" in args["content"], args
+
     shell_tools = [
         *tools,
         {
@@ -616,6 +1185,30 @@ def check_large_write_chunk_hint_and_retry_feedback():
             },
         },
     ]
+    unavailable_search = (
+        f"{ns}<tool_call>"
+        f"{ns}<invoke file_search>make_diagrams.py</file_search>"
+        f"{ns}</tool_call>"
+    )
+    search_recovery = _tool_retry_recovery_hint(
+        unavailable_search,
+        FakeMiniMaxToolModule,
+        shell_tools,
+    )
+    assert "`file_search` is not an advertised tool" in search_recovery, search_recovery
+    assert "use `Bash`" in search_recovery, search_recovery
+    assert "Do not emit `file_search` again" in search_recovery, search_recovery
+
+    promise_recovery = _tool_retry_recovery_hint(
+        "I need to update the missing arguments. Let me fix them:",
+        FakeMiniMaxToolModule,
+        shell_tools,
+    )
+    assert "promised an action" in promise_recovery, promise_recovery
+    assert "exactly one complete tool call" in promise_recovery, promise_recovery
+    assert "`Bash`" in promise_recovery, promise_recovery
+    assert "Do not narrate" in promise_recovery, promise_recovery
+
     oversized_shell = (
         f"{ns}<tool_call>"
         f'{ns}<invoke name="Bash">'
@@ -757,6 +1350,18 @@ def check_command_workdir_drift_is_anchored_narrowly():
     assert repaired["workdir"] == root, repaired
     assert len(changes) == 1, changes
 
+    typo, changes = _anchor_command_working_directory(
+        "bash",
+        {
+            "command": "ls -la",
+            "workdir": "/workspace/ThunderMLX/opencode-fixturd",
+        },
+        tools,
+        messages,
+    )
+    assert typo["workdir"] == root, typo
+    assert len(changes) == 1, changes
+
     subdir, changes = _anchor_command_working_directory(
         "bash",
         {"command": "pwd", "workdir": f"{root}/tests"},
@@ -779,6 +1384,40 @@ def check_command_workdir_drift_is_anchored_narrowly():
     )
     assert preserved["workdir"] == external, preserved
     assert not changes, changes
+
+    history_messages = [
+        {"role": "user", "content": "Inspect the generated PDF and summarize it."},
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call_workdir_ok",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({
+                        "command": "pwd",
+                        "workdir": "/private/tmp",
+                    }),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_workdir_ok",
+            "content": "/private/tmp\n",
+        },
+    ]
+    history_repaired, changes = _anchor_command_working_directory(
+        "bash",
+        {
+            "command": "python3 validate.py",
+            "workdir": "/private/tmp/thinnerx-gate-does-not-exist",
+        },
+        tools,
+        history_messages,
+    )
+    assert history_repaired["workdir"] == "/private/tmp", history_repaired
+    assert len(changes) == 1, changes
 
 
 def check_reversed_edit_is_repaired_only_after_proven_failure():
@@ -1062,8 +1701,9 @@ def check_soft_tool_loop_steering_preserves_tools():
     assert diag and "repeated_tool" in diag["reasons"], diag
     patched = _add_tool_system_hint_if_needed(looped, {}, tools, tool_loop_diag=diag)
     assert patched[0]["role"] == "system", patched
-    assert "Tools remain available" in patched[0]["content"], patched[0]
-    assert "tool-call format" in patched[0]["content"], patched[0]
+    assert patched[-1]["role"] == "system", patched
+    assert "Tools remain available" in patched[-1]["content"], patched[-1]
+    assert "tool-call format" in patched[-1]["content"], patched[-1]
 
 
 def _repeated_named_tool_messages(tool_name, count):
@@ -1108,7 +1748,8 @@ def check_soft_tool_loop_hint_is_cache_stable():
             tools,
             tool_loop_diag=diag,
         )
-        hints.append(patched[0]["content"])
+        assert patched[-1]["role"] == "system", patched
+        hints.append(patched[-1]["content"])
     assert hints[0] == hints[1], hints
 
 
@@ -1284,11 +1925,78 @@ def check_repeated_exec_command_eventually_forces_final_answer():
         looped.append({"role": "tool", "content": "total 8\n-rw-r--r-- app.py"})
     diag = _tool_loop_steering_diag(looped, tools)
     assert diag and "repeated_command" in diag["reasons"], diag
-    assert "force_final" not in diag["reasons"], diag
+    assert "identical_command_result" in diag["reasons"], diag
+    assert "force_final" in diag["reasons"], diag
     patched = _add_tool_system_hint_if_needed(looped, {}, tools, tool_loop_diag=diag)
     assert patched[0]["role"] == "system", patched
-    assert "Long agent-loop steering" in patched[0]["content"], patched[0]
-    assert "tools are unavailable" not in patched[0]["content"], patched[0]
+    assert patched[-1]["role"] == "system", patched
+    assert "Tool loop breaker" in patched[-1]["content"], patched[-1]
+    assert "tools are unavailable" not in patched[-1]["content"], patched[-1]
+
+
+def check_identical_command_result_loop_forces_final_only_when_unchanged():
+    import sharded_server as server
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    }]
+
+    def messages(results):
+        history = [{"role": "user", "content": "Build and validate it."}]
+        for index, result in enumerate(results):
+            call_id = f"call-{index}"
+            history.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": {"cmd": "python3 build.py"},
+                    },
+                }],
+            })
+            history.append({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result,
+            })
+        return history
+
+    previous_after = server.TOOL_LOOP_FORCE_FINAL_AFTER
+    previous_commands = server.TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS
+    previous_pairs = server.TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS
+    try:
+        server.TOOL_LOOP_FORCE_FINAL_AFTER = 0
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS = 0
+        server.TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS = 4
+
+        stuck = _tool_loop_steering_diag(messages(["no output"] * 4), tools)
+        assert stuck["repeated_command_result_count"] == 4, stuck
+        assert "identical_command_result" in stuck["reasons"], stuck
+        assert "force_final" in stuck["reasons"], stuck
+
+        productive = _tool_loop_steering_diag(
+            messages(["failed", "1 passed", "2 passed", "3 passed"]),
+            tools,
+        )
+        assert productive and "repeated_command" in productive["reasons"], productive
+        assert productive["repeated_command_result_count"] == 1, productive
+        assert "identical_command_result" not in productive["reasons"], productive
+        assert "force_final" not in productive["reasons"], productive
+    finally:
+        server.TOOL_LOOP_FORCE_FINAL_AFTER = previous_after
+        server.TOOL_LOOP_FORCE_FINAL_REPEATED_COMMANDS = previous_commands
+        server.TOOL_LOOP_FORCE_FINAL_IDENTICAL_COMMAND_RESULTS = previous_pairs
 
 
 def check_repeated_apply_patch_keeps_tool_schema_stable():
@@ -1370,9 +2078,9 @@ def check_long_tool_loop_gets_force_final_hint():
     diag = _tool_loop_steering_diag(looped, tools)
     assert diag and "force_final" in diag["reasons"], diag
     patched = _add_tool_system_hint_if_needed(looped, {}, None, tool_loop_diag=diag)
-    assert patched[0]["role"] == "system", patched
-    assert "stop calling tools for this single turn" in patched[0]["content"], patched[0]
-    assert "Do not request another tool" in patched[0]["content"], patched[0]
+    assert patched[-1]["role"] == "system", patched
+    assert "stop calling tools for this single turn" in patched[-1]["content"], patched[-1]
+    assert "Do not request another tool" in patched[-1]["content"], patched[-1]
 
 
 def check_create_goal_objective_aliases():
@@ -1448,6 +2156,523 @@ def check_update_plan_scalar_coerces_to_plan_item():
     assert args == {"plan": [{"step": "Audit tool calls", "status": "in_progress"}]}, args
 
 
+def check_json_encoded_array_argument_matches_schema():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }]
+    todos = [
+        {"content": "Generate diagrams", "status": "in_progress", "priority": "high"},
+        {"content": "Build PDF", "status": "pending", "priority": "high"},
+    ]
+    calls = [{
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "arguments": {"todos": json.dumps(todos)},
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args == {"todos": todos}, args
+
+
+def check_equals_name_todowrite_beats_native_bash_misparse():
+    item_schema = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "status": {"type": "string"},
+            "priority": {"type": "string"},
+        },
+        "required": ["content", "status", "priority"],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "todowrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {"type": "array", "items": item_schema},
+                    },
+                    "required": ["todos"],
+                },
+            },
+        },
+    ]
+    ns = "]<]minimax[>["
+    raw = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke="todowrite">'
+        f"{ns}<todos>{ns}<item>"
+        f"{ns}<content>Build PDF{ns}</content>"
+        f"{ns}<status>pending{ns}</status>"
+        f"{ns}<priority>high{ns}</priority>"
+        f"{ns}</item>{ns}</todos>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(raw, FakeMiniMaxToolModule, tools)
+    assert remaining == "", remaining
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "todowrite", calls
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args == {
+        "todos": [{
+            "content": "Build PDF",
+            "status": "pending",
+            "priority": "high",
+        }],
+    }, args
+
+    wrong_native_call = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "arguments": {"command": args["todos"]},
+        },
+    }]
+    assert _validate_outgoing_tool_calls(wrong_native_call, tools) == []
+
+
+def check_image_generations_bypass_text_prompt_cache():
+    assert not _prompt_cache_allowed_for_generation(
+        "disabled",
+        [1, 2, 3],
+        "/private/tmp/example.png",
+    )
+
+
+def check_zcode_long_turn_xml_repairs_are_schema_grounded():
+    todo_item = {
+        "type": "object",
+        "properties": {
+            "content": {"type": "string"},
+            "status": {"type": "string"},
+            "activeForm": {"type": "string"},
+            "priority": {"type": "string"},
+        },
+        "required": ["content", "status", "activeForm"],
+    }
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "TodoWrite",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "todos": {"type": "array", "items": todo_item},
+                    },
+                    "required": ["todos"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file_path": {"type": "string"}},
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                        "replace_all": {"type": "boolean"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            },
+        },
+    ]
+    ns = "]<]minimax[>["
+    reversed_items = (
+        f"{ns}<tool_call>{ns}<invoke name=\"TodoWrite\">"
+        f"{ns}<todos>{ns}</item>"
+        f"{ns}<content>Inspect current state{ns}</content>"
+        f"{ns}<status>completed{ns}</status>"
+        f"{ns}<activeform>Inspecting current state{ns}</activeform>"
+        f"{ns}</item>"
+        f"{ns}<content>Update report{ns}</content>"
+        f"{ns}<status>in_progress{ns}</status>"
+        f"{ns}<activeform>Updating report{ns}</activeform>"
+        f"{ns}</item>{ns}</todos>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        reversed_items,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["todos"] == [
+        {
+            "content": "Inspect current state",
+            "status": "completed",
+            "activeForm": "Inspecting current state",
+        },
+        {
+            "content": "Update report",
+            "status": "in_progress",
+            "activeForm": "Updating report",
+        },
+    ], args
+
+    reversed_container = (
+        f"{ns}<tool_call>"
+        f"{ns}<invoke name TodoWrite (replacing the stale list)>"
+        f"{ns}</todos>{ns}<item>"
+        f"{ns}<content>Inspect current project state{ns}</content>"
+        f"{ns}<status>in_progress{ns}</status>"
+        f"{ns}<activeform>Inspecting current project state{ns}</activeform>"
+        f"{ns}<priority>high{ns}</priority>"
+        f"{ns}</item>{ns}<item>"
+        f"{ns}<content>Run full tests{ns}</content>"
+        f"{ns}<status>pending{ns}</status>"
+        f"{ns}<activeform>Running full tests{ns}</activeform>"
+        f"{ns}<priority>high{ns}</priority>"
+        f"{ns}</item>{ns}</todos>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        reversed_container,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["todos"] == [
+        {
+            "content": "Inspect current project state",
+            "status": "in_progress",
+            "activeForm": "Inspecting current project state",
+            "priority": "high",
+        },
+        {
+            "content": "Run full tests",
+            "status": "pending",
+            "activeForm": "Running full tests",
+            "priority": "high",
+        },
+    ], args
+
+    long_todo_items = []
+    for index in range(8):
+        active_form = (
+            ""
+            if index == 7
+            else f"{ns}<activeform>Working item {index}{ns}</activeform>"
+        )
+        long_todo_items.append(
+            f"{ns}<item>"
+            f"{ns}<status>{'in_progress' if index == 2 else 'pending'}"
+            f"{ns}</status>"
+            f"{ns}<content>Work item {index}{ns}</content>"
+            f"{active_form}"
+            f"{ns}<priority>medium{ns}</priority>"
+            f"{ns}</item>"
+        )
+    long_open_todo = (
+        f"{ns}<tool_call>{ns}<invoke name=\"TodoWrite\">"
+        f"{ns}<todos>{''.join(long_todo_items)}"
+    )
+    assert long_open_todo.count(ns) > 32
+    assert not _tool_fragment_looks_degenerate(
+        long_open_todo,
+        FakeMiniMaxToolModule,
+    )
+    long_complete_todo = (
+        f"{long_open_todo}{ns}</todos>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        long_complete_todo,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert len(args["todos"]) == 8, args
+    assert args["todos"][-1]["activeForm"] == "Work item 7", args
+
+    marker_spam = f"{ns}<tool_call>" + (ns * 40)
+    assert _tool_fragment_looks_degenerate(
+        marker_spam,
+        FakeMiniMaxToolModule,
+    )
+
+    mixed_tools = [
+        *tools,
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
+    truncated_todo = (
+        f"{ns}<tool_call>{ns}<invoke todo>Replace with updated todos"
+        f"{ns}</content>{ns}<priority>high{ns}</priority>"
+        f"{ns}</item>{ns}</todos>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, _ = _parse_tool_calls(
+        truncated_todo,
+        FakeMiniMaxToolModule,
+        mixed_tools,
+    )
+    assert all(
+        call["function"]["name"] != "Bash"
+        for call in calls
+    ), calls
+
+    labeled_json = (
+        f"{ns}<tool_call>{ns}<invoke TodoWrite}}>{ns} "
+        'todos: [{"content":"Update report","status":"in_progress",'
+        '"activeForm":"Updating report","priority":"high"}]]'
+        f"{ns}}} }}{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        labeled_json,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["todos"][0]["content"] == "Update report", args
+    assert args["todos"][0]["priority"] == "high", args
+
+    broken_read = (
+        f"{ns}<tool_call>{ns}<invoke name=\"Read -f "
+        f"/private/tmp/native-tool-gate/REPORT.md>"
+        f"{ns}</file_path>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        broken_read,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args == {
+        "file_path": "/private/tmp/native-tool-gate/REPORT.md",
+    }, args
+
+    malformed_edit = (
+        f"{ns}<tool_call>{ns}<invoke name=\"Edit\">"
+        f"{ns}<file_path>/private/tmp/native-tool-gate/stats.py"
+        f"{ns}</file_path>"
+        f"{ns}<old_string>before{ns}</old_string>"
+        f"{ns}<new_value>after{ns}</old_string>"
+        f"{ns}<new_string>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(
+        malformed_edit,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert remaining == "", remaining
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["new_string"] == "after", args
+
+    typed_call = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "arguments": {
+                "file_path": "/private/tmp/native-tool-gate/stats.py",
+                "old_string": "before",
+                "new_string": "after",
+                "replace_all": "false",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(typed_call, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["replace_all"] is False, args
+
+
+def check_function_syntax_invoke_recovers_read():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"filePath": {"type": "string"}},
+                    "required": ["filePath"],
+                },
+            },
+        },
+    ]
+    ns = "]<]minimax[>["
+    path = "/private/tmp/project/build/make_diagrams.py"
+    raw = (
+        "Let me read the existing file properly.</mm:think>"
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="read_file(path="{path}")]'
+        f"{ns}</command>{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(raw, FakeMiniMaxToolModule, tools)
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "read", calls
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {"filePath": path}, args
+    assert "read_file" not in remaining, remaining
+    body_raw = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke>read_file(path="{path}")]'
+        f"{ns}</command>{ns}</invoke>{ns}</tool_call>"
+    )
+    body_calls, _ = _parse_tool_calls(
+        body_raw,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert len(body_calls) == 1, body_calls
+    assert body_calls[0]["function"]["name"] == "read", body_calls
+    assert json.loads(body_calls[0]["function"]["arguments"]) == {
+        "filePath": path,
+    }
+
+    processed_messages = [
+        {
+            "role": "system",
+            "content": (
+                "<env>\nCurrent working directory: /private/tmp/project\n"
+                "</env>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Read build/make_diagrams.py, then continue the PDF.",
+        },
+    ]
+    synthesized = _synthesize_explicit_read_tool_call(
+        processed_messages,
+        tools,
+    )
+    assert synthesized["function"]["name"] == "read", synthesized
+    synthesized_args = json.loads(synthesized["function"]["arguments"])
+    assert synthesized_args == {"filePath": "build/make_diagrams.py"}, synthesized_args
+    hint = _tool_retry_recovery_hint(
+        "Let me read the existing file with the correct path.</mm:think>"
+        f"{ns}<tool_call>{ns}<invoke>",
+        FakeMiniMaxToolModule,
+        tools,
+        processed_messages,
+    )
+    assert "`read`" in hint and "build/make_diagrams.py" in hint, hint
+
+    completed_messages = processed_messages + [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "read-1",
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "arguments": json.dumps({
+                        "filePath": "/private/tmp/project/build/make_diagrams.py",
+                    }),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read-1",
+            "content": "def make_diagrams():\n    pass\n",
+        },
+    ]
+    assert _synthesize_explicit_read_tool_call(
+        completed_messages,
+        tools,
+    ) is None
+    wrong_command = {
+        "command": (
+            "cat >> /private/tmp/thundermlx-M3-project/"
+            "build/make_diagrams.py <<'EOF'\n# next section\nEOF"
+        ),
+    }
+    anchored, changes = _anchor_command_paths_from_read_history(
+        "bash",
+        wrong_command,
+        tools,
+        completed_messages,
+    )
+    assert changes, (anchored, changes)
+    assert "/private/tmp/project/build/make_diagrams.py" in anchored["command"]
+    assert "thundermlx-M3-project" not in anchored["command"]
+
+
 def check_missing_required_tool_args_report_dropped():
     tools = [{
         "type": "function",
@@ -1479,6 +2704,314 @@ def check_missing_required_tool_args_report_dropped():
     assert validated == [], validated
     assert dropped == 1, dropped
 
+
+def check_missing_write_path_uses_named_tool_proven_target_only():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["filePath", "content"],
+            },
+        },
+    }]
+    root = "/private/tmp/native-tool-gate"
+    processed_messages = [
+        {
+            "role": "system",
+            "content": (
+                "<env>\nCurrent working directory: " + root + "\n</env>"
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Fill sections_a.py, sections_b.py, and sections_c.py.",
+        },
+    ]
+    for suffix in ("sections_a.py", "sections_b.py", "sections_c.py"):
+        call_id = "read-" + suffix
+        processed_messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "arguments": json.dumps({
+                            "filePath": f"{root}/{suffix}",
+                        }),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": "<content>scaffold</content>",
+            },
+        ])
+    call = [{
+        "type": "function",
+        "function": {
+            "name": "write",
+            "arguments": {"content": "def add_title():\n    pass\n"},
+        },
+    }]
+    raw = (
+        "I'll create a small working scaffold for `sections_a.py` first."
+        "]<]minimax[>[<tool_call>"
+    )
+    validated, dropped = _validate_outgoing_tool_calls(
+        call,
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+        raw_output=raw,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["filePath"] == f"{root}/sections_a.py", args
+    assert args["content"] == "def add_title():\n    pass\n", args
+
+    # A complete native call can omit all pre-tool prose and drift the parent
+    # directory. The one successful same-basename Read remains exact evidence.
+    no_cwd_messages = processed_messages[1:]
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": "/private/tmp/thundermlr/sections_a.py",
+                    "content": "SECTIONS = []\n",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=no_cwd_messages,
+        raw_output="]<]minimax[>[<tool_call>",
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["filePath"] == f"{root}/sections_a.py", args
+
+    leaked_content = (
+        "SECTIONS = []\n"
+        "]<]minimax[>[\ncontent>"
+    )
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": f"{root}/sections_a.py",
+                    "content": leaked_content,
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["content"] == "SECTIONS = []", args
+
+    nested_leak = (
+        "SECTIONS = []\n"
+        "]<]minimax[>[</command>]<]minimax[>[</invoke"
+    )
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": f"{root}/sections_a.py",
+                    "content": nested_leak,
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["content"] == "SECTIONS = []", args
+
+    mutation_messages = processed_messages[:2] + [
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "write-sections-b",
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "arguments": json.dumps({
+                        "filePath": f"{root}/build/sections_b.py",
+                        "content": "# first bounded section\n",
+                    }),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "write-sections-b",
+            "content": "Wrote file successfully.",
+        },
+    ]
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": f"{root}/sections_b.py",
+                    "content": "# second bounded section\n",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=mutation_messages,
+        raw_output=(
+            "I'll continue `sections_b.py` with the next bounded section."
+            "]<]minimax[>[<tool_call>"
+        ),
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["filePath"] == f"{root}/build/sections_b.py", args
+
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": "/Users/example/Downloads/build_sections_a.py",
+                    "content": "def add_title():\n    pass\n",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+        raw_output=raw,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["filePath"] == f"{root}/sections_a.py", args
+
+    ambiguous = raw.replace("sections_a.py", "sections_a.py and sections_b.py")
+    validated, dropped = _validate_outgoing_tool_calls(
+        call,
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+        raw_output=ambiguous,
+    )
+    assert validated == [], validated
+    assert dropped == 1, dropped
+
+    tagged_path = f"{root}/sections_a.py]<]minimax[>[</filePath>"
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "write",
+                "arguments": {
+                    "filePath": tagged_path,
+                    "content": "def add_title():\n    pass\n",
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["filePath"] == f"{root}/sections_a.py", args
+
+
+def check_todowrite_fills_only_schema_required_neutral_defaults():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low"],
+                                },
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    }]
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "todowrite",
+                "arguments": {
+                    "todos": [{
+                        "content": "Implement section A",
+                        "status": "in_progress",
+                    }],
+                },
+            },
+        }],
+        tools,
+        return_dropped=True,
+    )
+    assert dropped == 0, dropped
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["todos"] == [{
+        "content": "Implement section A",
+        "status": "in_progress",
+        "priority": "medium",
+    }], args
+
+    # Never invent the task itself when required semantic content is absent.
+    validated, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "todowrite",
+                "arguments": {"todos": [{"status": "pending"}]},
+            },
+        }],
+        tools,
+        return_dropped=True,
+    )
+    assert validated == [], validated
+    assert dropped == 1, dropped
 
 def check_empty_required_tool_args_report_dropped():
     tools = [{
@@ -1607,6 +3140,202 @@ def check_malformed_apply_patch_payload_report_dropped():
     )
     assert dropped == 0, dropped
     assert len(validated) == 1, validated
+
+
+def check_reversed_write_path_and_content_are_repaired():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    payload = (
+        "# aggregated content module\n"
+        "from pathlib import Path\n\n"
+        "def build():\n"
+        "    return Path('/tmp/output')\n"
+    ) * 4
+    calls = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "arguments": {
+                "file_path": payload,
+                "content": "/private/tmp/zcode/build/content_core.py",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["file_path"] == "/private/tmp/zcode/build/content_core.py", args
+    assert args["content"] == payload.strip(), args
+
+    normal = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "arguments": {
+                "file_path": "/private/tmp/zcode/build/normal.py",
+                "content": "print('ok')\n",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(normal, tools)
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["file_path"].endswith("normal.py"), args
+    assert args["content"] == "print('ok')\n", args
+
+
+def check_multiline_python_c_bash_call_is_executable():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["command", "description"],
+            },
+        },
+    }]
+    text = (
+        "]<]minimax[>[<tool_call>\n"
+        "]<]minimax[>[<invoke name=\"Bash\">"
+        "]<]minimax[>[<command>cd /private/tmp/zcode/build && python3 -c \"\n"
+        "import content_pipeline as cp\n"
+        "import content_msa as cm\n"
+        "print(cp.PIPELINE_SECTION['title'])\n"
+        "print(cm.MSA_DEEP_DIVE['title'])\n"
+        "\" 2>&1]<]minimax[>[</command>"
+        "]<]minimax[>[<description>Inspect content module shapes</description>"
+        "]<]minimax[>[</invoke>\n"
+        "]<]minimax[>[</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "", remaining
+    validated, dropped = _validate_outgoing_tool_calls(
+        calls,
+        tools,
+        return_dropped=True,
+    )
+    assert dropped == 0, (calls, validated, dropped)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["command"].startswith("cd /private/tmp/zcode/build"), args
+    assert "python3 -c" in args["command"], args
+    assert args["description"] == "Inspect content module shapes", args
+
+
+def check_zcode_user_workspace_anchors_drifted_write_and_cd():
+    root = "/private/tmp/thundermlx-zcode-artifacts-20260712-2335"
+    wrong_root = "/private/tmp/thundermlx-zcode-artifacts-20260712"
+    messages = [
+        {"role": "system", "content": "Use tools to complete the task."},
+        {
+            "role": "user",
+            "content": f"Work only in the existing {root} directory.",
+        },
+        {
+            "role": "user",
+            "content": "Write build/content_manifest.py, then compile it.",
+        },
+    ]
+    write_tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    write_call = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "arguments": {
+                "file_path": f"{wrong_root}/build/content_manifest.py",
+                "content": "TITLE = 'Guide'\n",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(
+        write_call,
+        write_tools,
+        processed_messages=messages,
+    )
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["file_path"] == f"{root}/build/content_manifest.py", args
+
+    bash_tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "description": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        },
+    }]
+    bash_call = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "arguments": {
+                "command": (
+                    f"cd {wrong_root}/build && "
+                    "python3 -c \"import content_manifest\""
+                ),
+                "description": "Validate manifest",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(
+        bash_call,
+        bash_tools,
+        processed_messages=messages,
+    )
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["command"].startswith(f"cd {root}/build &&"), args
+
+    list_call = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "arguments": {
+                "command": f"ls {wrong_root}/build/ 2>&1",
+                "description": "Inspect build directory",
+            },
+        },
+    }]
+    validated = _validate_outgoing_tool_calls(
+        list_call,
+        bash_tools,
+        processed_messages=messages,
+    )
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args["command"] == f"ls {root}/build/ 2>&1", args
 
 
 def check_tool_call_reasoning_recall_restores_model_context():
@@ -1992,6 +3721,50 @@ def check_empty_tool_markers_get_specific_fallback():
     assert _looks_like_tool_compat_fallback_content(content), content
 
 
+def check_empty_native_invoke_targets_planned_edit_retry():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    raw = (
+        "Good, the edit worked. Let me continue using focused Edit calls."
+        "</mm:think>"
+        f"{ns}<tool_call>{ns}\ninvoke:{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, _ = _parse_tool_calls(raw, FakeMiniMaxToolModule, tools)
+    assert calls == [], calls
+    assert not _usable_tool_turn(
+        raw,
+        FakeMiniMaxToolModule,
+        tools,
+        [{"role": "user", "content": "Continue building the guide."}],
+        "enabled",
+    )
+    hint = _tool_retry_recovery_hint(
+        raw,
+        FakeMiniMaxToolModule,
+        tools,
+        [{"role": "user", "content": "Continue building the guide."}],
+    )
+    assert "`Edit`" in hint, hint
+    assert "`file_path`" in hint, hint
+    assert "`old_string`" in hint, hint
+    assert "`new_string`" in hint, hint
+    assert "one focused replacement" in hint, hint
+
+
 def check_tool_fallback_content_does_not_poison_next_turn():
     tools = [{
         "type": "function",
@@ -2069,6 +3842,46 @@ def check_repeated_long_user_tool_prompt_forces_final():
     diag = _tool_loop_steering_diag(messages, tools)
     assert diag and "repeated_user_tool_prompt" in diag["reasons"], diag
     assert "force_final" in diag["reasons"], diag
+
+
+def check_repeated_long_goal_prompt_with_tool_progress_is_allowed():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "exec_command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    }]
+    repeated = "Inspect this project and continue the goal with tools. " * 120
+    messages = []
+    for index in range(3):
+        call_id = f"call-{index}"
+        messages.extend([
+            {"role": "user", "content": repeated},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": json.dumps({"cmd": f"printf {index}"}),
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": str(index),
+            },
+        ])
+    diag = _tool_loop_steering_diag(messages, tools)
+    assert not diag or "repeated_user_tool_prompt" not in diag["reasons"], diag
 
 
 def check_inbound_tool_call_content_is_not_model_facing():
@@ -2217,11 +4030,166 @@ def check_semantic_decode_stop_is_rank0_owned():
         _BATCH_PATH_ACTIVE.update(original_batch)
 
 
+def check_bash_rejects_source_and_numeric_fragments():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    for command in (
+        "20",
+        "def build_pdf(path):\n    return path\n",
+        "from reportlab.pdfgen import canvas\ncanvas.Canvas('x.pdf')\n",
+        '\"\"\"PDF builder.\"\"\"\nimport os\ndef build_pdf(path):\n    return path\n',
+        "cat > /tmp/docx_builder.py <<'PYEOF'\nprint('x')\n",
+        (
+            'Edit</name> <parameter name="file_path">word_stats.py'
+            '</parameter> <parameter name="old_string">old</parameter>'
+        ),
+    ):
+        validated, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": {"command": command},
+                },
+            }],
+            tools,
+            return_dropped=True,
+        )
+        assert validated == [], (command, validated)
+        assert dropped == 1, (command, dropped)
+
+    for command in (
+        "python3 -c 'print(20)'",
+        "python3 - <<'PY'\nprint(20)\nPY",
+        "sed -n '1,20p' build_pdf.py",
+    ):
+        validated, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": {"command": command},
+                },
+            }],
+            tools,
+            return_dropped=True,
+        )
+        assert dropped == 0, (command, dropped)
+        assert len(validated) == 1, (command, validated)
+
+    script = "/tmp/build_pdf.py"
+    processed_messages = [
+        {
+            "role": "assistant",
+            "tool_calls": [{
+                "id": "call-python-permission",
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({"command": script}),
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-python-permission",
+            "content": f"zsh: permission denied: {script}",
+        },
+    ]
+    repaired, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": {"command": script},
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=processed_messages,
+    )
+    assert dropped == 0, dropped
+    repaired_args = json.loads(repaired[0]["function"]["arguments"])
+    assert repaired_args["command"] == f"python3 {script}", repaired_args
+
+
+def check_ssd_restore_append_capacity_is_bounded():
+    logical = 45_178
+    old_full_request_reserve = _prompt_cache_ssd_round_capacity(
+        logical, 32_768, 256
+    )
+    bounded_worker_reserve = _prompt_cache_ssd_round_capacity(
+        logical, 4_096, 256
+    )
+    logical_only_artifact = _prompt_cache_ssd_round_capacity(logical, 0, 256)
+
+    assert old_full_request_reserve == 78_080, old_full_request_reserve
+    assert bounded_worker_reserve == 49_408, bounded_worker_reserve
+    assert logical_only_artifact == 45_312, logical_only_artifact
+    assert bounded_worker_reserve < old_full_request_reserve
+    assert bounded_worker_reserve - logical <= 4_096 + 255
+
+    cache = MiniMaxM3KVCache()
+    cache.kv_cache.keys = mx.zeros(
+        (1, 1, old_full_request_reserve, 2), dtype=mx.float16
+    )
+    cache.kv_cache.values = mx.zeros(
+        (1, 1, old_full_request_reserve, 2), dtype=mx.float16
+    )
+    cache.kv_cache.offset = logical
+    cache.index_keys = mx.zeros(
+        (1, 1, old_full_request_reserve, 2), dtype=mx.float16
+    )
+    cache.index_offset = logical
+
+    state, storage = _prompt_cache_ssd_backing_state(
+        cache, max_spare_tokens=0
+    )
+    assert state[0][0].shape[2] == logical_only_artifact
+    assert state[1].shape[2] == logical_only_artifact
+
+    restored = MiniMaxM3KVCache()
+    restored_storage = _prompt_cache_ssd_restore_backing_state(
+        restored,
+        state,
+        storage,
+        target_capacity=logical + 4_096,
+    )
+    assert restored.offset == logical
+    assert restored.index_offset == logical
+    assert restored_storage["capacity"] == bounded_worker_reserve
+    assert restored.kv_cache.keys.shape[2] == bounded_worker_reserve
+    assert restored.index_keys.shape[2] == bounded_worker_reserve
+    mx.eval(
+        restored.kv_cache.keys,
+        restored.kv_cache.values,
+        restored.index_keys,
+    )
+
+
 def main():
     check_complete_analysis_channel()
+    check_tool_retry_preserves_long_prompt_prefix()
+    check_file_cleanup_promise_requires_a_tool_call()
     check_stream_analysis_channel()
     check_unknown_channel_does_not_buffer_forever()
+    check_image_generations_bypass_text_prompt_cache()
     check_malformed_positional_xml_tool_call_recovers()
+    check_bare_nested_invoke_with_namespaced_args_recovers()
+    check_named_empty_read_uses_unique_reasoning_path()
+    check_bare_edit_name_with_xml_arguments_recovers()
+    check_quoted_positional_agent_call_recovers()
+    check_relative_read_path_stays_relative_when_home_cwd_is_misleading()
+    check_under_specified_positional_edit_is_rejected()
     check_malformed_command_tag_tool_calls_recover()
     check_codex_pseudo_goal_call_recovers()
     check_codex_pseudo_goal_before_malformed_exec_prefers_goal()
@@ -2230,6 +4198,7 @@ def main():
     check_loose_segment_command_tool_call_recovers()
     check_incomplete_loose_segment_command_is_not_emitted()
     check_incomplete_native_write_is_never_emitted()
+    check_complete_json_call_survives_missing_outer_close()
     check_large_write_chunk_hint_and_retry_feedback()
     check_post_tool_action_promise_is_not_a_final_answer()
     check_codex_tool_arg_schema_canonicalization()
@@ -2245,14 +4214,24 @@ def main():
     check_repeated_control_tool_filter_keeps_work_tools()
     check_repeated_exec_command_keeps_tool_schema_stable()
     check_repeated_exec_command_eventually_forces_final_answer()
+    check_identical_command_result_loop_forces_final_only_when_unchanged()
     check_repeated_apply_patch_keeps_tool_schema_stable()
     check_long_tool_loop_gets_force_final_hint()
     check_create_goal_objective_aliases()
     check_update_plan_scalar_coerces_to_plan_item()
+    check_json_encoded_array_argument_matches_schema()
+    check_equals_name_todowrite_beats_native_bash_misparse()
+    check_zcode_long_turn_xml_repairs_are_schema_grounded()
+    check_function_syntax_invoke_recovers_read()
     check_missing_required_tool_args_report_dropped()
+    check_missing_write_path_uses_named_tool_proven_target_only()
+    check_todowrite_fills_only_schema_required_neutral_defaults()
     check_empty_required_tool_args_report_dropped()
     check_parameterless_and_optional_only_tool_args_are_accepted()
     check_malformed_apply_patch_payload_report_dropped()
+    check_reversed_write_path_and_content_are_repaired()
+    check_multiline_python_c_bash_call_is_executable()
+    check_zcode_user_workspace_anchors_drifted_write_and_cd()
     check_tool_call_reasoning_recall_restores_model_context()
     check_read_file_coerces_to_exec_command()
     check_exec_stdin_aliases_to_write_stdin()
@@ -2260,14 +4239,18 @@ def main():
     check_stale_unavailable_tool_gets_compatibility_fallback()
     check_zcoder_codex_tool_argument_matrix()
     check_empty_tool_markers_get_specific_fallback()
+    check_empty_native_invoke_targets_planned_edit_retry()
     check_tool_fallback_content_does_not_poison_next_turn()
     check_gateway_treats_tool_fallback_as_unusable()
     check_repeated_long_user_tool_prompt_forces_final()
+    check_repeated_long_goal_prompt_with_tool_progress_is_allowed()
     check_inbound_tool_call_content_is_not_model_facing()
     check_tool_stop_on_valid_or_complete_invalid_tool_call()
     check_invalid_apply_patch_stops_decode_without_emitting_tool()
     check_malformed_apply_patch_simple_write_synthesizes_exec()
     check_semantic_decode_stop_is_rank0_owned()
+    check_bash_rejects_source_and_numeric_fragments()
+    check_ssd_restore_append_capacity_is_bounded()
     print("PASS")
 
 
