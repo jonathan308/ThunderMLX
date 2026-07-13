@@ -299,6 +299,16 @@ BATCH_TOOL_NATURAL_DRAIN = os.environ.get(
 TOOL_RETRY_NO_THINK = os.environ.get(
     "MLX_M3_TOOL_RETRY_NO_THINK", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Switching a thinking request to the no-thinking template invalidates its
+# tokenized prefix. Keep that last-resort path for short turns only; rebuilding
+# a large hot agent transcript inside a hidden retry can outlive the client's
+# stream-idle budget even though both ranks remain healthy.
+TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS = int(
+    os.environ.get(
+        "MLX_M3_TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS",
+        "16384",
+    ) or "0"
+)
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
     os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "8192") or "0"
 )
@@ -397,6 +407,13 @@ MAX_CONCURRENT_REQUESTS = max(
 # both ranks share one model/prompt-cache state and must stay in lockstep.
 EFFECTIVE_MAX_CONCURRENT_REQUESTS = 1
 SSE_KEEPALIVE_SECONDS = float(os.environ.get("MLX_M3_SSE_KEEPALIVE_SECONDS", "5"))
+# Empty OpenAI deltas keep the transport alive, but some agent clients do not
+# count them as stream activity. During a buffered tool turn, periodically emit
+# an explicit reasoning-channel status so a live recovery cannot be mistaken
+# for a dead stream. 0 disables the client-visible pulse.
+TOOL_STREAM_PROGRESS_SECONDS = float(
+    os.environ.get("MLX_M3_TOOL_STREAM_PROGRESS_SECONDS", "45") or "0"
+)
 # Native MiniMax tool XML can be malformed yet recoverable only after the
 # complete decode. Buffer the full transaction by default so a failed first
 # attempt cannot leak markup before a validated retry is ready.
@@ -6617,6 +6634,11 @@ def _generation_defaults_status():
         "tool_retry_no_call_token_budget": (
             TOOL_RETRY_NO_CALL_TOKEN_BUDGET
         ),
+        "tool_retry_no_think": TOOL_RETRY_NO_THINK,
+        "tool_retry_no_think_max_prompt_tokens": (
+            TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS
+        ),
+        "tool_stream_progress_seconds": TOOL_STREAM_PROGRESS_SECONDS,
         "tool_thinking_runaway_token_budget": (
             TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
         ),
@@ -8453,7 +8475,15 @@ def _canonicalize_tool_argument_keys(arguments, tools, name):
     # agent shims reject even though the OpenAI API itself is permissive.
     # Schemas that explicitly allow additionalProperties keep their extra
     # keys — dropping them loses real data (2026-07-06 audit).
-    shaped = {prop: result[prop] for prop in props if prop in result}
+    # Upstream XML parsers sometimes materialize an omitted optional field as
+    # null (observed with Edit.replace_all). Treat that exactly like absence;
+    # retaining it converts an otherwise complete call into a schema mismatch.
+    # Required nulls remain for the normal missing-required diagnostic.
+    shaped = {
+        prop: result[prop]
+        for prop in props
+        if prop in result and (prop in required or result[prop] is not None)
+    }
     if leftovers and _tool_schema_allows_additional_properties(tools, name):
         for key, value in leftovers.items():
             shaped.setdefault(key, value)
@@ -11102,12 +11132,22 @@ def _tool_retry_thinking_mode(thinking_mode, prefer_no_think=None):
     return thinking_mode
 
 
-def _tool_retry_prefers_no_think(thinking_mode, attempt, total_attempts):
-    """Use the incompatible no-thinking template only as the last resort."""
+def _tool_retry_prefers_no_think(
+    thinking_mode,
+    attempt,
+    total_attempts,
+    prompt_tokens=0,
+):
+    """Use the incompatible no-thinking template only for short last resorts."""
+    prompt_tokens = max(0, int(prompt_tokens or 0))
     return bool(
         TOOL_RETRY_NO_THINK
         and _enable_thinking_for_generation(thinking_mode)
         and int(attempt or 0) >= max(1, int(total_attempts or 0))
+        and (
+            TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS <= 0
+            or prompt_tokens <= TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS
+        )
     )
 
 
@@ -11321,6 +11361,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             thinking_mode,
             attempt,
             TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            len(token_ids or []),
         )
         retry_thinking_mode = _tool_retry_thinking_mode(
             thinking_mode,
@@ -12582,6 +12623,62 @@ def _arguments_from_ns_arg_tags(raw_body, ns_token, tools, name):
     return args
 
 
+def _arguments_from_named_parameter_tags(raw_body, ns_token, tools, name):
+    """Recover MiniMax's hybrid ``<parameter name=...>`` argument format.
+
+    Long ZCode Edit turns sometimes emit a bare parameter opener, a namespaced
+    closer, and a closer whose tag name does not match the opener. Structural
+    closers remain namespaced, so split only on those boundaries and preserve
+    HTML/CSS/JS inside argument values byte-for-byte.
+    """
+    if not raw_body or not ns_token or "<parameter" not in raw_body:
+        return None
+    opener = re.compile(
+        rf"(?is)(?:{re.escape(ns_token)})?<parameter\b[^>]*"
+        r"\bname\s*=\s*(?:([\"'])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))"
+        r"[^>]*>",
+    )
+    matches = list(opener.finditer(raw_body))
+    if not matches:
+        return None
+    args = {}
+    for index, match in enumerate(matches):
+        raw_name = (match.group("quoted") or match.group("bare") or "").strip()
+        if not raw_name:
+            continue
+        next_opener = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(raw_body)
+        )
+        close_match = re.search(
+            rf"(?is){re.escape(ns_token)}</[A-Za-z_$][\w:.$-]*\s*>",
+            raw_body[match.end():next_opener],
+        )
+        if close_match is None:
+            # A bare </parameter> is still unambiguous; bare payload markup is
+            # not, so no other bare closer is accepted here.
+            close_match = re.search(
+                r"(?is)</parameter\s*>",
+                raw_body[match.end():next_opener],
+            )
+        if close_match is None:
+            continue
+        value_start = match.end()
+        value_end = value_start + close_match.start()
+        args[raw_name] = raw_body[value_start:value_end]
+    if not args:
+        return None
+    args = _canonicalize_tool_argument_keys(args, tools, name)
+    args = _coerce_json_encoded_schema_values(args, tools, name)
+    required = _tool_schema_required_names(tools, name)
+    if any(args.get(key) in (None, "") for key in required):
+        return None
+    if _tool_schema_type_mismatches(args, tools, name):
+        return None
+    return args
+
+
 def _positional_recovery_is_underspecified(raw_body, ns_token, tools, name):
     """Reject positional XML recovery that cannot cover required fields.
 
@@ -13642,6 +13739,19 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                 calls.append(_openai_tool_call(
                     name,
                     json.dumps(nested_array_args, ensure_ascii=False),
+                    len(calls),
+                ))
+                continue
+            named_parameter_args = _arguments_from_named_parameter_tags(
+                raw_body,
+                ns_token,
+                tools,
+                name,
+            )
+            if named_parameter_args:
+                calls.append(_openai_tool_call(
+                    name,
+                    json.dumps(named_parameter_args, ensure_ascii=False),
                     len(calls),
                 ))
                 continue
@@ -18586,6 +18696,8 @@ def run_http_server(model, processor, rank):
                     image_count=len(images), request_shape=request_shape,
                 )
                 submit_generation_job(_producer)
+                last_payload_at = time.monotonic()
+                last_progress_pulse_at = last_payload_at
                 try:
                     while True:
                         try:
@@ -18596,6 +18708,21 @@ def run_http_server(model, processor, rank):
                             else:
                                 item = await asyncio.to_thread(out_q.get)
                         except queue.Empty:
+                            now = time.monotonic()
+                            progress_delta = {}
+                            if (
+                                tools
+                                and TOOL_STREAM_BUFFER_ALL
+                                and TOOL_STREAM_PROGRESS_SECONDS > 0
+                                and now - last_payload_at
+                                >= TOOL_STREAM_PROGRESS_SECONDS
+                                and now - last_progress_pulse_at
+                                >= TOOL_STREAM_PROGRESS_SECONDS
+                            ):
+                                progress_delta["reasoning_content"] = (
+                                    "\n[Tool action is still processing.]\n"
+                                )
+                                last_progress_pulse_at = now
                             keepalive = {
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -18603,7 +18730,7 @@ def run_http_server(model, processor, rank):
                                 "model": response_model,
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {},
+                                    "delta": progress_delta,
                                     "finish_reason": None,
                                 }],
                             }
@@ -18611,6 +18738,8 @@ def run_http_server(model, processor, rank):
                             continue
                         if item is None:
                             break
+                        last_payload_at = time.monotonic()
+                        last_progress_pulse_at = last_payload_at
                         yield item
                 except (asyncio.CancelledError, GeneratorExit):
                     client_connected.clear()

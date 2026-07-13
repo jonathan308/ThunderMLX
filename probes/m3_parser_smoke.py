@@ -162,6 +162,9 @@ def check_tool_retry_preserves_long_prompt_prefix():
     assert not _tool_retry_prefers_no_think("enabled", 1, 3)
     assert not _tool_retry_prefers_no_think("enabled", 2, 3)
     assert _tool_retry_prefers_no_think("enabled", 3, 3)
+    assert _tool_retry_prefers_no_think("enabled", 3, 3, 16384)
+    assert not _tool_retry_prefers_no_think("enabled", 3, 3, 16385)
+    assert not _tool_retry_prefers_no_think("enabled", 3, 3, 50126)
     assert not _tool_retry_prefers_no_think("disabled", 3, 3)
 
     raw_tool_reasoning = (
@@ -395,6 +398,74 @@ def check_bare_edit_name_with_xml_arguments_recovers():
         "replace_all": False,
     }, arguments
     assert _tool_call_complete_for_stop(text, FakeMiniMaxToolModule, tools)
+
+
+def check_hybrid_named_parameter_edit_recovers_without_retry():
+    """Recover the exact long ZCode Edit drift without rewriting its HTML."""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                },
+                "required": ["file_path", "old_string", "new_string"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    old = ".eyebrow{color:red}\n</style>"
+    new = ".eyebrow{color:blue}\n.card{display:grid}\n</style>"
+    text = (
+        f"{ns}<tool_call>{ns}<invoke name=\"Edit\">"
+        f"{ns}<command>edit</command>"
+        f'<parameter name="path">/tmp/guide.html{ns}</parameter>'
+        f'<parameter name="oldtext">{old}{ns}</parameter>'
+        f'<parameter name="newtext">{new}{ns}</content>'
+        f"{ns}</invoke>{ns}</tool_call>"
+    )
+    calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    assert remaining == "", remaining
+    assert len(calls) == 1, calls
+    validated, dropped = _validate_outgoing_tool_calls(
+        calls,
+        tools,
+        return_dropped=True,
+    )
+    assert dropped == 0, (validated, dropped)
+    assert len(validated) == 1, validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args == {
+        "file_path": "/tmp/guide.html",
+        "old_string": old,
+        "new_string": new,
+    }, args
+
+    # The upstream parser can materialize an absent optional boolean as null.
+    # It must remain absent, not invalidate an otherwise complete Edit call.
+    null_optional = [{
+        "type": "function",
+        "function": {
+            "name": "Edit",
+            "arguments": {
+                **args,
+                "replace_all": None,
+            },
+        },
+    }]
+    validated, dropped = _validate_outgoing_tool_calls(
+        null_optional,
+        tools,
+        return_dropped=True,
+    )
+    assert dropped == 0, (validated, dropped)
+    clean_args = json.loads(validated[0]["function"]["arguments"])
+    assert "replace_all" not in clean_args, clean_args
 
 
 def check_quoted_positional_agent_call_recovers():
@@ -4187,6 +4258,7 @@ def main():
     check_bare_nested_invoke_with_namespaced_args_recovers()
     check_named_empty_read_uses_unique_reasoning_path()
     check_bare_edit_name_with_xml_arguments_recovers()
+    check_hybrid_named_parameter_edit_recovers_without_retry()
     check_quoted_positional_agent_call_recovers()
     check_relative_read_path_stays_relative_when_home_cwd_is_misleading()
     check_under_specified_positional_edit_is_rejected()
