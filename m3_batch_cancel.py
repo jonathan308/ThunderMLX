@@ -75,6 +75,37 @@ _PREFILL_CANCEL_EVERY = max(
 )
 
 
+def _rank_aware_int(name, default, *, fallback_name=None):
+    rank = os.environ.get("MLX_RANK", "").strip()
+    keys = []
+    if rank:
+        keys.append(f"{name}_RANK{rank}")
+    keys.append(name)
+    if fallback_name:
+        if rank:
+            keys.append(f"{fallback_name}_RANK{rank}")
+        keys.append(fallback_name)
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None and str(value).strip():
+            return int(value)
+    return int(default)
+
+
+# A request's max_tokens is a safety ceiling, not its expected output size.
+# Reserving the whole ceiling on every warm-cache conversion pushed a 45k
+# session to 78k physical KV slots and exhausted the 128GB rank. Keep a small
+# rank-aware window and let the native cache grow if a response truly needs it.
+_BATCH_APPEND_RESERVE_TOKENS = max(
+    0,
+    _rank_aware_int(
+        "MLX_M3_BATCH_APPEND_RESERVE_TOKENS",
+        4096,
+        fallback_name="MLX_M3_PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS",
+    ),
+)
+
+
 class Unsupported(Exception):
     """Request shape the batch-cancel path does not handle; use stream_generate."""
 
@@ -296,23 +327,96 @@ def _prefill_overlap_loop(pb, rank, progress_cb, total):
 # Warm cache <-> batch cache conversion (B=1, left_padding=[0])
 # ---------------------------------------------------------------------------
 
-def _warm_batch_caches(prompt_cache):
+def _pad_sequence_capacity(value, target_capacity):
+    if value is None or len(value.shape) < 3:
+        return value
+    current = int(value.shape[2])
+    target = max(current, int(target_capacity or 0))
+    if target <= current:
+        return value
+    padding = [(0, 0)] * len(value.shape)
+    padding[2] = (0, target - current)
+    return mx.pad(value, padding)
+
+
+def _rounded_capacity(target_capacity, step):
+    target = max(0, int(target_capacity or 0))
+    step = max(1, int(step or 1))
+    return ((target + step - 1) // step) * step
+
+
+def _warm_batch_caches(prompt_cache, target_capacity=0):
     from mlx_vlm.models import cache as vcache
 
     out = []
     for c in prompt_cache:
         if hasattr(c, "to_batch") and not isinstance(c, vcache.KVCache):
-            out.append(c.to_batch([0]))  # MiniMaxM3KVCache: contents preserved
+            # MiniMaxM3KVCache.to_batch() goes through KVCache.state, which
+            # slices backing tensors to the logical offset. A restored 350k
+            # cache then becomes exactly full and its first appended token
+            # reallocates/copies the entire KV on every layer. B=1 with zero
+            # padding can safely share the full backing arrays while carrying
+            # the logical offsets separately.
+            bc = c.to_batch([0])
+            source = getattr(c, "kv_cache", None)
+            target = getattr(bc, "kv_cache", None)
+            # Keep MLX's native BatchKVCache growth cadence. Propagating the
+            # single-cache 4096-token step into the batch cache triggered an
+            # M5 IOGPUFamily "completeMemory prepare count underflow" panic at
+            # 315k prefill tokens. Capacity reservation below avoids a whole-
+            # KV append copy without changing the proven batch allocator.
+            batch_step = max(
+                1,
+                int(getattr(target, "step", 256) or 256),
+            )
+            if (
+                source is not None
+                and target is not None
+                and getattr(source, "keys", None) is not None
+            ):
+                desired = _rounded_capacity(
+                    max(int(c.offset), int(target_capacity or 0)),
+                    batch_step,
+                )
+                keys = _pad_sequence_capacity(source.keys, desired)
+                values = _pad_sequence_capacity(source.values, desired)
+                source.keys = keys
+                source.values = values
+                target.keys = keys
+                target.values = values
+                target.left_padding = mx.array([0], dtype=mx.int32)
+                target.offset = mx.array([int(c.offset)], dtype=mx.int32)
+                target._idx = int(c.offset)
+                bc._can_skip_decode_mask = True
+                index_keys = _pad_sequence_capacity(
+                    getattr(c, "index_keys", None), desired
+                )
+                c.index_keys = index_keys
+                bc.index_keys = index_keys
+                bc.index_offset = int(getattr(c, "index_offset", 0) or 0)
+                arrays = [keys, values]
+                if index_keys is not None:
+                    arrays.append(index_keys)
+                mx.eval(*arrays)
+            out.append(bc)
         elif isinstance(c, vcache.KVCache):
             bc = vcache.BatchKVCache([0])
+            batch_step = max(1, int(getattr(bc, "step", 256) or 256))
             if c.offset > 0:
-                keys, values = c.state
-                bc.state = (
-                    keys,
-                    values,
-                    mx.array([c.offset], dtype=mx.int32),
-                    mx.array([0], dtype=mx.int32),
+                desired = _rounded_capacity(
+                    max(int(c.offset), int(target_capacity or 0)),
+                    batch_step,
                 )
+                keys = _pad_sequence_capacity(c.keys, desired)
+                values = _pad_sequence_capacity(c.values, desired)
+                c.keys = keys
+                c.values = values
+                bc.keys = keys
+                bc.values = values
+                bc.left_padding = mx.array([0], dtype=mx.int32)
+                bc.offset = mx.array([int(c.offset)], dtype=mx.int32)
+                bc._idx = int(c.offset)
+                mx.eval(keys, values)
             out.append(bc)
         else:
             raise Unsupported(f"no warm batch conversion for {type(c).__name__}")
@@ -339,19 +443,28 @@ def _restore_single_caches(batch_caches, single_caches):
 
     for bc, sc in zip(batch_caches, single_caches):
         if hasattr(sc, "kv_cache"):  # MiniMaxM3KVCache
-            keys, values, offsets, left_pad = bc.kv_cache.state
-            off = int(offsets[0].item())
-            kv_state = (keys[..., :off, :], values[..., :off, :])
-            index_state = None
-            if bc.index_keys is not None:
-                index_state = bc.index_keys[..., : bc.index_offset, :]
-            sc.state = (kv_state if off > 0 else None, index_state)
-            sc.offset = off
+            inner = bc.kv_cache
+            off = int(getattr(inner, "_idx", 0) or 0)
+            if off > 0 and inner.keys is not None:
+                sc.kv_cache.keys = inner.keys
+                sc.kv_cache.values = inner.values
+                sc.kv_cache.offset = off
+            else:
+                sc.kv_cache.keys = None
+                sc.kv_cache.values = None
+                sc.kv_cache.offset = 0
+            sc.index_keys = bc.index_keys
+            sc.index_offset = int(getattr(bc, "index_offset", 0) or 0)
         elif isinstance(sc, vcache.KVCache):
-            keys, values, offsets, _ = bc.state
-            off = int(offsets[0].item())
-            if off > 0:
-                sc.state = (keys[..., :off, :], values[..., :off, :])
+            off = int(getattr(bc, "_idx", 0) or 0)
+            if off > 0 and bc.keys is not None:
+                sc.keys = bc.keys
+                sc.values = bc.values
+                sc.offset = off
+            else:
+                sc.keys = None
+                sc.values = None
+                sc.offset = 0
 
 
 # ---------------------------------------------------------------------------
@@ -435,11 +548,13 @@ def batch_cancel_stream_generate(rank, model, processor, prompt, **kwargs):
         prompt_cache=prompt_cache,
         prefill_step_size=prefill_step_size,
         progress_cb=progress_cb,
+        max_kv_size=kwargs.get("max_kv_size"),
     )
 
 
 def _run(rank, model, processor, tokenizer, input_ids, max_tokens, sampler,
-         processors, prompt_cache, prefill_step_size, progress_cb):
+         processors, prompt_cache, prefill_step_size, progress_cb,
+         max_kv_size=None):
     from mlx_vlm.generate import ar as ar_mod
     from mlx_vlm.generate.dispatch import GenerationResult
     from mlx_vlm.tokenizer_utils import make_streaming_detokenizer
@@ -461,10 +576,33 @@ def _run(rank, model, processor, tokenizer, input_ids, max_tokens, sampler,
     ids_arr = mx.array([suffix_list], dtype=mx.int32)
     inputs_embeds = inner.embed_tokens(ids_arr)
 
+    append_reserve_tokens = min(
+        max(0, int(max_tokens or 0)),
+        _BATCH_APPEND_RESERVE_TOKENS,
+    )
+    target_capacity = total_prompt_tokens + append_reserve_tokens
+    if max_kv_size is not None and int(max_kv_size or 0) > 0:
+        target_capacity = min(target_capacity, int(max_kv_size))
+    logger.debug(
+        "rank %s: warm batch KV target prompt=%d output_ceiling=%d "
+        "append_reserve=%d target=%d",
+        rank,
+        total_prompt_tokens,
+        max_tokens,
+        append_reserve_tokens,
+        target_capacity,
+    )
+
     if prompt_cache:
-        batch_caches = _warm_batch_caches(prompt_cache)
+        batch_caches = _warm_batch_caches(
+            prompt_cache,
+            target_capacity=target_capacity,
+        )
     else:
-        batch_caches = _warm_batch_caches(lm.make_cache())
+        batch_caches = _warm_batch_caches(
+            lm.make_cache(),
+            target_capacity=target_capacity,
+        )
 
     pb = ar_mod.PromptProcessingBatch(
         model=model,

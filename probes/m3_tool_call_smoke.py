@@ -28,7 +28,12 @@ def request_json(method, path, payload=None, timeout=60):
 
 
 def health(timeout=5):
-    return request_json("GET", "/health", timeout=timeout)
+    out = request_json("GET", "/health", timeout=timeout)
+    # The arbiter exposes M3 health under ``m3.health`` while the direct
+    # endpoint returns it at the top level. Normalize both so this probe can
+    # validate the exact same request path through ports 8080 and 8010.
+    nested = (out.get("m3") or {}).get("health") if isinstance(out, dict) else None
+    return nested if isinstance(nested, dict) else out
 
 
 def wait_idle(before_completed, timeout=90):
@@ -127,6 +132,8 @@ def run_stream(model, max_tokens, timeout):
     calls = []
     finish = None
     raw_chunks = []
+    reasoning_chunks = []
+    reasoning_times = []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -141,6 +148,10 @@ def run_stream(model, max_tokens, timeout):
                 finish = choice.get("finish_reason") or finish
                 delta = choice.get("delta") or {}
                 calls.extend(delta.get("tool_calls") or [])
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if reasoning:
+                    reasoning_chunks.append(reasoning)
+                    reasoning_times.append(time.time() - started)
     final = wait_idle(before)
     last = final.get("last_request") or {}
     leaked = any(
@@ -154,6 +165,14 @@ def run_stream(model, max_tokens, timeout):
         "finish": finish,
         "tool_calls": calls,
         "raw_chunks": len(raw_chunks),
+        "reasoning_chunks": len(reasoning_chunks),
+        "first_reasoning_s": (
+            round(reasoning_times[0], 3) if reasoning_times else None
+        ),
+        "reasoning_span_s": (
+            round(reasoning_times[-1] - reasoning_times[0], 3)
+            if len(reasoning_times) > 1 else 0.0
+        ),
         "raw_marker_leak": leaked,
         "failed": final.get("requests_failed"),
         "decode_tps": last.get("decode_tps"),
@@ -162,6 +181,10 @@ def run_stream(model, max_tokens, timeout):
     print(json.dumps(row, sort_keys=True), flush=True)
     if not calls or finish != "tool_calls" or leaked:
         raise SystemExit("stream tool call missing or raw marker leaked")
+    if "no-think" not in model.lower() and len(reasoning_chunks) < 2:
+        raise SystemExit(
+            "thinking tool call did not stream incremental reasoning_content"
+        )
     return row
 
 

@@ -2,6 +2,7 @@
 Reports GPU arch, and bf16 matmul + 4-bit qmm throughput at MoE-ish shapes.
 Small (<1GB), brief (<15s). Safe to run alongside production."""
 import time, platform, subprocess
+from importlib.metadata import version
 import mlx.core as mx
 
 def dev_arch():
@@ -27,7 +28,7 @@ def bench(fn, iters=30, warm=8):
     mx.synchronize()
     return (time.perf_counter() - t0) / iters
 
-print(f"arch={dev_arch()}  macOS={macos()}  mlx={mx.__version__}")
+print(f"arch={dev_arch()}  macOS={macos()}  mlx={version('mlx')}")
 
 # bf16 dense matmul: [M,K] @ [K,N]
 for (Mr, K, N) in [(4096, 6144, 6144), (2048, 6144, 8192)]:

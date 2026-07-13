@@ -5,6 +5,7 @@ This intentionally measures cold prompt processing with unique session ids. It
 restores the original runtime tuning at the end, even if a test fails.
 """
 import argparse
+import hashlib
 import json
 import time
 import urllib.request
@@ -60,10 +61,10 @@ def wait_idle(timeout=120):
     raise TimeoutError(f"endpoint not idle: {last}")
 
 
-def stream_chat(name, prompt, *, session_id, max_tokens, timeout):
+def stream_chat(name, prompt, *, model, session_id, max_tokens, timeout):
     before = health().get("requests_completed", 0)
     payload = {
-        "model": "Minimax-M3-No-Think",
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
         "max_tokens": max_tokens,
@@ -80,6 +81,7 @@ def stream_chat(name, prompt, *, session_id, max_tokens, timeout):
     first_chunk_s = None
     chunks = 0
     chars = 0
+    output_parts = []
     with urllib.request.urlopen(req, timeout=timeout) as r:
         for raw in r:
             line = raw.decode("utf-8", "replace").strip()
@@ -95,6 +97,7 @@ def stream_chat(name, prompt, *, session_id, max_tokens, timeout):
                 first_chunk_s = time.time() - started
             if piece:
                 chars += len(piece)
+                output_parts.append(piece)
             chunks += 1
     client_elapsed = time.time() - started
     deadline = time.time() + 60
@@ -109,6 +112,7 @@ def stream_chat(name, prompt, *, session_id, max_tokens, timeout):
     prepare = last.get("prompt_cache_prepare") or pc.get("last_prepare_event") or {}
     ks = h.get("kernel_stats") or {}
     gd = h.get("generation_defaults") or {}
+    output_text = "".join(output_parts)
     return {
         "name": name,
         "session_id": session_id,
@@ -116,6 +120,8 @@ def stream_chat(name, prompt, *, session_id, max_tokens, timeout):
         "client_ttft_s": round(first_chunk_s or 0.0, 3),
         "chunks": chunks,
         "chars": chars,
+        "output_sha256": hashlib.sha256(output_text.encode("utf-8")).hexdigest(),
+        "output_text": output_text[:500],
         "server_prompt_tokens": last.get("prompt_tokens"),
         "server_prompt_tps": last.get("prompt_tps"),
         "server_ttft_s": last.get("first_token_s"),
@@ -151,6 +157,7 @@ def main():
     global BASE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default=BASE)
+    parser.add_argument("--model", default="Minimax-M3-No-Think")
     parser.add_argument("--records", type=int, default=1200)
     parser.add_argument("--steps", default="4096,5120,6144")
     parser.add_argument("--max-tokens", type=int, default=32)
@@ -173,6 +180,7 @@ def main():
             row = stream_chat(
                 f"prefill_step_{step}",
                 prompt,
+                model=args.model,
                 session_id=f"{prefix}-{step}",
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,

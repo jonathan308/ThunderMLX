@@ -2546,6 +2546,8 @@ async def models():
             item.setdefault("object", "model")
             item["owned_by"] = item.get("owned_by") or source
             item["gateway_backend"] = "m3" if model_id in M3_MODEL_IDS else "omlx"
+            if model_id in M3_MODEL_IDS:
+                item.setdefault("max_model_len", ADVERTISED_MAX_MODEL_LEN)
             data.append(item)
             seen.add(model_id)
     for model_id in sorted(M3_MODEL_IDS):

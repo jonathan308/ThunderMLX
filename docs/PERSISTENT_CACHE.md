@@ -43,6 +43,18 @@ reboot.
 - `MLX_M3_PROMPT_CACHE_SSD=0`: opt-in master switch.
 - `MLX_M3_PROMPT_CACHE_SSD_RESTORE=0`: separate restore gate. Enable only after
   save-only artifacts are validated across both ranks.
+- `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE=0`: save complete eligible cache states
+  automatically after successful turns.
+- `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS=8192`: coalesce large
+  rewrites until the durable checkpoint advances by this many tokens.
+- `MLX_M3_PROMPT_CACHE_SSD_APPEND_RESERVE_TOKENS=4096`: maximum spare append
+  window recreated on restore; rank-specific `_RANK0` and `_RANK1` overrides
+  can reflect asymmetric memory headroom.
+- `MLX_M3_BATCH_APPEND_RESERVE_TOKENS=4096`: matching bounded reserve for the
+  single-cache to cancellable batch-cache bridge, also with rank overrides.
+- `MLX_M3_PROMPT_CACHE_SSD_SAVE_RESERVE_TOKENS=0`: spare backing retained in a
+  new SSD artifact. Zero stores logical KV contents only; restore recreates the
+  bounded live append window.
 - `MLX_M3_PROMPT_CACHE_SSD_DIR=~/.cache/thundermlx/prompt-kv`: default storage
   root used locally by each rank.
 - `MLX_M3_PROMPT_CACHE_SSD_DIR_RANK0=`: optional rank-0 KV-cache artifact root.
@@ -101,16 +113,32 @@ cap.
 
 ## Serialization
 
-MiniMax-M3 cache objects expose `state`:
+MiniMax-M3 cache objects expose a logical `state`, but MLX intentionally slices
+that state to the current token offset. Persisting the sliced view makes a
+restored cache exactly full. The next suffix or decode token can then reallocate
+and copy the entire long-context KV tensor on every layer.
 
-- KV state: keys and values arrays from `KVCache`
-- MSA index state: sparse index-key arrays from `MiniMaxM3KVCache`
+SSD schema v3 therefore stores:
 
-MLX can write arrays with `mx.save_safetensors()` and load them with `mx.load()`.
-Use one file per layer to keep failures localized and to avoid very large single
-files. After loading, assign the restored tuple back through each cache object's
-`state` setter, then run `mx.eval([c.state for c in cache])` before marking the
-cache resident.
+- explicit KV/MSA backing arrays, cropped to logical contents plus only the
+  configured save reserve (zero by default)
+- logical KV and MSA index offsets separately from physical capacity
+- per-layer backing layout metadata
+- the normal model, tokenizer, runtime, split, rank, shape, and dtype metadata
+
+MLX writes one safetensors file per layer. Restore installs and materializes one
+layer at a time so a 350k cache does not retain both every source tensor and
+every padded destination tensor at once. It crops inherited spare capacity,
+then pads only to the request length plus a bounded rank-aware append reserve;
+`max_tokens` remains an output safety ceiling rather than a prediction of how
+much KV capacity every layer must preallocate. The single-to-batch and
+batch-to-single bridge carries backing arrays and logical offsets directly
+instead of routing through sliced `state`, while its conversion target uses the
+same bounded policy. The batch cache keeps MLX's native 256-token growth
+cadence.
+
+Schema-v1/v2 artifacts safely miss after this change. Rebuild them under schema
+v3 rather than attempting an ambiguous migration.
 
 ## Validation Gates
 
@@ -207,6 +235,25 @@ Repeatable validation lives in `probes/m3_persistent_cache_probe.py`:
     correctly.
   Both gates ran with SSD restore enabled, RAM cache reset before restore, and
   `0` failed requests.
+- The schema-v2 precursor capacity gate passed on 2026-07-12 with a real
+  `353,608`-token
+  agent/tool prompt. Cold prefill measured `273.56 prompt tok/s` and
+  `19.96 decode tok/s`. The completed cache retained `354,048` physical slots
+  for `354,003` logical tokens, saved locally on both ranks, cleared from RAM,
+  and restored `354,003/354,039` prompt tokens. Restore reserved `356,352`
+  slots, left `2,291` spare after the follow-up, answered correctly at
+  `20.96 decode tok/s`, and kept failures at `0`. Clearing live RAM afterward
+  returned wired memory to `6.5 GB` on the Studio rank and `3.0 GB` on the
+  MacBook rank without a reboot or orphan.
+- The final schema-v3 gate stores logical capacity by default and restores a
+  bounded append window instead of carrying a request's full output ceiling on
+  every layer. Under the final runtime fingerprint, no-thinking saved 46,588
+  tokens and restored `46,588/46,625` (`99.92%`) with `0.86s` server TTFT and
+  `26.49 decode tok/s`. A thinking/tool-shaped cache saved 47,366 tokens and
+  restored `47,366/48,293` (`98.08%`). Its intentionally tiny first attempt
+  exercised the bounded 4k internal tool-recovery budget; the capacity probe
+  distinguishes that explicit bound from the rejected behavior that reserved
+  the full 32k global output ceiling. Both modes ended with zero failures.
 - The final safety patch changed the runtime fingerprint, so older durable
   artifacts may safely miss with a runtime mismatch. Rebuild/save under the
   current fingerprint when you need a specific long session to restore from SSD.
@@ -224,3 +271,8 @@ Repeatable validation lives in `probes/m3_persistent_cache_probe.py`:
   restore is soaked.
 - Do not make SSD restore part of `/v1/stop`; interrupted generation should not
   write partial or unverified caches.
+- Do not copy the single-cache 4096-token allocation step into `BatchKVCache`.
+  A controlled 350k experiment reached about 315k tokens and triggered an M5
+  IOGPUFamily `completeMemory() prepare count underflow` kernel panic despite
+  healthy swap/compressor state and remaining memory headroom. Preserve backing
+  capacity explicitly while retaining the native 256-token batch allocator.

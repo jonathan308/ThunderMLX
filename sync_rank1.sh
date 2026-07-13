@@ -32,6 +32,7 @@ fi
 
 FILES=(
   .env.example
+  bin/mlx-python
   LICENSE
   README.md
   M3_Start.command
@@ -52,7 +53,8 @@ FILES=(
   sync_rank1.sh
 )
 
-ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" "mkdir -p '$CLUSTER'" >/dev/null
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
+  "mkdir -p '$CLUSTER' '$CLUSTER/bin'" >/dev/null
 for f in "${FILES[@]}"; do
   if [[ -f "$CLUSTER/$f" ]]; then
     scp -o BatchMode=yes -o ConnectTimeout=10 \
@@ -84,5 +86,5 @@ if [[ -d "$CLUSTER/MSA Support" ]]; then
 fi
 
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
-  "chmod +x '$CLUSTER/M3_Start.command' '$CLUSTER/M3_Stop.command' '$CLUSTER/launch_cluster.sh' '$CLUSTER/stop_cluster.sh' '$CLUSTER/auto_restart.sh' '$CLUSTER/sync_rank1.sh' '$CLUSTER/cluster_gui.py' '$CLUSTER/m3_warmup.py'; find '$CLUSTER/probes' '$CLUSTER/tools' '$CLUSTER/scripts' -type f \\( -name '*.py' -o -name '*.sh' \\) -exec chmod +x {} + 2>/dev/null || true; rm -rf '$CLUSTER/__pycache__' '$CLUSTER/probes/__pycache__' '$CLUSTER/tools/__pycache__'" \
+  "chmod +x '$CLUSTER/bin/mlx-python' '$CLUSTER/M3_Start.command' '$CLUSTER/M3_Stop.command' '$CLUSTER/launch_cluster.sh' '$CLUSTER/stop_cluster.sh' '$CLUSTER/auto_restart.sh' '$CLUSTER/sync_rank1.sh' '$CLUSTER/cluster_gui.py' '$CLUSTER/m3_warmup.py'; find '$CLUSTER/probes' '$CLUSTER/tools' '$CLUSTER/scripts' -type f \\( -name '*.py' -o -name '*.sh' \\) -exec chmod +x {} + 2>/dev/null || true; rm -rf '$CLUSTER/__pycache__' '$CLUSTER/probes/__pycache__' '$CLUSTER/tools/__pycache__'" \
   >/dev/null

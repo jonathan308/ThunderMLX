@@ -4,7 +4,8 @@ Compares CUSTOM MSA kernels (score-matrix build, topk/mask, sparse attention)
 vs STOCK qmm GEMMs (attn projections + MoE gather_qmm) at model shapes.
 Synthetic tensors only. rank0 (M3 Ultra). Keeps peak mem well under 20GB.
 """
-import os, sys, time, importlib.util, gc, json
+import os, time, importlib.util, gc, json
+from pathlib import Path
 
 os.environ.setdefault("MLX_M3_MSA_PREFILL", "1")
 os.environ.setdefault("MLX_M3_KERNEL_STATS", "1")
@@ -14,13 +15,13 @@ os.environ.setdefault("MLX_M3_MSA_PREFILL_BLOCKWISE_TOPK_BLOCK_CHUNK", "2")
 
 import mlx.core as mx
 
-MSA_PATH = "~/ThunderMLX-eagle3/MSA Support/mlx_vlm/models/minimax_m3_vl/msa.py"
+ROOT = Path(__file__).resolve().parents[3]
+MSA_PATH = ROOT / "MSA Support/mlx_vlm/models/minimax_m3_vl/msa.py"
 spec = importlib.util.spec_from_file_location("m3_msa", MSA_PATH)
 M = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(M)
 
 # installed mlx_vlm switch layers for the MoE qmm proxy
-sys.path.append("~/mlx-vlm064-env/lib/python3.14/site-packages")
 from mlx_vlm.models.switch_layers import SwitchLinear
 
 DT = mx.bfloat16
