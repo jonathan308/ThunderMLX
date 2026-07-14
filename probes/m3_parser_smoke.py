@@ -40,6 +40,7 @@ from sharded_server import (
     _bound_large_file_write_arguments,
     _buffered_tool_reasoning,
     _remaining_tool_reasoning,
+    _require_alternate_work_tool,
     _date_context_for_session,
     _arm_rank0_semantic_eos,
     _filter_looping_control_tools,
@@ -59,6 +60,7 @@ from sharded_server import (
     _tool_retry_recovery_hint,
     _tool_write_early_stop_chars,
     _tool_loop_steering_diag,
+    _tool_loop_steering_text,
     _usable_tool_turn,
     _parse_tool_calls,
     _prompt_cache_allowed_for_generation,
@@ -1982,6 +1984,69 @@ def check_repeated_exec_command_keeps_tool_schema_stable():
     assert names == [], names
     remaining = [item["function"]["name"] for item in filtered]
     assert remaining == ["exec_command", "apply_patch"], remaining
+
+
+def check_repeated_write_loop_requires_a_different_work_tool():
+    import sharded_server as server
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in ("Write", "Edit", "Bash", "Read")
+    ]
+    looped = [{"role": "user", "content": "Build the guide in sections."}]
+    for index in range(3):
+        call_id = f"write-{index}"
+        looped.extend([
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "Write",
+                        "arguments": {
+                            "file_path": "/tmp/guide.html",
+                            "content": (
+                                "<!doctype html><main></main>"
+                                "<!-- THUNDERMLX_CONTINUE -->"
+                            ),
+                        },
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": "File written successfully",
+            },
+        ])
+
+    previous = server.TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS
+    try:
+        server.TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS = {"Write"}
+        diag = _tool_loop_steering_diag(looped, tools)
+        assert diag and "repeated_command" in diag["reasons"], diag
+        filtered, names = _filter_looping_control_tools(tools, diag)
+        assert names == ["Write"], names
+        remaining = [item["function"]["name"] for item in filtered]
+        assert remaining == ["Edit", "Bash", "Read"], remaining
+        request = {"tool_choice": "auto"}
+        assert _require_alternate_work_tool(request, filtered, names), request
+        assert request["tool_choice"] == "required", request
+        assert request["_tool_loop_required_alternate"] is True, request
+        diag["filtered_tools"] = names
+        hint = _tool_loop_steering_text(diag)
+        assert "different available tool" in hint, hint
+        assert "repeat Write" in hint, hint
+    finally:
+        server.TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS = previous
 
 
 def check_repeated_exec_command_eventually_forces_final_answer():
@@ -4315,6 +4380,7 @@ def main():
     check_targeted_repeated_tool_breaker_is_scoped()
     check_repeated_control_tool_filter_keeps_work_tools()
     check_repeated_exec_command_keeps_tool_schema_stable()
+    check_repeated_write_loop_requires_a_different_work_tool()
     check_repeated_exec_command_eventually_forces_final_answer()
     check_identical_command_result_loop_forces_final_only_when_unchanged()
     check_repeated_apply_patch_keeps_tool_schema_stable()

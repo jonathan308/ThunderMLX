@@ -7686,6 +7686,26 @@ def _filter_looping_control_tools(tools, diag):
     return filtered_tools, sorted(filter_names)
 
 
+def _require_alternate_work_tool(request, tools, filtered_names):
+    """Require one different tool after filtering an exact repeated action.
+
+    Leaving ``tool_choice=auto`` lets the model answer that no write tool is
+    available even when Edit/Bash remain in the native client schema. Only an
+    evidence-gated repeated *work* tool enters this path; ordinary turns and
+    control-tool loop filtering keep their original OpenAI semantics.
+    """
+    if not isinstance(request, dict) or not tools or not filtered_names:
+        return False
+    filtered_work_tools = (
+        set(filtered_names) & TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS
+    )
+    if not filtered_work_tools:
+        return False
+    request["tool_choice"] = "required"
+    request["_tool_loop_required_alternate"] = True
+    return True
+
+
 def _tool_working_directory_from_messages(processed_messages):
     """Extract an explicit client-provided working directory, if present.
 
@@ -17595,6 +17615,14 @@ def run_http_server(model, processor, rank):
                 if filtered_control_tools:
                     tool_loop_diag["filtered_tools"] = filtered_control_tools
                     request["_tool_source"] = "tools_control_loop_filtered"
+                    if _require_alternate_work_tool(
+                        request,
+                        tools,
+                        filtered_control_tools,
+                    ):
+                        request["_tool_source"] = (
+                            "tools_repeated_work_filtered_required"
+                        )
             request["_tool_loop_steering"] = tool_loop_diag
             logger.warning(
                 "tool-loop steering hint active "
