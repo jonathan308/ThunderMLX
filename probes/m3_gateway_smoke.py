@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT))
 import model_gateway as gateway  # noqa: E402
 from model_gateway import (  # noqa: E402
     DEFAULT_MODEL_ID,
+    _normalize_session_title,
+    _normalize_session_title_sse,
     _responses_model_prefers_reasoning_heartbeat,
     backend_for_model,
     canonical_m3_model_id,
@@ -97,6 +99,79 @@ def check_zcode_title_sidecar_is_short_and_visible():
     assert "metadata, not an action" in payload["messages"][0]["content"], payload
     assert "Build an interactive transformer demo." in payload["messages"][1]["content"], payload
     assert "Output only the title" in payload["messages"][1]["content"], payload
+
+
+def check_opencode_title_sidecar_is_short_streaming_and_single():
+    body, model, changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3-No-Think",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a title generator. You output ONLY a thread title.",
+                },
+                {
+                    "role": "user",
+                    "content": "Generate a title for this conversation:\n",
+                },
+                {
+                    "role": "user",
+                    "content": "Download Gemma weights for a local inference server.",
+                },
+            ],
+            "stream": True,
+            "max_tokens": 32000,
+        }).encode("utf-8")
+    )
+    payload = json.loads(body)
+    assert changed is True, payload
+    assert model == "Minimax-M3-No-Think", payload
+    assert payload["thinking_mode"] == "disabled", payload
+    assert payload["max_tokens"] == 24, payload
+    assert payload["temperature"] == 0, payload
+    assert payload["stream"] is True, payload
+    assert len(payload["messages"]) == 2, payload
+    assert "exactly one" in payload["messages"][0]["content"], payload
+    assert "Download Gemma weights" in payload["messages"][1]["content"], payload
+    assert "Generate a title for this conversation" not in payload["messages"][1]["content"], payload
+
+    long_title = _normalize_session_title(
+        "Test Fixture: Probe Format Function with List Input and Self-Check Assertions"
+    )
+    assert len(long_title) <= 50, long_title
+    assert len(long_title.split()) <= 7, long_title
+
+    clipped_title = _normalize_session_title(
+        "Add summarize_bounds helper to opencode_gui_probe.py with dictionary return"
+    )
+    assert clipped_title == "Add summarize_bounds helper", clipped_title
+
+    multi_title = _normalize_session_title(
+        "Here are a few title options for this conversation:\n"
+        "1. Debugging OpenCode title generation\n"
+        "2. Improving background labels"
+    )
+    assert multi_title == "Debugging OpenCode title generation", multi_title
+
+    raw = b"".join([
+        b'data: {"id":"title-1","object":"chat.completion.chunk","created":1,"model":"Qwen","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+        b'data: {"id":"title-1","object":"chat.completion.chunk","created":1,"model":"Qwen","choices":[{"index":0,"delta":{"content":"Here is a thinking process:"},"finish_reason":null}]}\n\n',
+        b'data: [DONE]\n\n',
+    ])
+    normalized = _normalize_session_title_sse(raw, payload).decode("utf-8")
+    assert "Here is a thinking process" not in normalized, normalized
+    assert "Download Gemma weights local inference server" in normalized, normalized
+    assert normalized.endswith("data: [DONE]\n\n"), normalized
+
+    qwen_raw = b"".join([
+        b'data: {"id":"title-2","object":"chat.completion.chunk","created":0,"model":"keepalive","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n',
+        b'data: {"id":"title-2","object":"chat.completion.chunk","created":0,"model":"keepalive","choices":[{"index":0,"delta":{"content":"**Analyze User Input:**\\n- **Input Request:**"},"finish_reason":null}]}\n\n',
+        b'data: [DONE]\n\n',
+    ])
+    qwen_normalized = _normalize_session_title_sse(qwen_raw, payload).decode("utf-8")
+    assert "Analyze User Input" not in qwen_normalized, qwen_normalized
+    assert '"model": "Minimax-M3-No-Think"' in qwen_normalized, qwen_normalized
+    assert "Download Gemma weights local inference server" in qwen_normalized, qwen_normalized
 
 
 def check_unknown_models_cannot_trigger_an_omlx_switch():
@@ -295,6 +370,7 @@ def main():
     check_explicit_omlx_model_is_preserved()
     check_m3_case_and_path_aliases_are_canonicalized()
     check_zcode_title_sidecar_is_short_and_visible()
+    check_opencode_title_sidecar_is_short_streaming_and_single()
     check_unknown_models_cannot_trigger_an_omlx_switch()
     check_responses_heartbeat_model_selection()
     check_thinking_heartbeat_keeps_reasoning_separate()

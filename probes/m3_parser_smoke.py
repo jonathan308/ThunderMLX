@@ -2058,6 +2058,90 @@ def check_repeated_write_loop_requires_a_different_work_tool():
         server.TOOL_LOOP_FILTER_REPEATED_WORK_TOOLS = previous
 
 
+def check_exact_successful_mutation_is_blocked_without_hiding_tools():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    arguments = {
+        "file_path": "/tmp/guide.html",
+        "content": "<!doctype html><main>Native tools</main>",
+    }
+    prior_call = {
+        "id": "write-success",
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "arguments": json.dumps(arguments),
+        },
+    }
+    completed = [
+        {"role": "user", "content": "Create the guide."},
+        {"role": "assistant", "content": None, "tool_calls": [prior_call]},
+        {
+            "role": "tool",
+            "tool_call_id": "write-success",
+            "content": "File written successfully",
+        },
+    ]
+    duplicate, dropped, names = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {"name": "Write", "arguments": arguments},
+        }],
+        tools,
+        return_dropped=True,
+        return_dropped_names=True,
+        processed_messages=completed,
+    )
+    assert duplicate == [], duplicate
+    assert dropped == 1, dropped
+    assert names == ["Write"], names
+
+    changed, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "arguments": {**arguments, "content": "new content"},
+            },
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=completed,
+    )
+    assert dropped == 0 and len(changed) == 1, (changed, dropped)
+
+    failed = [
+        *completed[:-1],
+        {
+            "role": "tool",
+            "tool_call_id": "write-success",
+            "content": "Error: permission denied",
+        },
+    ]
+    retry, dropped = _validate_outgoing_tool_calls(
+        [{
+            "type": "function",
+            "function": {"name": "Write", "arguments": arguments},
+        }],
+        tools,
+        return_dropped=True,
+        processed_messages=failed,
+    )
+    assert dropped == 0 and len(retry) == 1, (retry, dropped)
+
+
 def check_repeated_exec_command_eventually_forces_final_answer():
     tools = [
         {
@@ -2773,6 +2857,24 @@ def check_function_syntax_invoke_recovers_read():
     assert len(body_calls) == 1, body_calls
     assert body_calls[0]["function"]["name"] == "read", body_calls
     assert json.loads(body_calls[0]["function"]["arguments"]) == {
+        "filePath": path,
+    }
+
+    live_drift = (
+        f"{ns}<tool_call>"
+        f"{ns}<invoke>read_file>\n"
+        f"<path>{path}</path>\n"
+        f"</invoke_file>"
+        f"{ns}</tool_call>"
+    )
+    live_calls, _ = _parse_tool_calls(
+        live_drift,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert len(live_calls) == 1, live_calls
+    assert live_calls[0]["function"]["name"] == "read", live_calls
+    assert json.loads(live_calls[0]["function"]["arguments"]) == {
         "filePath": path,
     }
 
@@ -4182,6 +4284,64 @@ def check_malformed_apply_patch_simple_write_synthesizes_exec():
     assert "/Users/example/Desktop/test.txt" in args["cmd"], args
 
 
+def check_legacy_bare_question_recovers_free_form_prompt():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "question",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string"},
+                                "header": {"type": "string"},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string"},
+                                            "description": {"type": "string"},
+                                        },
+                                        "required": ["label", "description"],
+                                    },
+                                },
+                                "multiple": {"type": "boolean"},
+                            },
+                            "required": ["question", "header", "options"],
+                        },
+                    },
+                },
+                "required": ["questions"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    text = (
+        f"{ns}<tool_call>\n"
+        f"{ns}<invoke>\n"
+        f"{ns}<question>How should I download the weights?{ns}</question>\n"
+        f"{ns}</invoke>\n"
+        f"{ns}</tool_call>"
+    )
+    calls, _ = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, (calls, validated)
+    assert validated[0]["function"]["name"] == "question", validated
+    args = json.loads(validated[0]["function"]["arguments"])
+    assert args == {
+        "questions": [{
+            "question": "How should I download the weights?",
+            "header": "How should I download",
+            "options": [],
+        }],
+    }, args
+
+
 def check_semantic_decode_stop_is_rank0_owned():
     original = dict(_FORCE_EOS)
     original_batch = dict(_BATCH_PATH_ACTIVE)
@@ -4390,6 +4550,7 @@ def main():
     check_repeated_control_tool_filter_keeps_work_tools()
     check_repeated_exec_command_keeps_tool_schema_stable()
     check_repeated_write_loop_requires_a_different_work_tool()
+    check_exact_successful_mutation_is_blocked_without_hiding_tools()
     check_repeated_exec_command_eventually_forces_final_answer()
     check_identical_command_result_loop_forces_final_only_when_unchanged()
     check_repeated_apply_patch_keeps_tool_schema_stable()
@@ -4425,6 +4586,7 @@ def main():
     check_tool_stop_on_valid_or_complete_invalid_tool_call()
     check_invalid_apply_patch_stops_decode_without_emitting_tool()
     check_malformed_apply_patch_simple_write_synthesizes_exec()
+    check_legacy_bare_question_recovers_free_form_prompt()
     check_semantic_decode_stop_is_rank0_owned()
     check_bash_rejects_source_and_numeric_fragments()
     check_ssd_restore_append_capacity_is_bounded()

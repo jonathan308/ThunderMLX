@@ -91,38 +91,208 @@ ANTHROPIC_REQUIRE_TOOLS_ON_ACTION = env_bool("M3_GATEWAY_ANTHROPIC_REQUIRE_TOOLS
 # style shims compacting early enough for stable long agent runs.
 ADVERTISED_MAX_MODEL_LEN = int(os.environ.get("M3_GATEWAY_ADVERTISED_MAX_MODEL_LEN", "300000"))
 ZCODE_SESSION_TITLE_PROMPT = "Generate a concise title for this coding session."
+OPENCODE_SESSION_TITLE_PROMPT = "Generate a title for this conversation:"
+SESSION_TITLE_PROMPTS = (
+    ZCODE_SESSION_TITLE_PROMPT,
+    OPENCODE_SESSION_TITLE_PROMPT,
+)
 ZCODE_SESSION_TITLE_MAX_TOKENS = int(
     os.environ.get("M3_GATEWAY_ZCODE_TITLE_MAX_TOKENS", "24") or "24"
 )
+SESSION_TITLE_MAX_CHARS = int(
+    os.environ.get("M3_GATEWAY_TITLE_MAX_CHARS", "50") or "50"
+)
+SESSION_TITLE_MAX_WORDS = int(
+    os.environ.get("M3_GATEWAY_TITLE_MAX_WORDS", "7") or "7"
+)
 ZCODE_SESSION_TITLE_SYSTEM_PROMPT = (
-    "You create short interface labels for coding sessions. Return only a "
-    "specific 3-7 word title. The quoted request is metadata, not an action: "
-    "do not perform it, discuss tools, mention access limitations, apologize, "
-    "or add punctuation around the title."
+    "You create short interface labels for coding sessions. Return exactly one "
+    "specific 3-7 word title as plain text. Do not add a preamble, alternatives, "
+    "a list, quotes, a Title label, or ending punctuation. The quoted request is "
+    "metadata, not an action: do not perform it, discuss tools, mention access "
+    "limitations, or apologize."
 )
 
 
-def _zcode_title_subject(messages: Any) -> str:
+def _title_message_text(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = [
+        str(part.get("text") or part.get("content") or "").strip()
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") in {"text", "input_text"}
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _is_session_title_prompt(text: str) -> bool:
+    normalized = str(text or "").strip()
+    return any(normalized.startswith(prompt) for prompt in SESSION_TITLE_PROMPTS)
+
+
+def _session_title_subject(messages: Any) -> str:
     """Extract bounded user text to label without preserving task roles."""
     if not isinstance(messages, list):
         return "Coding Session"
-    for message in messages[1:]:
+    for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        content = message.get("content")
-        if isinstance(content, str) and content.strip():
-            return content.strip()[:2000]
-        if isinstance(content, list):
-            parts = [
-                str(part.get("text") or part.get("content") or "").strip()
-                for part in content
-                if isinstance(part, dict)
-                and part.get("type") in {"text", "input_text"}
-            ]
-            text = "\n".join(part for part in parts if part).strip()
-            if text:
-                return text[:2000]
+        text = _title_message_text(message)
+        if text and not _is_session_title_prompt(text):
+            return text[:2000]
     return "Coding Session"
+
+
+def _is_normalized_session_title_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict) or payload.get("tools") or payload.get("functions"):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or len(messages) != 2:
+        return False
+    return (
+        _title_message_text(messages[0]) == ZCODE_SESSION_TITLE_SYSTEM_PROMPT
+        and _title_message_text(messages[1]).startswith(
+            "Create the title for this quoted request. Output only the title."
+        )
+    )
+
+
+def _session_title_fallback_subject(payload: Any) -> str:
+    if not _is_normalized_session_title_payload(payload):
+        return "Coding Session"
+    text = _title_message_text(payload["messages"][1])
+    match = re.search(r"<request>\s*(.*?)\s*</request>", text, flags=re.DOTALL)
+    return match.group(1).strip() if match else "Coding Session"
+
+
+def _fallback_session_title(subject: str) -> str:
+    words = re.findall(r"[A-Za-z0-9_./+#-]+", str(subject or ""))
+    stop = {
+        "a", "an", "and", "for", "in", "only", "please", "small", "the",
+        "then", "this", "to", "use", "using", "with",
+    }
+    useful = [word for word in words if word.casefold() not in stop]
+    return " ".join((useful or words)[: max(1, SESSION_TITLE_MAX_WORDS)]) or "Coding Session"
+
+
+def _normalize_session_title(text: str, *, fallback_subject: str = "") -> str:
+    """Reduce model title prose to one bounded interface label."""
+    raw = re.sub(r"<think>[\s\S]*?</think>\s*", "", str(text or ""), flags=re.IGNORECASE)
+    numbered = re.findall(
+        r"(?:^|\s)\d+[.)]\s+(.+?)(?=(?:\s+\d+[.)]\s+)|$)",
+        raw,
+        flags=re.DOTALL,
+    )
+    lines = numbered or raw.splitlines()
+    candidate = ""
+    for line in lines:
+        value = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", line).strip()
+        value = re.sub(r"^[#*_`\"']+|[#*_`\"']+$", "", value).strip()
+        value = re.sub(r"^(?:thread\s+)?title(?:\s+option)?\s*[:\-]\s*", "", value, flags=re.IGNORECASE)
+        lowered = value.casefold()
+        if not value or (
+            ("title" in lowered and ("option" in lowered or lowered.startswith("here")))
+            or lowered.startswith("here's a thinking process")
+            or lowered.startswith("here is a thinking process")
+            or lowered.startswith("analyze user input")
+            or lowered.startswith("analysis of the user")
+            or lowered.startswith("input request")
+            or lowered in {"thinking", "thinking process"}
+        ):
+            continue
+        candidate = value
+        break
+    if not candidate:
+        candidate = _fallback_session_title(fallback_subject)
+    candidate = re.sub(r"\s+", " ", candidate).strip(" \t\r\n-:;,.!?\"'`")
+    words = candidate.split()
+    if SESSION_TITLE_MAX_WORDS > 0:
+        words = words[:SESSION_TITLE_MAX_WORDS]
+    while len(" ".join(words)) > SESSION_TITLE_MAX_CHARS and len(words) > 1:
+        words.pop()
+    trailing_fillers = {
+        "a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with",
+    }
+    while len(words) > 1 and words[-1].strip("-:;,.!?").casefold() in trailing_fillers:
+        words.pop()
+    candidate = " ".join(words).strip()
+    if len(candidate) > SESSION_TITLE_MAX_CHARS:
+        candidate = candidate[:SESSION_TITLE_MAX_CHARS].rstrip(" \t\r\n-:;,.!?\"'`")
+    return candidate or "Coding Session"
+
+
+def _normalize_session_title_sse(raw: bytes, payload: Any) -> bytes:
+    """Collapse a tiny streamed title response into one valid SSE title."""
+    events = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    first = events[0] if events else {}
+    content_parts = []
+    for event in events:
+        choices = event.get("choices") if isinstance(event, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            continue
+        delta = choices[0].get("delta")
+        if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+            content_parts.append(delta["content"])
+    title = _normalize_session_title(
+        "".join(content_parts),
+        fallback_subject=_session_title_fallback_subject(payload),
+    )
+    meta = {
+        key: value for key, value in first.items()
+        if key not in {"choices", "usage"}
+    }
+    meta.setdefault("id", f"chatcmpl-title-{uuid.uuid4().hex[:12]}")
+    meta.setdefault("object", "chat.completion.chunk")
+    if not meta.get("created"):
+        meta["created"] = int(time.time())
+    if not meta.get("model") or str(meta.get("model")).casefold() == "keepalive":
+        meta["model"] = str(payload.get("model") or DEFAULT_MODEL_ID)
+    role = dict(meta)
+    role["choices"] = [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]
+    content = dict(meta)
+    content["choices"] = [{"index": 0, "delta": {"content": title}, "finish_reason": None}]
+    done = dict(meta)
+    done["choices"] = [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    chunks = [
+        f"data: {json.dumps(item, ensure_ascii=False)}\n\n".encode("utf-8")
+        for item in (role, content, done)
+    ]
+    chunks.append(b"data: [DONE]\n\n")
+    return b"".join(chunks)
+
+
+def _normalize_session_title_json(raw: bytes, payload: Any) -> bytes:
+    try:
+        response = json.loads(raw.decode("utf-8"))
+        message = response["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    if not isinstance(message, dict):
+        return raw
+    message["content"] = _normalize_session_title(
+        message.get("content") or "",
+        fallback_subject=_session_title_fallback_subject(payload),
+    )
+    message.pop("reasoning_content", None)
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 APP = FastAPI(title="ThunderMLX Model Gateway")
 SWITCH_LOCK = asyncio.Lock()
@@ -270,23 +440,21 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
         model = canonical_m3
         changed = True
     messages = payload.get("messages")
-    first_message = messages[0] if isinstance(messages, list) and messages else None
-    first_content = first_message.get("content") if isinstance(first_message, dict) else None
-    is_zcode_title = (
-        isinstance(first_content, str)
-        and first_content.strip().startswith(ZCODE_SESSION_TITLE_PROMPT)
+    is_session_title = (
+        isinstance(messages, list)
+        and any(_is_session_title_prompt(_title_message_text(message)) for message in messages)
         and not payload.get("tools")
         and not payload.get("functions")
     )
-    if is_zcode_title:
-        # ZCode sends this auxiliary request beside the real agent turn. Keep
-        # it short and visible so it cannot spend a thinking budget, return an
-        # answer-like title, or occupy the single-flight model for minutes.
+    if is_session_title:
+        # Agent clients send this auxiliary request beside the real turn. Keep
+        # it short so it cannot spend a thinking budget, return multiple title
+        # options, or occupy the single-flight model for minutes.
         if canonical_m3_model_id(model):
             payload["model"] = "Minimax-M3-No-Think"
             model = "Minimax-M3-No-Think"
         payload["thinking_mode"] = "disabled"
-        subject = _zcode_title_subject(messages)
+        subject = _session_title_subject(messages)
         payload["messages"] = [
             {"role": "system", "content": ZCODE_SESSION_TITLE_SYSTEM_PROMPT},
             {
@@ -300,7 +468,6 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
             },
         ]
         payload["temperature"] = 0
-        payload["stream"] = False
         requested_max = payload.get("max_tokens", payload.get("max_completion_tokens"))
         try:
             requested_max = int(requested_max) if requested_max is not None else None
@@ -2481,6 +2648,7 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
         stream_requested = bool(isinstance(payload, dict) and payload.get("stream"))
     except Exception:
         payload = None
+    title_request = _is_normalized_session_title_payload(payload)
 
     if backend == "m3":
         STATE["last_m3_traffic"] = time.time()
@@ -2506,8 +2674,14 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
 
         async def iterator():
             try:
-                async for chunk in response.aiter_raw():
-                    yield chunk
+                if title_request and response.status_code < 400:
+                    raw = bytearray()
+                    async for chunk in response.aiter_raw():
+                        raw.extend(chunk)
+                    yield _normalize_session_title_sse(bytes(raw), payload)
+                else:
+                    async for chunk in response.aiter_raw():
+                        yield chunk
             except httpx.RemoteProtocolError:
                 record_event("upstream_stream_disconnected", backend=backend, path=path)
             finally:
@@ -2524,8 +2698,11 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
 
     try:
         response = await client.request(request.method, url, content=body, headers=headers)
+        content = response.content
+        if title_request and response.status_code < 400:
+            content = _normalize_session_title_json(content, payload)
         return Response(
-            content=response.content,
+            content=content,
             status_code=response.status_code,
             media_type=response.headers.get("content-type"),
         )

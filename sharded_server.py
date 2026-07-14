@@ -310,13 +310,14 @@ TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS = int(
     ) or "0"
 )
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
-    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "8192") or "0"
+    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "65536") or "0"
 )
-# Aim well below the parser's hard ceiling. MiniMax otherwise treats the
-# advertised maximum as a target and frequently crosses it before emitting
-# the closing tool tag, turning every large-file step into a costly retry.
+# Leave room for a native, atomic file mutation while keeping it below the
+# normal 16k output-token ceiling. Agent clients differ substantially here:
+# some ask for focused edits while others emit one 40-60 KiB call. Both are
+# valid and should finish before compatibility recovery intervenes.
 _DEFAULT_TOOL_WRITE_CHUNK_TARGET_CHARS = (
-    min(4096, TOOL_WRITE_CHUNK_MAX_CHARS)
+    min(49152, TOOL_WRITE_CHUNK_MAX_CHARS)
     if TOOL_WRITE_CHUNK_MAX_CHARS > 0 else 0
 )
 TOOL_WRITE_CHUNK_TARGET_CHARS = int(
@@ -338,7 +339,7 @@ else:
 # regenerate the atomic call. This does not cap normal answers or completed
 # calls. 0 disables.
 TOOL_INCOMPLETE_CALL_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "8192") or "0"
+    os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "16384") or "0"
 )
 DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
@@ -8350,10 +8351,25 @@ def _tool_names_with_property(tools, property_name):
 def _infer_tool_name_from_body(attrs, body, tools, name_map):
     """Infer a missing malformed MiniMax <invoke ...> name from schema + args."""
     haystack = f"{attrs or ''}\n{body or ''}"
+    # OpenCode thinking output can lose only the name attribute and leave the
+    # legacy alias as the first body token, e.g. ``<invoke>read_file>``. Name
+    # that explicit schema alias before path-like text is mistaken for Bash.
+    body_name = re.match(
+        r"(?is)^\s*(?P<name>[A-Za-z_$][\w:.$-]*)\s*>",
+        body or "",
+    )
+    if body_name:
+        candidate = _canonical_tool_name(body_name.group("name"), name_map)
+        if candidate in _tool_names_from_schema(tools):
+            return candidate
     if re.search(r"</?(?:todos|todo)\b", haystack, flags=re.IGNORECASE):
         todo_tools = _tool_names_with_property(tools, "todos")
         if len(todo_tools) == 1:
             return todo_tools[0]
+    if re.search(r"<question\b", haystack, flags=re.IGNORECASE):
+        question_tools = _tool_names_with_property(tools, "questions")
+        if len(question_tools) == 1:
+            return question_tools[0]
     for match in re.finditer(r'\{\s*"name"\s*:\s*"(?P<name>(?:\\.|[^"])*)"', haystack):
         candidate = _canonical_tool_name(_loads_json_string_fragment(match.group("name")), name_map)
         if candidate:
@@ -9634,6 +9650,90 @@ def _tool_message_text(message):
             if isinstance(text, str):
                 parts.append(text)
     return "\n".join(parts)
+
+
+def _exact_mutation_fingerprint(tool_name, arguments):
+    """Hash one complete native file mutation without truncating its payload."""
+    normalized_name = re.sub(
+        r"[^a-z0-9]", "", str(tool_name or "").lower()
+    )
+    if (
+        normalized_name not in _MUTATING_FILE_TOOL_NAMES
+        or not isinstance(arguments, dict)
+    ):
+        return ""
+    try:
+        canonical = json.dumps(
+            arguments,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(
+        f"{normalized_name}\0{canonical}".encode("utf-8")
+    ).hexdigest()
+
+
+def _tool_result_is_failure(message):
+    """Recognize explicit client-side failures without guessing from prose."""
+    if not isinstance(message, dict):
+        return True
+    if message.get("is_error") is True or message.get("error"):
+        return True
+    status = str(message.get("status") or "").strip().lower()
+    if status in {"error", "failed", "failure", "cancelled", "canceled"}:
+        return True
+    text = _tool_message_text(message).strip()
+    return bool(re.search(
+        r"(?is)(?:^|\n)\s*(?:error|failed|failure|traceback|exception)\b|"
+        r"\b(?:permission denied|no such file|was not applied|did not match|"
+        r"could not find|tool call was not executed)\b",
+        text,
+    ))
+
+
+def _successful_exact_mutation_fingerprints(processed_messages):
+    """Return exact file mutations completed after the latest user request.
+
+    This is deliberately narrower than the general loop detector. It requires
+    an assistant call id, a matching non-error tool result, and byte-identical
+    canonical arguments. Distinct edits, retries after failures, and a later
+    user turn are untouched.
+    """
+    messages = processed_messages or []
+    latest_user_index = max(
+        (
+            index for index, message in enumerate(messages)
+            if isinstance(message, dict) and message.get("role") == "user"
+        ),
+        default=-1,
+    )
+    pending = {}
+    successful = set()
+    for message in messages[latest_user_index + 1:]:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "").strip()
+                fingerprint = _exact_mutation_fingerprint(
+                    _tool_call_name_for_loop(call),
+                    _tool_call_arguments_dict(call),
+                )
+                if call_id and fingerprint:
+                    pending[call_id] = fingerprint
+            continue
+        if message.get("role") not in {"tool", "function"}:
+            continue
+        call_id = str(message.get("tool_call_id") or "").strip()
+        fingerprint = pending.pop(call_id, "") if call_id else ""
+        if fingerprint and not _tool_result_is_failure(message):
+            successful.add(fingerprint)
+    return successful
 
 
 def _normalized_read_snapshot(text):
@@ -11076,6 +11176,17 @@ def _tool_retry_recovery_hint(
             continue
         arguments = _tool_call_arguments_dict(tool_call)
         required = set(_tool_schema_required_names(tools, name))
+        mutation_fingerprint = _exact_mutation_fingerprint(name, arguments)
+        if mutation_fingerprint in _successful_exact_mutation_fingerprints(
+            processed_messages
+        ):
+            return (
+                f"Tool-call recovery: this exact `{name}` action already "
+                "completed successfully in the current user turn. Do not "
+                "repeat it. Continue with a different advertised tool or "
+                "different arguments if more work is required; otherwise "
+                "provide the final answer from the completed result."
+            )
         oversized = _oversized_mutating_file_payload(name, arguments)
         if oversized:
             return _mutation_hint(
@@ -11772,6 +11883,9 @@ def _validate_outgoing_tool_calls(
         return ([], 0) if return_dropped else []
     name_map = _tool_name_map_from_schema(tools)
     allowed = set(name_map.values())
+    successful_mutations = _successful_exact_mutation_fingerprints(
+        processed_messages
+    )
     validated = []
     dropped = 0
     dropped_names = []
@@ -11962,6 +12076,17 @@ def _validate_outgoing_tool_calls(
                     repaired_python_command["source"],
                     repaired_python_command["target"],
                 )
+            mutation_fingerprint = _exact_mutation_fingerprint(name, decoded)
+            if mutation_fingerprint in successful_mutations:
+                logger.warning(
+                    "dropping exact duplicate %s mutation that already "
+                    "completed successfully in this user turn (path=%r)",
+                    name,
+                    _file_write_path(decoded),
+                )
+                dropped += 1
+                dropped_names.append(str(name))
+                continue
             decoded, oversized_write_chars = _bound_large_file_write_arguments(
                 name,
                 decoded,
@@ -12254,6 +12379,17 @@ def _validate_outgoing_tool_calls(
                 repaired_python_command["source"],
                 repaired_python_command["target"],
             )
+        mutation_fingerprint = _exact_mutation_fingerprint(name, decoded)
+        if mutation_fingerprint in successful_mutations:
+            logger.warning(
+                "dropping exact duplicate %s mutation that already completed "
+                "successfully in this user turn (path=%r)",
+                name,
+                _file_write_path(decoded),
+            )
+            dropped += 1
+            dropped_names.append(str(name))
+            continue
         decoded, oversized_write_chars = _bound_large_file_write_arguments(
             name,
             decoded,
@@ -12721,6 +12857,92 @@ def _labeled_json_array_args_from_body(raw_body, tools, name):
         except json.JSONDecodeError:
             return None
     return {prop: value} if isinstance(value, list) else None
+
+
+def _legacy_question_args_from_body(raw_body, ns_token, tools, name):
+    """Recover an explicit bare question as one schema-valid free-form prompt.
+
+    MiniMax occasionally emits ``<invoke><question>...</question></invoke>``
+    for OpenCode's declared question tool, omitting the outer ``questions``
+    array. The user-facing question is complete and atomic, but no answer
+    choices were emitted. Preserve that intent without inventing choices by
+    sending an empty options array; OpenCode then exposes its normal custom
+    answer field.
+    """
+    if not raw_body or not ns_token:
+        return None
+    specs = _tool_schema_property_specs(tools, name)
+    array_fields = [
+        (key, spec)
+        for key, spec in specs.items()
+        if re.sub(r"[^a-z0-9]", "", key.lower()) == "questions"
+        and isinstance(spec, dict)
+        and spec.get("type") == "array"
+        and isinstance(spec.get("items"), dict)
+        and spec["items"].get("type") == "object"
+    ]
+    if len(array_fields) != 1:
+        return None
+    field, array_spec = array_fields[0]
+    item_spec = array_spec.get("items") or {}
+    child_specs = item_spec.get("properties")
+    child_specs = child_specs if isinstance(child_specs, dict) else {}
+    if not child_specs:
+        return None
+    child_by_compact = {
+        re.sub(r"[^a-z0-9]", "", key.lower()): key
+        for key in child_specs
+    }
+    question_key = child_by_compact.get("question")
+    header_key = child_by_compact.get("header")
+    options_key = child_by_compact.get("options")
+    if not (question_key and header_key and options_key):
+        return None
+
+    def _tag_value(tag):
+        match = re.search(
+            rf"(?is)(?:{re.escape(ns_token)})?"
+            rf"<{re.escape(tag)}\b[^>]*>"
+            rf"(?P<value>.*?)"
+            rf"(?:{re.escape(ns_token)})?"
+            rf"</{re.escape(tag)}\s*>",
+            raw_body,
+        )
+        if match is None:
+            return ""
+        value = match.group("value").strip()
+        return value if value and "<" not in value and ">" not in value else ""
+
+    question = _tag_value("question")
+    if not question or len(question) > 2000:
+        return None
+    header = _tag_value("header")
+    if not header:
+        header_words = re.findall(r"[A-Za-z0-9_./+#-]+", question)[:4]
+        header = " ".join(header_words) or "Clarification"
+    header = header[:30].strip() or "Clarification"
+    item = {
+        question_key: question,
+        header_key: header,
+        options_key: [],
+    }
+    child_required = item_spec.get("required")
+    child_required = child_required if isinstance(child_required, list) else []
+    for child in child_required:
+        if not isinstance(child, str) or item.get(child) not in (None, ""):
+            continue
+        spec = child_specs.get(child)
+        expected = spec.get("type") if isinstance(spec, dict) else None
+        if expected == "boolean":
+            item[child] = False
+        elif expected == "array":
+            item[child] = []
+        else:
+            return None
+    args = {field: [item]}
+    if _tool_schema_type_mismatches(args, tools, name):
+        return None
+    return args
 
 
 def _arguments_from_ns_arg_tags(raw_body, ns_token, tools, name):
@@ -13853,6 +14075,44 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
                 prop for prop in path_props
                 if prop in _tool_schema_required_names(tools, name)
             ]
+            if (
+                len(required_paths) == 1
+                and len(_tool_schema_required_names(tools, name)) == 1
+            ):
+                # The same legacy ``<invoke>read_file>`` drift often leaves
+                # ordinary (non-namespaced) path tags. Extract that complete,
+                # explicit value before positional parsing can absorb the
+                # alias and XML closer into the filename.
+                path_aliases = list(dict.fromkeys([
+                    *path_props,
+                    "path",
+                    "file_path",
+                    "filePath",
+                    "filename",
+                ]))
+                bare_path = None
+                for path_alias in path_aliases:
+                    tagged_path = re.search(
+                        rf"(?is)(?:{re.escape(ns_token)})?"
+                        rf"<{re.escape(path_alias)}\b[^>]*>"
+                        rf"(?P<value>.*?)"
+                        rf"(?:{re.escape(ns_token)})?"
+                        rf"</{re.escape(path_alias)}\s*>",
+                        raw_body,
+                    )
+                    if tagged_path:
+                        bare_path = tagged_path.group("value").strip()
+                        break
+                if bare_path and "<" not in bare_path and ">" not in bare_path:
+                    calls.append(_openai_tool_call(
+                        name,
+                        json.dumps(
+                            {required_paths[0]: bare_path},
+                            ensure_ascii=False,
+                        ),
+                        len(calls),
+                    ))
+                    continue
             if len(required_paths) == 1 and not any(
                 re.search(
                     rf"{re.escape(ns_token)}<{re.escape(prop)}\s*>",
@@ -13880,6 +14140,19 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
             # (UnboundLocalError wedge, 2026-07-09 — rank1 died, cache
             # diverged, next request deadlocked).
             body = raw_body
+            legacy_question_args = _legacy_question_args_from_body(
+                raw_body,
+                ns_token,
+                tools,
+                name,
+            )
+            if legacy_question_args:
+                calls.append(_openai_tool_call(
+                    name,
+                    json.dumps(legacy_question_args, ensure_ascii=False),
+                    len(calls),
+                ))
+                continue
             labeled_array_args = _labeled_json_array_args_from_body(
                 raw_body,
                 tools,
