@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "recommended": "guard-032b",
+  "variants": {
+    "guard-032b": {
+      "version": "0.32.0.dev20260706+c110f69e",
+      "status": "production",
+      "note": "Validated paired MLX/MLX-Metal build with the JACCL progress guard and safe teardown path."
+    }
+  }
+}

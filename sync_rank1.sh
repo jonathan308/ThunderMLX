@@ -54,13 +54,18 @@ FILES=(
 )
 
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
-  "mkdir -p '$CLUSTER' '$CLUSTER/bin'" >/dev/null
+  "mkdir -p '$CLUSTER' '$CLUSTER/bin' '$CLUSTER/ops'" >/dev/null
 for f in "${FILES[@]}"; do
   if [[ -f "$CLUSTER/$f" ]]; then
     scp -o BatchMode=yes -o ConnectTimeout=10 \
       "$CLUSTER/$f" "$PEER:$CLUSTER/$f" >/dev/null
   fi
 done
+
+if [[ -f "$CLUSTER/ops/known_answer.py" ]]; then
+  scp -o BatchMode=yes -o ConnectTimeout=10 \
+    "$CLUSTER/ops/known_answer.py" "$PEER:$CLUSTER/ops/known_answer.py" >/dev/null
+fi
 
 if [[ -d "$CLUSTER/docs" ]]; then
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \

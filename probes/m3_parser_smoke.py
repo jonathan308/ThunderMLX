@@ -1517,6 +1517,56 @@ def check_large_write_chunk_hint_and_retry_feedback():
     )
 
 
+def check_native_large_writes_bypass_scaffold_policy():
+    import sharded_server as server
+
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["file_path", "content"],
+            },
+        },
+    }]
+    original_max = server.TOOL_WRITE_CHUNK_MAX_CHARS
+    original_target = server.TOOL_WRITE_CHUNK_TARGET_CHARS
+    server.TOOL_WRITE_CHUNK_MAX_CHARS = 0
+    server.TOOL_WRITE_CHUNK_TARGET_CHARS = 0
+    try:
+        assert _model_facing_tool_schemas(tools) is tools
+        assert _tool_write_early_stop_chars() == 0
+        incomplete = (
+            "]<]minimax[>[<tool_call>"
+            "]<]minimax[>[<invoke name=\"Write\">"
+            "]<]minimax[>[<file_path>/tmp/native-large.html"
+            "]<]minimax[>[</file_path>"
+            "]<]minimax[>[<content>"
+            + ("x" * 7000)
+        )
+        assert _synthesize_bounded_write_scaffold_text(incomplete, tools) == ""
+        complete = [{
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "arguments": {
+                    "file_path": "/tmp/native-large.html",
+                    "content": "x" * 7000,
+                },
+            },
+        }]
+        validated = _validate_outgoing_tool_calls(complete, tools)
+        assert len(validated) == 1, validated
+    finally:
+        server.TOOL_WRITE_CHUNK_MAX_CHARS = original_max
+        server.TOOL_WRITE_CHUNK_TARGET_CHARS = original_target
+
+
 def check_post_tool_action_promise_is_not_a_final_answer():
     tools = [{
         "type": "function",
@@ -4822,6 +4872,7 @@ def main():
     check_complete_native_write_survives_unfinished_followup()
     check_complete_json_call_survives_missing_outer_close()
     check_large_write_chunk_hint_and_retry_feedback()
+    check_native_large_writes_bypass_scaffold_policy()
     check_post_tool_action_promise_is_not_a_final_answer()
     check_codex_tool_arg_schema_canonicalization()
     check_command_workdir_drift_is_anchored_narrowly()

@@ -182,6 +182,14 @@ MiniMax-M3 MLX model.
    http://127.0.0.1:8090
    ```
 
+   The Models tab checks runtime versions on both ranks. `Update MLX-VLM`
+   stages exact MLX-VLM and MLX-LM release wheels, preserves the custom MLX
+   core, updates both ranks, reapplies runtime patches, validates dependencies, and restarts the
+   managed cluster. `Update MLX` accepts only the production-validated paired
+   MLX/MLX-Metal build declared in `runtime_patches/mlx_variants.json`; it runs
+   kernel known-answer checks on both Macs and restores the previous pair if a
+   validation step fails.
+
 7. Connect clients to:
 
    ```text
