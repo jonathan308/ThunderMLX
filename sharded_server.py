@@ -30,6 +30,7 @@ COORDINATION
 """
 import logging
 import asyncio
+import copy
 import difflib
 import gc
 import hashlib
@@ -6646,6 +6647,7 @@ def _generation_defaults_status():
         "tool_stream_buffer_all": TOOL_STREAM_BUFFER_ALL,
         "tool_write_chunk_max_chars": TOOL_WRITE_CHUNK_MAX_CHARS,
         "tool_write_chunk_target_chars": TOOL_WRITE_CHUNK_TARGET_CHARS,
+        "tool_write_scaffold_threshold_chars": _tool_write_early_stop_chars(),
         "tool_incomplete_call_token_budget": (
             TOOL_INCOMPLETE_CALL_TOKEN_BUDGET
         ),
@@ -7760,6 +7762,85 @@ def _tool_working_directory_from_messages(processed_messages):
         ):
             return candidate
     return ""
+
+
+def _tool_write_early_stop_chars():
+    """Payload size where an open Write is more useful as a scaffold."""
+    if TOOL_WRITE_CHUNK_MAX_CHARS <= 0:
+        return 0
+    if TOOL_WRITE_CHUNK_TARGET_CHARS <= 0:
+        return TOOL_WRITE_CHUNK_MAX_CHARS
+    # Leave room for path/argument markup and a prompt closing tag while still
+    # stopping a giant file body well before the parser's hard ceiling.
+    return min(
+        TOOL_WRITE_CHUNK_MAX_CHARS,
+        TOOL_WRITE_CHUNK_TARGET_CHARS + 1024,
+    )
+
+
+def _model_facing_tool_schemas(tools):
+    """Annotate bounded file payloads without mutating client tool schemas."""
+    if not tools or TOOL_WRITE_CHUNK_TARGET_CHARS <= 0:
+        return tools
+    bounded = copy.deepcopy(tools)
+    for tool in bounded:
+        if not isinstance(tool, dict):
+            continue
+        function = (
+            tool.get("function")
+            if isinstance(tool.get("function"), dict)
+            else tool
+        )
+        if not isinstance(function, dict):
+            continue
+        normalized = re.sub(
+            r"[^a-z0-9]",
+            "",
+            str(function.get("name") or "").lower(),
+        )
+        if normalized in _WRITE_FILE_TOOL_NAMES:
+            payload_keys = ("content", "contents", "text", "data")
+        elif normalized in _MUTATING_FILE_TOOL_NAMES:
+            payload_keys = (
+                "new_string",
+                "newString",
+                "new_text",
+                "newText",
+                "replacement",
+            )
+        else:
+            continue
+        parameters = function.get("parameters")
+        properties = (
+            parameters.get("properties")
+            if isinstance(parameters, dict)
+            else None
+        )
+        if not isinstance(properties, dict):
+            continue
+        for key in payload_keys:
+            spec = properties.get(key)
+            if not isinstance(spec, dict):
+                continue
+            existing = spec.get("maxLength")
+            if isinstance(existing, int) and existing > 0:
+                spec["maxLength"] = min(
+                    existing,
+                    TOOL_WRITE_CHUNK_TARGET_CHARS,
+                )
+            else:
+                spec["maxLength"] = TOOL_WRITE_CHUNK_TARGET_CHARS
+            note = (
+                f"Maximum {TOOL_WRITE_CHUNK_TARGET_CHARS} characters per "
+                "call. For larger files, create a small scaffold and use "
+                "focused follow-up Edit calls."
+            )
+            description = str(spec.get("description") or "").strip()
+            if note not in description:
+                spec["description"] = (
+                    f"{description} {note}".strip()
+                )
+    return bounded
 
 
 def _file_write_chunk_hint(tools):
@@ -9699,10 +9780,11 @@ def _bound_large_file_write_arguments(tool_name, arguments):
         return arguments, 0
     content_key = _file_write_content_key(arguments)
     content = arguments.get(content_key) if content_key else None
+    scaffold_threshold = _tool_write_early_stop_chars()
     if (
-        TOOL_WRITE_CHUNK_MAX_CHARS <= 0
+        scaffold_threshold <= 0
         or not isinstance(content, str)
-        or len(content) <= TOOL_WRITE_CHUNK_MAX_CHARS
+        or len(content) <= scaffold_threshold
     ):
         return arguments, 0
     bounded = dict(arguments)
@@ -9741,16 +9823,17 @@ def _synthesize_bounded_write_scaffold_text(full_output, tools):
     direct_payload_chars = _file_write_payload_chars(full_output, tools)
     shell_write = _shell_create_file_payload_info(full_output, tools)
     shell_payload_chars = int((shell_write or {}).get("payload_chars") or 0)
+    scaffold_threshold = _tool_write_early_stop_chars()
     if (
-        TOOL_WRITE_CHUNK_MAX_CHARS <= 0
+        scaffold_threshold <= 0
         or max(direct_payload_chars, shell_payload_chars)
-        <= TOOL_WRITE_CHUNK_MAX_CHARS
+        <= scaffold_threshold
     ):
         return ""
     name_map = _tool_name_map_from_schema(tools)
     selected_name = ""
     path = ""
-    if direct_payload_chars > TOOL_WRITE_CHUNK_MAX_CHARS:
+    if direct_payload_chars > scaffold_threshold:
         for tool in tools or []:
             name = _tool_function_name(tool)
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
@@ -9763,7 +9846,7 @@ def _synthesize_bounded_write_scaffold_text(full_output, tools):
                     selected_name,
                 )
                 break
-    if not selected_name and shell_payload_chars > TOOL_WRITE_CHUNK_MAX_CHARS:
+    if not selected_name and shell_payload_chars > scaffold_threshold:
         for tool in tools or []:
             name = _tool_function_name(tool)
             normalized = re.sub(r"[^a-z0-9]", "", name.lower())
@@ -11185,7 +11268,7 @@ def _render_tool_retry_prompt(model, processor, processed_messages, tools,
         thinking_mode=retry_thinking_mode,
     )
     if tools:
-        template_kwargs["tools"] = tools
+        template_kwargs["tools"] = _model_facing_tool_schemas(tools)
     with _tokenizer_runtime_lock:
         return apply_chat_template(
             processor,
@@ -11340,7 +11423,6 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         full_output,
         tools,
     )
-    scaffold_fallback = ""
     if bounded_scaffold and _usable_tool_turn(
         bounded_scaffold,
         tool_module,
@@ -11349,13 +11431,13 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         thinking_mode,
         require_call=require_call,
     ):
-        scaffold_fallback = bounded_scaffold
         logger.warning(
-            "[rank 0] %s %s prepared a bounded scaffold fallback for an "
-            "oversized incomplete Write; attempting a focused retry first",
+            "[rank 0] %s %s returning a bounded scaffold immediately after "
+            "an oversized incomplete Write",
             label,
             req_id,
         )
+        return bounded_scaffold
     ceiling = MAX_TOKENS_CEILING if MAX_TOKENS_CEILING > 0 else 16384
     retry_max_tokens = min(ceiling, max(int(max_tokens or 0), 2048) * 2)
     if TOOL_UNUSABLE_RETRY_MAX_TOKENS > 0:
@@ -11525,26 +11607,15 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             retry_thinking_mode,
             require_call=require_call,
         ):
-            scaffold_fallback = retry_scaffold
-            if attempt >= TOOL_UNUSABLE_RETRY_ATTEMPTS:
-                logger.warning(
-                    "[rank 0] %s %s tool retry %d/%d exhausted focused "
-                    "recovery; returning the bounded scaffold fallback",
-                    label,
-                    req_id,
-                    attempt,
-                    TOOL_UNUSABLE_RETRY_ATTEMPTS,
-                )
-                return retry_scaffold
             logger.warning(
                 "[rank 0] %s %s tool retry %d/%d was still an oversized "
-                "Write; keeping its scaffold only as a fallback and "
-                "retrying one smaller focused action",
+                "Write; returning its bounded scaffold immediately",
                 label,
                 req_id,
                 attempt,
                 TOOL_UNUSABLE_RETRY_ATTEMPTS,
             )
+            return retry_scaffold
         if _usable_tool_turn(full_output, tool_module, tools,
                              processed_messages, retry_thinking_mode,
                              require_call=require_call):
@@ -11570,15 +11641,6 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                     e,
                 )
             gc.collect()
-    if scaffold_fallback:
-        logger.warning(
-            "[rank 0] %s %s returning bounded scaffold after %d focused "
-            "tool retries",
-            label,
-            req_id,
-            TOOL_UNUSABLE_RETRY_ATTEMPTS,
-        )
-        return scaffold_fallback
     explicit_read = _synthesize_explicit_read_tool_call(
         processed_messages,
         tools,
@@ -14714,6 +14776,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
             if action_tool_task
             else TOOL_NO_CALL_TOKEN_BUDGET
         )
+    write_scaffold_threshold = _tool_write_early_stop_chars()
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -14839,7 +14902,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         and not _FORCE_EOS["active"]
                         and tools
                         and tool_call_started
-                        and TOOL_WRITE_CHUNK_MAX_CHARS > 0
+                        and write_scaffold_threshold > 0
                         and n % 8 == 0):
                     write_payload_chars = _file_write_payload_chars(
                         tool_accumulated,
@@ -14858,7 +14921,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     )
                     if (
                         oversized_payload_chars
-                        > TOOL_WRITE_CHUNK_MAX_CHARS
+                        > write_scaffold_threshold
                         and not _tool_call_complete_for_stop(
                             tool_accumulated,
                             tool_module,
@@ -14867,8 +14930,8 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     ):
                         logger.warning(
                             "rank 0: oversized %s payload at token %d "
-                            "(%d chars after invocation, budget=%d) — forcing "
-                            "EOS for scaffold retry",
+                            "(%d chars after invocation, scaffold=%d, hard=%d) "
+                            "— forcing EOS for immediate scaffold",
                             (
                                 "file-producing shell"
                                 if shell_write_payload_chars
@@ -14877,6 +14940,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                             ),
                             n,
                             oversized_payload_chars,
+                            write_scaffold_threshold,
                             TOOL_WRITE_CHUNK_MAX_CHARS,
                         )
                         _FORCE_EOS["active"] = True
@@ -15193,6 +15257,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         if action_tool_task
         else TOOL_NO_CALL_TOKEN_BUDGET
     )
+    write_scaffold_threshold = _tool_write_early_stop_chars()
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -15321,7 +15386,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         and not _FORCE_EOS["active"]
                         and tools
                         and tool_call_started
-                        and TOOL_WRITE_CHUNK_MAX_CHARS > 0
+                        and write_scaffold_threshold > 0
                         and n % 8 == 0):
                     write_payload_chars = _file_write_payload_chars(
                         tool_guard_text,
@@ -15340,7 +15405,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     )
                     if (
                         oversized_payload_chars
-                        > TOOL_WRITE_CHUNK_MAX_CHARS
+                        > write_scaffold_threshold
                         and not _tool_call_complete_for_stop(
                             tool_guard_text,
                             tool_module,
@@ -15349,8 +15414,8 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     ):
                         logger.warning(
                             "rank 0: oversized streaming %s payload at token "
-                            "%d (%d chars after invocation, budget=%d) — "
-                            "forcing EOS for scaffold retry",
+                            "%d (%d chars after invocation, scaffold=%d, "
+                            "hard=%d) — forcing EOS for immediate scaffold",
                             (
                                 "file-producing shell"
                                 if shell_write_payload_chars
@@ -15359,6 +15424,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                             ),
                             n,
                             oversized_payload_chars,
+                            write_scaffold_threshold,
                             TOOL_WRITE_CHUNK_MAX_CHARS,
                         )
                         _FORCE_EOS["active"] = True
@@ -17658,7 +17724,7 @@ def run_http_server(model, processor, rank):
                 thinking_mode=thinking_mode,
             )
             if tools:
-                tk["tools"] = tools
+                tk["tools"] = _model_facing_tool_schemas(tools)
             def _render_prompt_with_lock():
                 with _tokenizer_runtime_lock:
                     return apply_chat_template(

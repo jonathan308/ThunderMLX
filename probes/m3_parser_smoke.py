@@ -47,6 +47,7 @@ from sharded_server import (
     _file_write_payload_chars,
     _incomplete_tool_call_budget_reached,
     _looks_like_tool_compat_fallback_content,
+    _model_facing_tool_schemas,
     _remember_assistant_reasoning,
     _tool_request_fallback_content,
     _tool_intent_without_call,
@@ -56,6 +57,7 @@ from sharded_server import (
     _tool_retry_prefers_no_think,
     _tool_retry_thinking_mode,
     _tool_retry_recovery_hint,
+    _tool_write_early_stop_chars,
     _tool_loop_steering_diag,
     _usable_tool_turn,
     _parse_tool_calls,
@@ -1049,6 +1051,14 @@ def check_large_write_chunk_hint_and_retry_feedback():
     assert f"below {TOOL_WRITE_CHUNK_TARGET_CHARS} characters" in hint, hint
     assert "hard parser ceiling is 6000" in hint, hint
     assert "small valid working scaffold" in hint, hint
+    assert _tool_write_early_stop_chars() == 5120
+
+    model_tools = _model_facing_tool_schemas(tools)
+    model_content = model_tools[0]["function"]["parameters"]["properties"]["content"]
+    original_content = tools[0]["function"]["parameters"]["properties"]["content"]
+    assert model_content["maxLength"] == TOOL_WRITE_CHUNK_TARGET_CHARS
+    assert "small scaffold" in model_content["description"], model_content
+    assert "maxLength" not in original_content, original_content
 
     ns = "]<]minimax[>["
     malformed = (
@@ -1195,13 +1205,13 @@ def check_large_write_chunk_hint_and_retry_feedback():
 
     oversized_call = {
         "file_path": "/tmp/snake.html",
-        "content": "x" * 7000,
+        "content": "x" * 5300,
     }
     bounded, original_chars = _bound_large_file_write_arguments(
         "Write",
         oversized_call,
     )
-    assert original_chars == 7000, original_chars
+    assert original_chars == 5300, original_chars
     assert len(bounded["content"]) < 6000, bounded
     assert "THUNDERMLX_CONTINUE" in bounded["content"], bounded
     assert bounded["file_path"] == "/tmp/snake.html", bounded
@@ -1211,7 +1221,7 @@ def check_large_write_chunk_hint_and_retry_feedback():
         f'{ns}<invoke name="Write">'
         f"{ns}<file_path>/tmp/snake.html{ns}</file_path>"
         f"{ns}<content>"
-        + ("x" * 7000)
+        + ("x" * 5300)
     )
     scaffold_text = _synthesize_bounded_write_scaffold_text(
         incomplete_large,
