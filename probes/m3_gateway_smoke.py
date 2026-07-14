@@ -17,6 +17,7 @@ from model_gateway import (  # noqa: E402
     _normalize_session_title,
     _normalize_session_title_sse,
     _responses_model_prefers_reasoning_heartbeat,
+    _sse_keepalive_comment,
     backend_for_model,
     canonical_m3_model_id,
     model_ids_from_catalog,
@@ -260,7 +261,7 @@ def _decode_responses_events(chunks):
     return events
 
 
-async def _run_stream_fixture(model, deltas):
+async def _run_stream_fixture(model, deltas, *, include_raw=False):
     old_client = gateway.httpx.AsyncClient
     old_ensure = gateway.ensure_backend
     old_hb = os.environ.get("M3_GATEWAY_RESPONSES_HEARTBEAT_SECONDS")
@@ -287,7 +288,8 @@ async def _run_stream_fixture(model, deltas):
         chunks = []
         async for chunk in response.body_iterator:
             chunks.append(chunk)
-        return _decode_responses_events(chunks)
+        events = _decode_responses_events(chunks)
+        return (events, chunks) if include_raw else events
     finally:
         gateway.httpx.AsyncClient = old_client
         gateway.ensure_backend = old_ensure
@@ -306,19 +308,22 @@ def _added_items(events):
 
 
 def check_responses_heartbeat_model_selection():
+    assert _sse_keepalive_comment() == ": keepalive\n\n"
     assert _responses_model_prefers_reasoning_heartbeat("Minimax-M3")
     assert _responses_model_prefers_reasoning_heartbeat("M3-Web")
     assert not _responses_model_prefers_reasoning_heartbeat("Minimax-M3-No-Think")
 
 
 def check_thinking_heartbeat_keeps_reasoning_separate():
-    events = asyncio.run(_run_stream_fixture(
+    events, raw_chunks = asyncio.run(_run_stream_fixture(
         "Minimax-M3",
         [
             {"reasoning_content": "private reasoning"},
             {"content": "visible answer"},
         ],
+        include_raw=True,
     ))
+    assert any(str(chunk).startswith(": keepalive") for chunk in raw_chunks), raw_chunks
     added = _added_items(events)
     assert [(idx, kind) for idx, kind, _ in added] == [
         (0, "reasoning"),
@@ -365,6 +370,45 @@ def check_no_think_heartbeat_reuses_message_item():
     assert [item["output_index"] for item in text_deltas] == [0]
 
 
+def check_anthropic_buffered_prefill_emits_transport_keepalive():
+    old_messages = gateway.anthropic_messages
+    old_seconds = gateway.SSE_KEEPALIVE_SECONDS
+
+    async def _delayed_messages(_payload):
+        await asyncio.sleep(0.03)
+        return gateway.JSONResponse({
+            "id": "msg_fixture",
+            "type": "message",
+            "role": "assistant",
+            "model": "Minimax-M3-No-Think",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 4, "output_tokens": 1},
+        })
+
+    async def _collect():
+        response = await gateway.anthropic_messages_stream({
+            "model": "Minimax-M3-No-Think",
+            "stream": True,
+        })
+        chunks = []
+        async for chunk in response.body_iterator:
+            chunks.append(str(chunk))
+        return response, chunks
+
+    gateway.anthropic_messages = _delayed_messages
+    gateway.SSE_KEEPALIVE_SECONDS = 0.01
+    try:
+        response, chunks = asyncio.run(_collect())
+    finally:
+        gateway.anthropic_messages = old_messages
+        gateway.SSE_KEEPALIVE_SECONDS = old_seconds
+
+    assert chunks[0] == ": keepalive\n\n", chunks
+    assert any("event: message_start" in chunk for chunk in chunks), chunks
+    assert response.headers.get("x-accel-buffering") == "no", response.headers
+
+
 def main():
     check_empty_model_defaults_to_m3_agent_model()
     check_explicit_omlx_model_is_preserved()
@@ -375,6 +419,7 @@ def main():
     check_responses_heartbeat_model_selection()
     check_thinking_heartbeat_keeps_reasoning_separate()
     check_no_think_heartbeat_reuses_message_item()
+    check_anthropic_buffered_prefill_emits_transport_keepalive()
     print("PASS")
 
 

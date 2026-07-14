@@ -105,11 +105,56 @@ def test_legacy_display_style_is_not_recovered_by_default():
     assert remaining == text, remaining
 
 
+def test_closed_native_write_survives_unfinished_followup():
+    tools = [
+        *write_tool({
+            "file_path": {"type": "string"},
+            "content": {"type": "string"},
+        }),
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
+    content = "<!doctype html><html><body>ready</body></html>"
+    text = (
+        "I will create the file."
+        f"{NS}<tool_call>"
+        f'{NS}<invoke name="Write">'
+        f"{NS}<file_path>/tmp/dino.html{NS}</file_path>"
+        f"{NS}<content>{content}{NS}</content>"
+        f"{NS}</invoke>"
+        f"{NS}</tool_call>"
+        "I will verify it."
+        f'{NS}<tool_call> Bash {{"command":"ls -la /tmp/dino.html"}}'
+    )
+    calls, remaining = _parse_tool_calls(text, minimax_m3, tools)
+    validated = _validate_outgoing_tool_calls(calls, tools)
+    assert len(validated) == 1, validated
+    assert validated[0]["function"]["name"] == "Write", validated
+    assert json.loads(validated[0]["function"]["arguments"]) == {
+        "file_path": "/tmp/dino.html",
+        "content": content,
+    }
+    assert remaining == "I will create the file.", remaining
+
+
 def main():
     assert TOOL_COMPAT_OVERLAY is False
     test_native_claude_style_write_call_with_camel_schema()
     test_native_claude_style_write_call_maps_to_snake_schema()
     test_legacy_display_style_is_not_recovered_by_default()
+    test_closed_native_write_survives_unfinished_followup()
     print("PASS")
 
 

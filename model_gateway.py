@@ -61,6 +61,13 @@ STOP_M3_GRACE_S = float(os.environ.get("M3_GATEWAY_STOP_M3_GRACE_S", "30"))
 # Streamed /v1/responses translates upstream deltas live (codex sees thinking
 # stream into its reasoning UI). 0 falls back to the end-of-turn replay.
 RESPONSES_LIVE_STREAM = env_bool("M3_GATEWAY_RESPONSES_LIVE", True)
+SSE_KEEPALIVE_SECONDS = max(
+    0.0, float(os.environ.get("M3_GATEWAY_SSE_KEEPALIVE_SECONDS", "5") or "0")
+)
+SSE_STREAM_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+}
 ALLOW_UNLOAD_OMLX = env_bool("M3_GATEWAY_ALLOW_UNLOAD_OMLX", True)
 SWITCH_TIMEOUT = float(os.environ.get("M3_GATEWAY_SWITCH_TIMEOUT_SECONDS", "900"))
 # Read-timeout for proxied non-stream completion POSTs — generation-scale,
@@ -2291,16 +2298,59 @@ def _anthropic_sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
-async def anthropic_messages_stream(payload: dict[str, Any]) -> StreamingResponse:
-    # Use the validated non-stream OpenAI path internally, then emit Anthropic
-    # Messages SSE. This keeps tool inputs fully validated before Claude Code
-    # executes them while preserving streaming protocol compatibility.
-    response = await anthropic_messages({**payload, "stream": False})
-    if response.status_code >= 400:
-        return response  # type: ignore[return-value]
-    data = json.loads(response.body.decode("utf-8"))
+def _sse_keepalive_comment() -> str:
+    """Return a standards-compliant SSE comment heartbeat."""
+    return ": keepalive\n\n"
 
+
+async def anthropic_messages_stream(payload: dict[str, Any]) -> StreamingResponse:
     async def iterator():
+        # The validated Anthropic bridge buffers the upstream tool transaction
+        # until it has a complete call. Run it as a task so headers and SSE
+        # comments still reach Claude Code during prefill/recovery instead of
+        # leaving the transport silent for minutes.
+        response_task = asyncio.create_task(
+            anthropic_messages({**payload, "stream": False})
+        )
+        try:
+            while not response_task.done():
+                done, _ = await asyncio.wait(
+                    {response_task},
+                    timeout=(
+                        SSE_KEEPALIVE_SECONDS
+                        if SSE_KEEPALIVE_SECONDS > 0
+                        else None
+                    ),
+                )
+                if response_task in done:
+                    break
+                yield _sse_keepalive_comment()
+            response = response_task.result()
+        finally:
+            if not response_task.done():
+                response_task.cancel()
+                try:
+                    await response_task
+                except BaseException:
+                    pass
+
+        if response.status_code >= 400:
+            try:
+                error_body = json.loads(response.body.decode("utf-8"))
+            except Exception:
+                error_body = {
+                    "error": {
+                        "type": "upstream_error",
+                        "message": response.body.decode("utf-8", "replace")[:2000],
+                    }
+                }
+            error = error_body.get("error") if isinstance(error_body, dict) else None
+            if not isinstance(error, dict):
+                error = {"type": "upstream_error", "message": str(error_body)[:2000]}
+            yield _anthropic_sse("error", {"type": "error", "error": error})
+            return
+
+        data = json.loads(response.body.decode("utf-8"))
         message_start = {**data, "content": []}
         yield _anthropic_sse("message_start", {"type": "message_start", "message": message_start})
         for index, block in enumerate(data.get("content") or []):
@@ -2345,7 +2395,11 @@ async def anthropic_messages_stream(payload: dict[str, Any]) -> StreamingRespons
         })
         yield _anthropic_sse("message_stop", {"type": "message_stop"})
 
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_STREAM_HEADERS,
+    )
 
 
 def _messages_to_claude_prompt(payload: dict[str, Any]) -> tuple[str, str]:
@@ -2521,7 +2575,11 @@ async def claude_chat_completion_stream(payload: dict[str, Any]) -> StreamingRes
             }) + "\n\n"
             yield "data: [DONE]\n\n"
 
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_STREAM_HEADERS,
+    )
 
 
 async def claude_proxy(body: bytes) -> Response:
@@ -2678,6 +2736,8 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
                     raw = bytearray()
                     async for chunk in response.aiter_raw():
                         raw.extend(chunk)
+                        if b": keepalive" in chunk:
+                            yield _sse_keepalive_comment()
                     yield _normalize_session_title_sse(bytes(raw), payload)
                 else:
                     async for chunk in response.aiter_raw():
@@ -2694,6 +2754,7 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
             iterator(),
             status_code=response.status_code,
             media_type=response.headers.get("content-type", "text/event-stream"),
+            headers=SSE_STREAM_HEADERS,
         )
 
     try:
@@ -3462,6 +3523,7 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     except asyncio.TimeoutError:
                         if await request.is_disconnected():
                             raise _ResponsesClientGone()
+                        yield _sse_keepalive_comment()
                         for _ev in _heartbeat_events():
                             yield _ev
                         continue
@@ -3479,6 +3541,11 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
                         line = line.strip()
+                        if line.startswith(":"):
+                            # Preserve protocol comments even when HTTP chunk
+                            # boundaries split the upstream heartbeat.
+                            yield _sse_keepalive_comment()
+                            continue
                         if not line.startswith("data: "):
                             continue
                         data_str = line[6:].strip()
@@ -3605,7 +3672,11 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                     pass
             await client.aclose()
 
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_STREAM_HEADERS,
+    )
 
 
 @APP.post("/v1/responses")
@@ -3789,7 +3860,11 @@ async def responses_route(request: Request):
             })
         yield emit("response.completed", {"type": "response.completed", "response": response_data})
 
-    return StreamingResponse(iterator(), media_type="text/event-stream")
+    return StreamingResponse(
+        iterator(),
+        media_type="text/event-stream",
+        headers=SSE_STREAM_HEADERS,
+    )
 
 
 @APP.api_route("/v1/{rest:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])

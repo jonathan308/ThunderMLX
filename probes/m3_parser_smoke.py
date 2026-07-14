@@ -25,6 +25,7 @@ os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_TOOL", "6")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_STEER_MAX_REPEATED_COMMANDS", "3")
 os.environ.setdefault("MLX_M3_TOOL_LOOP_FORCE_FINAL_AFTER", "8")
 os.environ.setdefault("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "8192")
+os.environ.setdefault("MLX_M3_TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET", "64")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_TARGET_CHARS", "4096")
 
@@ -59,6 +60,7 @@ from sharded_server import (
     _tool_retry_prefers_no_think,
     _tool_retry_thinking_mode,
     _tool_retry_recovery_hint,
+    _single_apply_patch_fast_recovery,
     _tool_write_early_stop_chars,
     _tool_loop_steering_diag,
     _tool_loop_steering_text,
@@ -72,7 +74,9 @@ from sharded_server import (
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
     _shell_create_file_payload_info,
+    _sse_keepalive_comment as _server_sse_keepalive_comment,
     _synthesize_bounded_write_scaffold_text,
+    _synthesize_complete_add_file_artifact_text,
     _synthesize_explicit_read_tool_call,
     _synthesize_write_command_tool_call,
     _tool_call_complete_for_stop,
@@ -81,6 +85,7 @@ from sharded_server import (
     _validate_outgoing_tool_calls,
     split_stream_thinking_delta,
     split_thinking_text,
+    TOOL_WRITE_CHUNK_MAX_CHARS,
     TOOL_WRITE_CHUNK_TARGET_CHARS,
 )
 from model_gateway import _openai_response_has_usable_content
@@ -960,6 +965,153 @@ def check_incomplete_native_write_is_never_emitted():
     )
 
 
+def check_complete_native_write_survives_unfinished_followup():
+    from mlx_vlm.tool_parsers import minimax_m3 as native_minimax_m3
+
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Write",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["file_path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Edit",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                        "old_string": {"type": "string"},
+                        "new_string": {"type": "string"},
+                    },
+                    "required": ["file_path", "old_string", "new_string"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Read",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string"},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+    ]
+    ns = "]<]minimax[>["
+    content = "<!doctype html><html><body>ready</body></html>"
+    complete_write = (
+        "I will create the file."
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Write">'
+        f"{ns}<file_path>/tmp/dino.html{ns}</file_path>"
+        f"{ns}<content>{content}{ns}</content>"
+        f"{ns}</invoke>"
+        f"{ns}</tool_call>"
+    )
+    unfinished_verify = (
+        "I will verify it."
+        f'{ns}<tool_call> Bash {{"command":"ls -la /tmp/dino.html",'
+        '"description":"Verify the file was created"}'
+    )
+    calls, remaining = _parse_tool_calls(
+        complete_write + unfinished_verify,
+        native_minimax_m3,
+        tools,
+    )
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "Write", calls
+    args = json.loads(calls[0]["function"]["arguments"])
+    assert args == {
+        "file_path": "/tmp/dino.html",
+        "content": content,
+    }, args
+    assert remaining == "I will create the file.", remaining
+
+    for name, native_body, expected in (
+        (
+            "Edit",
+            (
+                f"{ns}<file_path>/tmp/dino.html{ns}</file_path>"
+                f"{ns}<old_string>ready{ns}</old_string>"
+                f"{ns}<new_string>running{ns}</new_string>"
+            ),
+            {
+                "file_path": "/tmp/dino.html",
+                "old_string": "ready",
+                "new_string": "running",
+            },
+        ),
+        (
+            "Read",
+            f"{ns}<file_path>/tmp/dino.html{ns}</file_path>",
+            {"file_path": "/tmp/dino.html"},
+        ),
+    ):
+        complete = (
+            f"I will use {name}."
+            f"{ns}<tool_call>"
+            f'{ns}<invoke name="{name}">'
+            f"{native_body}"
+            f"{ns}</invoke>"
+            f"{ns}</tool_call>"
+        )
+        calls, remaining = _parse_tool_calls(
+            complete + unfinished_verify,
+            native_minimax_m3,
+            tools,
+        )
+        assert len(calls) == 1, (name, calls)
+        assert calls[0]["function"]["name"] == name, calls
+        assert json.loads(calls[0]["function"]["arguments"]) == expected
+        assert remaining == f"I will use {name}.", remaining
+
+    # A partial first action remains non-executable even if another opener
+    # appears later; only an already closed, schema-valid prefix is retained.
+    partial_write = (
+        "I will create the file."
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Write">'
+        f"{ns}<file_path>/tmp/dino.html{ns}</file_path>"
+        f"{ns}<content><!doctype html>"
+    )
+    calls, remaining = _parse_tool_calls(
+        partial_write + unfinished_verify,
+        native_minimax_m3,
+        tools,
+    )
+    assert calls == [], calls
+    assert remaining == "I will create the file.", remaining
+
+
 def check_complete_json_call_survives_missing_outer_close():
     tools = [{
         "type": "function",
@@ -1059,6 +1211,10 @@ def check_large_write_chunk_hint_and_retry_feedback():
     model_tools = _model_facing_tool_schemas(tools)
     model_content = model_tools[0]["function"]["parameters"]["properties"]["content"]
     original_content = tools[0]["function"]["parameters"]["properties"]["content"]
+    model_keys = list(
+        model_tools[0]["function"]["parameters"]["properties"]
+    )
+    assert model_keys.index("file_path") < model_keys.index("content"), model_keys
     assert model_content["maxLength"] == TOOL_WRITE_CHUNK_TARGET_CHARS
     assert "small scaffold" in model_content["description"], model_content
     assert "maxLength" not in original_content, original_content
@@ -3417,6 +3573,134 @@ def check_malformed_apply_patch_payload_report_dropped():
     assert dropped == 0, dropped
     assert len(validated) == 1, validated
 
+    model_tools = _model_facing_tool_schemas(tools)
+    input_schema = model_tools[0]["function"]["parameters"]["properties"]["input"]
+    assert input_schema["maxLength"] == TOOL_WRITE_CHUNK_TARGET_CHARS, input_schema
+
+    ns = "]<]minimax[>["
+    incomplete_large = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="apply_patch">'
+        f"{ns}<input>*** Begin Patch\n*** Add File: game.html\n"
+        + ("+x\n" * (TOOL_WRITE_CHUNK_TARGET_CHARS // 2))
+    )
+    stop_info = _file_mutation_stop_info(incomplete_large, tools)
+    assert stop_info["kind"] == "apply-patch", stop_info
+    assert stop_info["normalized_name"] == "applypatch", stop_info
+    assert stop_info["threshold_chars"] == _tool_write_early_stop_chars(), stop_info
+    recovery = _tool_retry_recovery_hint(
+        incomplete_large,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert "`*** Begin Patch`" in recovery, recovery
+    assert "`*** End Patch`" in recovery, recovery
+    assert "old/target argument" not in recovery, recovery
+
+    no_call_recovery = _tool_retry_recovery_hint(
+        "I will create the requested file now.",
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert "`apply_patch`" in no_call_recovery, no_call_recovery
+    assert "did not produce an executable call" in no_call_recovery, no_call_recovery
+    assert "`*** Begin Patch`" in no_call_recovery, no_call_recovery
+    assert "`*** End Patch`" in no_call_recovery, no_call_recovery
+    assert _single_apply_patch_fast_recovery(tools, 16384)
+    assert not _single_apply_patch_fast_recovery(tools, 16385)
+    assert not _single_apply_patch_fast_recovery(
+        [
+            *tools,
+            {
+                "type": "function",
+                "function": {
+                    "name": "exec_command",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+        ],
+        1024,
+    )
+
+    oversized_valid_patch = (
+        "*** Begin Patch\n"
+        "*** Add File: game.html\n"
+        + ("+x\n" * TOOL_WRITE_CHUNK_MAX_CHARS)
+        + "*** End Patch"
+    )
+    calls[0]["function"]["arguments"] = {"input": oversized_valid_patch}
+    validated, dropped = _validate_outgoing_tool_calls(
+        calls,
+        tools,
+        return_dropped=True,
+    )
+    assert validated == [], validated
+    assert dropped == 1, dropped
+
+
+def check_complete_html_add_file_recovers_unterminated_patch_envelope():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "parameters": {
+                "type": "object",
+                "properties": {"input": {"type": "string"}},
+                "required": ["input"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    html = (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<body>\n"
+        "<script>console.log('ready')</script>\n</body>\n</html>"
+    )
+    malformed = (
+        f"{ns}<tool_call>\n"
+        f'{ns}<invoke name="apply_patch">'
+        f"{ns}<file_path>/tmp/dino.html</file_path>"
+        f"{ns}<patch>{html}"
+        + (f"{ns}</script>\n</body>\n</html>" * 20)
+    )
+    recovered = _synthesize_complete_add_file_artifact_text(
+        malformed,
+        tools,
+    )
+    assert recovered.startswith("[Tool call: apply_patch]\n"), recovered[:200]
+    arguments = json.loads(recovered.split("\n", 1)[1])
+    patch = arguments["input"]
+    assert patch.startswith(
+        "*** Begin Patch\n*** Add File: /tmp/dino.html\n+<!DOCTYPE html>"
+    ), patch[:200]
+    assert patch.endswith("+</html>\n*** End Patch"), patch[-200:]
+    assert patch.count("console.log('ready')") == 1, patch
+    assert patch.count("</html>") == 1, patch
+
+    free_form = (
+        f'{ns}<tool_call>{ns}<invoke name="apply_patch">{ns}<input>'
+        "*** Begin Patch\n*** Add File: /tmp/free-form.html\n"
+        + "\n".join(f"+{line}" for line in html.splitlines())
+    )
+    recovered = _synthesize_complete_add_file_artifact_text(
+        free_form,
+        tools,
+    )
+    assert recovered, free_form
+    arguments = json.loads(recovered.split("\n", 1)[1])
+    assert "*** Add File: /tmp/free-form.html" in arguments["input"]
+
+    incomplete = (
+        f"{ns}<tool_call>\n"
+        f'{ns}<invoke name="apply_patch">'
+        f"{ns}<file_path>/tmp/incomplete.html</file_path>"
+        f"{ns}<patch><!DOCTYPE html>\n<html><body>unfinished"
+    )
+    assert not _synthesize_complete_add_file_artifact_text(incomplete, tools)
+    risky = free_form.replace("*** Add File:", "*** Update File:")
+    assert not _synthesize_complete_add_file_artifact_text(risky, tools)
+    non_html = malformed.replace("/tmp/dino.html", "/tmp/dino.py")
+    assert not _synthesize_complete_add_file_artifact_text(non_html, tools)
+
 
 def check_reversed_write_path_and_content_are_repaired():
     tools = [{
@@ -4511,6 +4795,7 @@ def check_ssd_restore_append_capacity_is_bounded():
 
 
 def main():
+    assert _server_sse_keepalive_comment() == ": keepalive\n\n"
     check_complete_analysis_channel()
     check_tool_retry_preserves_long_prompt_prefix()
     check_thinking_action_retry_is_not_clipped_at_focused_budget()
@@ -4534,6 +4819,7 @@ def main():
     check_loose_segment_command_tool_call_recovers()
     check_incomplete_loose_segment_command_is_not_emitted()
     check_incomplete_native_write_is_never_emitted()
+    check_complete_native_write_survives_unfinished_followup()
     check_complete_json_call_survives_missing_outer_close()
     check_large_write_chunk_hint_and_retry_feedback()
     check_post_tool_action_promise_is_not_a_final_answer()
@@ -4567,6 +4853,7 @@ def main():
     check_empty_required_tool_args_report_dropped()
     check_parameterless_and_optional_only_tool_args_are_accepted()
     check_malformed_apply_patch_payload_report_dropped()
+    check_complete_html_add_file_recovers_unterminated_patch_envelope()
     check_reversed_write_path_and_content_are_repaired()
     check_multiline_python_c_bash_call_is_executable()
     check_zcode_user_workspace_anchors_drifted_write_and_cd()
