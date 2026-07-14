@@ -310,11 +310,12 @@ TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS = int(
     ) or "0"
 )
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
-    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "65536") or "0"
+    os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "0") or "0"
 )
-# Keep a complete mutation comfortably inside the bounded tool-retry budget.
-# Larger values let a content-first schema consume the whole decode before the
-# destination path or closing marker appears, leaving nothing safe to execute.
+# Native Write/Edit calls are atomic and already bounded by max_tokens plus the
+# incomplete-call stop. Leave their schemas and decode runway untouched by
+# default; positive values opt into the legacy scaffold policy for clients that
+# explicitly prefer small staged writes.
 _DEFAULT_TOOL_WRITE_CHUNK_TARGET_CHARS = (
     min(49152, TOOL_WRITE_CHUNK_MAX_CHARS)
     if TOOL_WRITE_CHUNK_MAX_CHARS > 0 else 0

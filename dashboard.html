@@ -646,9 +646,12 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
           <tbody id="runtimeRows"><tr><td colspan="6" style="color:var(--muted)">press Check stack</td></tr></tbody>
         </table>
       </div>
-      <label class="check" style="margin-top:10px"><input type="checkbox" id="updWorker" checked> update worker too</label>
       <div class="btnrow" style="margin-top:10px;align-items:center">
         <button class="btn" onclick="checkRuntimeStack()">Check stack</button>
+        <button class="btn primary" id="updMlxVlm" onclick="updateRuntimePackage('mlx-vlm')">Update MLX-VLM</button>
+        <button class="btn" id="updMlx" onclick="updateRuntimePackage('mlx')">Update MLX</button>
+        <span class="chip">rank 0 + rank 1</span>
+        <label class="check"><input type="checkbox" id="updRestart" checked> restart after update</label>
         <span class="save-state" id="mlxVlmState">not checked</span>
       </div>
       <p style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:10px">
@@ -794,6 +797,7 @@ function switchView(name){
   document.querySelectorAll("nav .tab").forEach(t => t.classList.toggle("active", t.dataset.view === name));
   document.querySelectorAll("section.view").forEach(v => v.classList.toggle("on", v.id === "view-"+name));
   if(name === "logs") logs(true);
+  if(name === "models") checkRuntimeStack();
 }
 document.querySelectorAll("nav .tab").forEach(t => t.addEventListener("click", () => switchView(t.dataset.view)));
 document.addEventListener("keydown", e => {
@@ -1252,10 +1256,10 @@ async function checkRuntimeStack(){
     if(!j.packages){ setText("mlxVlmState", j.error || "check failed"); return; }
     el("runtimeRows").innerHTML = j.packages.map(p => {
       const mismatch = p.ranks_match === false;
-      const updAvail = p.updatable && p.latest_release && p.rank0 && p.latest_release !== p.rank0;
+      const updAvail = !!p.update_available;
       const action = p.updatable
         ? '<button class="btn sm'+(updAvail ? " primary" : "")+'" onclick="updateRuntimePackage(\''+p.package+'\')">'
-          + (updAvail ? "Update" : "Reinstall") + "</button>"
+          + (updAvail ? "Update" : (p.package === "mlx" ? "Reinstall pair" : "Reinstall")) + "</button>"
         : '<span class="chip">pinned</span>';
       return "<tr>"
         + "<td><b>"+esc(p.package)+"</b></td>"
@@ -1266,20 +1270,50 @@ async function checkRuntimeStack(){
         + "<td>"+action+"</td>"
         + "</tr>";
     }).join("");
-    setText("mlxVlmState", j.worker_error ? "worker check failed: "+j.worker_error : "checked ✓");
+    const mlx = j.packages.find(p => p.package === "mlx");
+    const vlm = j.packages.find(p => p.package === "mlx-vlm");
+    if(el("updMlx")) el("updMlx").disabled = !mlx || !mlx.updatable;
+    if(el("updMlxVlm")) el("updMlxVlm").disabled = !vlm || !vlm.updatable;
+    setText("mlxVlmState", j.worker_error ? "worker check failed: "+j.worker_error : "both ranks verified ✓");
   }catch(e){ setText("mlxVlmState", "check failed: "+e); }
 }
 async function updateRuntimePackage(pkg){
-  if(!confirm("pip install -U "+pkg+" on rank 0"+(el("updWorker").checked ? " + rank 1" : "")+"? Restart the cluster afterwards.")) return;
-  setText("mlxVlmState", "updating "+pkg+"…");
+  const restart = !!el("updRestart").checked;
+  const detail = pkg === "mlx"
+    ? "install the validated MLX + MLX-Metal pair"
+    : "install the exact latest "+pkg+" wheel";
+  if(!confirm(detail+" on both ranks"+(restart ? " and restart the cluster" : "")+"?")) return;
+  setText("mlxVlmState", "staging "+pkg+" on both ranks…");
   try{
     const r = await fetch("/api/runtime/update", {method:"POST", headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({package:pkg, include_worker:el("updWorker").checked})});
+      body:JSON.stringify({package:pkg, include_worker:true, restart:restart})});
     const j = await r.json();
-    setText("mlxVlmState", j.ok ? pkg+" update running (log: "+(j.log||"")+"); restart cluster when done" : (j.error || "failed"));
+    setText("mlxVlmState", j.ok ? pkg+" update running…" : (j.error || "failed"));
     toast(j.ok ? pkg+" update started ✓" : "update failed ✕");
+    if(j.ok) pollRuntimeUpdate();
   }catch(e){ setText("mlxVlmState", "failed"); toast("update error: "+e.message); }
   logs(true);
+}
+let runtimeUpdatePoll = null;
+async function pollRuntimeUpdate(){
+  if(runtimeUpdatePoll) clearTimeout(runtimeUpdatePoll);
+  try{
+    const j = await (await fetch("/api/runtime/update/status", {cache:"no-store"})).json();
+    if(j.running){
+      setText("mlxVlmState", "updating both ranks…");
+      runtimeUpdatePoll = setTimeout(pollRuntimeUpdate, 2500);
+      return;
+    }
+    if(j.result){
+      const ok = j.result.startsWith("ok ") || j.result.startsWith("dry_run_ok ");
+      setText("mlxVlmState", ok ? "update validated ✓" : "update failed — previous runtime restored");
+      toast(ok ? "runtime update complete ✓" : "runtime update failed ✕");
+      await checkRuntimeStack();
+      logs(true);
+    }
+  }catch(e){
+    runtimeUpdatePoll = setTimeout(pollRuntimeUpdate, 3000);
+  }
 }
 
 /* ============ logs ============ */
@@ -1691,6 +1725,7 @@ setInterval(() => {
 setTheme((() => { try{ return localStorage.getItem("tmlx-theme") || "paper"; }catch(e){ return "paper"; } })());
 renderChat(); resetChatMetrics();
 refresh();
+pollRuntimeUpdate();
 // 1s poll: /health is an in-memory dict dump (~zero server cost); paired
 // with ~1s bar transitions so motion bridges the poll gap smoothly.
 setInterval(refresh, 1000);

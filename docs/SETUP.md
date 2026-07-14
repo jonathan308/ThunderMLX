@@ -159,6 +159,11 @@ and can auto-switch backends — guarded so it never interrupts active work).
   cancel distributed generation within a few tokens and free the slot.
 - **Logs**: server `/private/tmp/minimax-m3-cluster-logs/startup.log`,
   gateway `model_gateway.log`, dashboard `cluster_gui.log`.
+- **Runtime updates**: use the Models tab. Updates are staged and applied to
+  both ranks as one transaction. MLX-VLM and MLX-LM use exact PyPI wheels
+  without replacing the custom MLX core; MLX and MLX-Metal are always
+  installed as a validated pair. Successful updates restart the managed stack
+  automatically.
 
 ## Troubleshooting
 

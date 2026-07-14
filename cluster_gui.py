@@ -715,7 +715,8 @@ print(json.dumps({"ok": True, "installed": installed, "latest": latest, "update_
 # mlx-vlm (the model runtime: MiniMax-M3-VL implementation, generation loop,
 # minimax_m3 tool parser, vision path).
 RUNTIME_PACKAGES = ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm")
-RUNTIME_UPDATABLE = {"mlx-lm", "mlx-vlm"}
+RUNTIME_UPDATABLE = {"mlx", "mlx-lm", "mlx-vlm"}
+MLX_VARIANTS_MANIFEST = CLUSTER / "runtime_patches" / "mlx_variants.json"
 
 _VERSIONS_SNIPPET = r"""
 import importlib.metadata, json
@@ -746,6 +747,32 @@ def _pypi_latest(package):
     return value[-1] if value else None
 
 
+def validated_mlx_variant():
+    try:
+        manifest = json.loads(MLX_VARIANTS_MANIFEST.read_text())
+        label = str(manifest.get("recommended") or "").strip()
+        record = (manifest.get("variants") or {}).get(label) or {}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "label": "", "version": None}
+    variant_dir = CLUSTER / "runtime_patches" / "variants" / label
+    mlx_wheels = list(variant_dir.glob("mlx-[0-9]*.whl"))
+    metal_wheels = list(variant_dir.glob("mlx_metal-[0-9]*.whl"))
+    complete = len(mlx_wheels) == 1 and len(metal_wheels) == 1
+    approved = str(record.get("status") or "").lower() in {"production", "validated"}
+    return {
+        "ok": bool(label and complete and approved),
+        "label": label,
+        "version": record.get("version"),
+        "status": record.get("status"),
+        "note": record.get("note"),
+        "artifacts_present": complete,
+        "error": (
+            None if complete and approved
+            else f"validated production wheel pair is unavailable for {label or 'recommended variant'}"
+        ),
+    }
+
+
 def runtime_stack_versions():
     py = runtime_python()
     local = {}
@@ -756,9 +783,13 @@ def runtime_stack_versions():
         local = {"error": out.get("stderr") or "local version check failed"}
     remote = {}
     if PEER:
+        remote_command = (
+            f"cd {shlex.quote(str(CLUSTER))} && "
+            f"./bin/mlx-python -c {shlex.quote(_VERSIONS_SNIPPET)}"
+        )
         rout = run(
             ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", PEER,
-             f"~/mlx-env/bin/python -c {shlex.quote(_VERSIONS_SNIPPET)}"],
+             remote_command],
             timeout=25,
         )
         try:
@@ -771,27 +802,45 @@ def runtime_stack_versions():
             latest[package] = _pypi_latest(package)
         except Exception:
             latest[package] = None
+    mlx_variant = validated_mlx_variant()
     packages = []
     for package in RUNTIME_PACKAGES:
         installed = local.get(package)
         pinned = bool(installed and ("dev" in str(installed) or "+" in str(installed)))
+        if package == "mlx":
+            updatable = bool(mlx_variant.get("ok"))
+            target_version = mlx_variant.get("version")
+            update_mode = "validated-pair"
+            note = (
+                f"validated paired MLX/MLX-Metal build ({mlx_variant.get('label')})"
+                if updatable else mlx_variant.get("error")
+            )
+        elif package == "mlx-metal":
+            updatable = False
+            target_version = mlx_variant.get("version")
+            update_mode = "paired-with-mlx"
+            note = "updated atomically with MLX; never install this package alone"
+        else:
+            updatable = package in RUNTIME_UPDATABLE
+            target_version = latest.get(package)
+            update_mode = "pypi-exact"
+            note = "dependency of mlx-vlm" if package == "mlx-lm" else "model runtime"
         packages.append({
             "package": package,
             "rank0": installed,
             "rank1": remote.get(package),
             "ranks_match": (installed == remote.get(package)) if remote and "error" not in remote else None,
             "latest_release": latest.get(package if package != "mlx-metal" else "mlx"),
-            "updatable": package in RUNTIME_UPDATABLE,
+            "target_version": target_version,
+            "update_available": bool(updatable and installed and target_version and installed != target_version),
+            "updatable": updatable,
+            "update_mode": update_mode,
             "pinned_custom_build": pinned,
-            "note": (
-                "pinned custom build — managed via ops/install_mlx_variant.sh; "
-                "a pip update would REPLACE it with an older release"
-            ) if package in ("mlx", "mlx-metal") else (
-                "dependency of mlx-vlm" if package == "mlx-lm" else "model runtime"
-            ),
+            "note": note,
         })
     return {"ok": "error" not in local, "python": py, "packages": packages,
-            "worker": PEER or "", "worker_error": remote.get("error")}
+            "worker": PEER or "", "worker_error": remote.get("error"),
+            "mlx_variant": mlx_variant}
 
 
 def write_local_env_setting(key, value):
@@ -1313,77 +1362,112 @@ async def api_runtime_update(payload: dict):
     if package not in RUNTIME_UPDATABLE:
         return JSONResponse(status_code=400, content={
             "ok": False,
-            "error": f"{package!r} is not pip-updatable here; mlx/mlx-metal are "
-                     "pinned custom builds managed via ops/install_mlx_variant.sh",
+            "error": f"{package!r} is not an independently updatable runtime package",
         })
-    include_worker = bool(payload.get("include_worker", True))
-    py = runtime_python()
-    log = CLUSTER / f"{package.replace('-', '_')}_update.log"
-    worker_cmd = ""
-    if include_worker and PEER:
-        remote_py = shlex.quote("~/mlx-env/bin/python")
-        worker_cmd = (
-            " ; "
-            f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(PEER)} "
-            f"{shlex.quote(f'{remote_py} -m pip install -U {package}')}"
+    if payload.get("include_worker", True) is False:
+        return JSONResponse(status_code=400, content={
+            "ok": False,
+            "error": "distributed runtime updates must update both ranks atomically",
+        })
+    status = runtime_update_status()
+    if status.get("running"):
+        return JSONResponse(status_code=409, content={
+            "ok": False,
+            "error": "another runtime update is already running",
+            "status": status,
+        })
+    current_health = health()
+    if current_health.get("active_request"):
+        return JSONResponse(status_code=409, content={
+            "ok": False,
+            "error": "wait for the active inference request to finish before updating",
+        })
+    restart = bool(payload.get("restart", True))
+    dry_run = bool(payload.get("dry_run", False))
+    variant = str(payload.get("variant") or "").strip()
+    if package == "mlx":
+        approved_variant = validated_mlx_variant()
+        if not approved_variant.get("ok"):
+            return JSONResponse(status_code=409, content={
+                "ok": False,
+                "error": approved_variant.get("error") or "no validated MLX build is available",
+            })
+        approved_label = str(approved_variant.get("label") or "")
+        if variant and variant != approved_label:
+            return JSONResponse(status_code=400, content={
+                "ok": False,
+                "error": f"MLX variant {variant!r} is not the approved production pair",
+            })
+        variant = approved_label
+    command = " ".join([
+        f"M3_RUNTIME_UPDATE_DRY_RUN={'1' if dry_run else '0'}",
+        "/bin/zsh",
+        shlex.quote(str(CLUSTER / "scripts" / "update_runtime.sh")),
+        shlex.quote(package),
+        "1" if restart else "0",
+        shlex.quote(variant),
+    ])
+    if dry_run:
+        result = sh(command, timeout=180)
+    else:
+        result = start_background_job(
+            "m3_runtime_update",
+            command,
+            "runtime_update.log",
         )
-    cmd = (
-        f"cd {shlex.quote(str(CLUSTER))} && "
-        f"echo '[{package} update] $(date)' > {shlex.quote(str(log))} && "
-        f"{shlex.quote(py)} -m pip install -U {package} >> {shlex.quote(str(log))} 2>&1"
-        f"{worker_cmd} >> {shlex.quote(str(log))} 2>&1 && "
-        f"{shlex.quote(py)} -c 'import importlib.metadata; print(\"installed\", importlib.metadata.version(\"{package}\"))' >> {shlex.quote(str(log))} 2>&1"
-    )
-    result = sh(
-        f"/usr/bin/screen -dmS m3_{package.replace('-', '_')}_update /bin/zsh -lc {shlex.quote(cmd)}",
-        timeout=5,
-    )
     return {
         "ok": result["ok"],
         "package": package,
-        "include_worker": include_worker,
-        "worker": PEER if include_worker else "",
-        "python": py,
-        "log": log.name,
+        "include_worker": True,
+        "worker": PEER,
+        "python": runtime_python(),
+        "restart": restart,
+        "dry_run": dry_run,
+        "variant": variant,
+        "log": "runtime_update.log",
         "result": result,
-        "note": "Restart the cluster after the update finishes so both ranks import the new version.",
+        "note": "Both ranks are staged, validated, and restarted as one transaction.",
     }
 
 
 @APP.post("/api/runtime/mlx-vlm/update")
 async def api_mlx_vlm_update(payload: dict):
-    include_worker = bool(payload.get("include_worker", True))
-    py = runtime_python()
-    log = CLUSTER / "mlx_vlm_update.log"
-    worker_cmd = ""
-    if include_worker and PEER:
-        remote_py = shlex.quote(py)
-        remote_cluster = shlex.quote(str(CLUSTER))
-        worker_cmd = (
-            " ; "
-            f"ssh -o BatchMode=yes -o ConnectTimeout=10 {shlex.quote(PEER)} "
-            f"{shlex.quote(f'cd {remote_cluster} && {remote_py} -m pip install -U mlx-vlm')}"
-        )
-    cmd = (
-        f"cd {shlex.quote(str(CLUSTER))} && "
-        f"echo '[mlx-vlm update] $(date)' > {shlex.quote(str(log))} && "
-        f"{shlex.quote(py)} -m pip install -U mlx-vlm >> {shlex.quote(str(log))} 2>&1"
-        f"{worker_cmd} >> {shlex.quote(str(log))} 2>&1 && "
-        f"{shlex.quote(py)} -c 'import importlib.metadata; print(\"installed\", importlib.metadata.version(\"mlx-vlm\"))' >> {shlex.quote(str(log))} 2>&1"
-    )
-    result = sh(
-        f"/usr/bin/screen -dmS m3_mlx_vlm_update /bin/zsh -lc {shlex.quote(cmd)}",
-        timeout=5,
-    )
+    forwarded = dict(payload or {})
+    forwarded["package"] = "mlx-vlm"
+    return await api_runtime_update(forwarded)
+
+
+def runtime_update_status():
+    pid_path = CLUSTER / "m3_runtime_update.pid"
+    log_path = CLUSTER / "runtime_update.log"
+    pid = None
+    running = False
+    try:
+        pid = int(pid_path.read_text().strip())
+        running = run(["ps", "-p", str(pid), "-o", "pid="], timeout=3).get("ok", False)
+    except Exception:
+        pass
+    tail = ""
+    if log_path.exists():
+        try:
+            tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-80:])
+        except Exception:
+            tail = ""
+    match = re.findall(r"RUNTIME_UPDATE_RESULT\s+([^\n]+)", tail)
+    result = match[-1] if match else None
     return {
-        "ok": result["ok"],
-        "include_worker": include_worker,
-        "worker": PEER if include_worker else "",
-        "python": py,
-        "log": "mlx_vlm_update.log",
+        "ok": True,
+        "running": running,
+        "pid": pid,
+        "log": log_path.name,
         "result": result,
-        "note": "Restart the cluster after the update finishes so the endpoint imports the new MLX-VLM version.",
+        "tail": tail,
     }
+
+
+@APP.get("/api/runtime/update/status")
+def api_runtime_update_status():
+    return runtime_update_status()
 
 
 @APP.get("/api/logs", response_class=PlainTextResponse)
@@ -1395,6 +1479,7 @@ def api_logs(lines: int = 160):
         log_dir / "restart.log",
         CLUSTER / "model_download.log",
         CLUSTER / "mlx_vlm_update.log",
+        CLUSTER / "runtime_update.log",
         CLUSTER / "gui_text_probe.log",
         CLUSTER / "gui_full_probe.log",
         CLUSTER / "gui_tool_cache_probe.log",
