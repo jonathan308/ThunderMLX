@@ -44,6 +44,7 @@ from sharded_server import (
     _date_context_for_session,
     _arm_rank0_semantic_eos,
     _filter_looping_control_tools,
+    _file_mutation_stop_info,
     _file_write_chunk_hint,
     _file_write_payload_chars,
     _incomplete_tool_call_budget_reached,
@@ -1150,6 +1151,10 @@ def check_large_write_chunk_hint_and_retry_feedback():
         malformed_large_edit,
         edit_tools,
     ) > 6000, "malformed edit invocation was not bounded"
+    edit_stop = _file_mutation_stop_info(malformed_large_edit, edit_tools)
+    assert edit_stop["kind"] == "file-edit", edit_stop
+    assert edit_stop["threshold_chars"] == 6000, edit_stop
+    assert edit_stop["scaffoldable"] is False, edit_stop
     malformed_edit_recovery = _tool_retry_recovery_hint(
         malformed_large_edit,
         FakeMiniMaxToolModule,
@@ -1229,6 +1234,10 @@ def check_large_write_chunk_hint_and_retry_feedback():
         incomplete_large,
         tools,
     )
+    write_stop = _file_mutation_stop_info(incomplete_large, tools)
+    assert write_stop["kind"] == "file-write", write_stop
+    assert write_stop["threshold_chars"] == _tool_write_early_stop_chars(), write_stop
+    assert write_stop["scaffoldable"] is True, write_stop
     assert scaffold_text.startswith("[Tool call: Write]"), scaffold_text[:200]
     calls, remaining = _parse_tool_calls(
         scaffold_text,

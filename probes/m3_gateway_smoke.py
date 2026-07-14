@@ -90,7 +90,13 @@ def check_zcode_title_sidecar_is_short_and_visible():
     assert model == "Minimax-M3-No-Think", payload
     assert payload["model"] == "Minimax-M3-No-Think", payload
     assert payload["thinking_mode"] == "disabled", payload
-    assert payload["max_tokens"] == 64, payload
+    assert payload["max_tokens"] == 24, payload
+    assert payload["temperature"] == 0, payload
+    assert payload["stream"] is False, payload
+    assert len(payload["messages"]) == 2, payload
+    assert "metadata, not an action" in payload["messages"][0]["content"], payload
+    assert "Build an interactive transformer demo." in payload["messages"][1]["content"], payload
+    assert "Output only the title" in payload["messages"][1]["content"], payload
 
 
 def check_unknown_models_cannot_trigger_an_omlx_switch():
