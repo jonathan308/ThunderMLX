@@ -262,7 +262,7 @@ TOOL_UNUSABLE_RETRY_TEMPERATURES = [
 # so this only bounds pathological thinking rambles; long hot-suffix decodes
 # are also the JACCL wedge-prone regime, so keep retries short.
 TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
-    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "8192") or "0"
+    os.environ.get("MLX_M3_TOOL_UNUSABLE_RETRY_MAX_TOKENS", "16384") or "0"
 )
 # A tool-required turn that has not even STARTED a call by this many decode
 # tokens is drafting work in prose rather than executing it. Stop that attempt
@@ -312,10 +312,9 @@ TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS = int(
 TOOL_WRITE_CHUNK_MAX_CHARS = int(
     os.environ.get("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "65536") or "0"
 )
-# Leave room for a native, atomic file mutation while keeping it below the
-# normal 16k output-token ceiling. Agent clients differ substantially here:
-# some ask for focused edits while others emit one 40-60 KiB call. Both are
-# valid and should finish before compatibility recovery intervenes.
+# Keep a complete mutation comfortably inside the bounded tool-retry budget.
+# Larger values let a content-first schema consume the whole decode before the
+# destination path or closing marker appears, leaving nothing safe to execute.
 _DEFAULT_TOOL_WRITE_CHUNK_TARGET_CHARS = (
     min(49152, TOOL_WRITE_CHUNK_MAX_CHARS)
     if TOOL_WRITE_CHUNK_MAX_CHARS > 0 else 0
@@ -339,7 +338,17 @@ else:
 # regenerate the atomic call. This does not cap normal answers or completed
 # calls. 0 disables.
 TOOL_INCOMPLETE_CALL_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "16384") or "0"
+    os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "32768") or "0"
+)
+# Some malformed MiniMax tool turns finish their useful payload, then sample
+# control tokens that the detokenizer buffers without producing text.  A
+# conservative consecutive-empty-token budget lets the synchronized batch
+# sampler end that tail while preserving every byte already generated.
+TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET = int(
+    os.environ.get(
+        "MLX_M3_TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET",
+        "64",
+    ) or "0"
 )
 DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_DEFAULT_REPETITION_PENALTY", "0") or "0"
@@ -415,6 +424,15 @@ SSE_KEEPALIVE_SECONDS = float(os.environ.get("MLX_M3_SSE_KEEPALIVE_SECONDS", "5"
 TOOL_STREAM_PROGRESS_SECONDS = float(
     os.environ.get("MLX_M3_TOOL_STREAM_PROGRESS_SECONDS", "45") or "0"
 )
+SSE_STREAM_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse_keepalive_comment() -> str:
+    """Return a protocol-level SSE heartbeat ignored by event consumers."""
+    return ": keepalive\n\n"
 # Native MiniMax tool XML can be malformed yet recoverable only after the
 # complete decode. Buffer the full transaction by default so a failed first
 # attempt cannot leak markup before a validated retry is ready.
@@ -6652,6 +6670,9 @@ def _generation_defaults_status():
         "tool_incomplete_call_token_budget": (
             TOOL_INCOMPLETE_CALL_TOKEN_BUDGET
         ),
+        "tool_detokenizer_silent_token_budget": (
+            TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+        ),
         "tool_loop_force_final_repeated_tool_count": (
             TOOL_LOOP_FORCE_FINAL_REPEATED_TOOL_COUNT
         ),
@@ -7821,6 +7842,18 @@ def _model_facing_tool_schemas(tools):
         )
         if normalized in _WRITE_FILE_TOOL_NAMES:
             payload_keys = ("content", "contents", "text", "data")
+        elif normalized == "applypatch":
+            # Codex exposes apply_patch as a free-form string in `input`.
+            # Without a model-facing bound MiniMax can spend the whole output
+            # budget drafting one unterminated patch before validation sees it.
+            payload_keys = (
+                "input",
+                "patch",
+                "patch_text",
+                "patchText",
+                "content",
+                "diff",
+            )
         elif normalized in _MUTATING_FILE_TOOL_NAMES:
             payload_keys = (
                 "new_string",
@@ -7839,6 +7872,23 @@ def _model_facing_tool_schemas(tools):
         )
         if not isinstance(properties, dict):
             continue
+        if normalized in _WRITE_FILE_TOOL_NAMES:
+            # OpenCode's Write schema can advertise content before filePath.
+            # MiniMax usually follows that order, so an interrupted large body
+            # may never reveal the destination needed for safe scaffolding.
+            # Reorder only the model-facing copy; the client's schema and
+            # argument names remain untouched.
+            path_keys = [
+                key for key in _FILE_PATH_ARGUMENT_KEYS if key in properties
+            ]
+            if path_keys:
+                ordered_keys = path_keys + [
+                    key for key in properties if key not in path_keys
+                ]
+                parameters["properties"] = {
+                    key: properties[key] for key in ordered_keys
+                }
+                properties = parameters["properties"]
         for key in payload_keys:
             spec = properties.get(key)
             if not isinstance(spec, dict):
@@ -9434,12 +9484,22 @@ def _file_mutation_stop_info(text, tools):
             "scaffoldable": True,
         }
     scaffoldable = bool((direct or {}).get("scaffoldable"))
+    normalized = str((direct or {}).get("normalized_name") or "")
+    apply_patch = normalized == "applypatch"
     return {
-        "kind": "file-write" if scaffoldable else "file-edit",
+        "kind": (
+            "file-write"
+            if scaffoldable
+            else "apply-patch"
+            if apply_patch
+            else "file-edit"
+        ),
+        "normalized_name": normalized,
         "payload_chars": direct_chars,
         "threshold_chars": (
             _tool_write_early_stop_chars()
             if scaffoldable
+            or apply_patch
             else TOOL_WRITE_CHUNK_MAX_CHARS
         ),
         "scaffoldable": scaffoldable,
@@ -9897,6 +9957,8 @@ def _oversized_mutating_file_payload(tool_name, arguments):
         "newString", "new_string", "newText", "new_text", "replacement",
         "patch", "patch_text", "patchText",
     )
+    if normalized == "applypatch":
+        candidates += ("input", "content", "diff")
     oversized = [
         (key, len(arguments[key]))
         for key in candidates
@@ -10039,6 +10101,169 @@ def _synthesize_bounded_write_scaffold_text(full_output, tools):
     if any(arguments.get(key) in (None, "") for key in required):
         return ""
     return f"[Tool call: {selected_name}]\n{json.dumps(arguments, ensure_ascii=False)}"
+
+
+def _complete_html_document_prefix(payload):
+    """Return one structurally complete HTML document from a noisy tail."""
+    if not isinstance(payload, str) or not payload:
+        return ""
+    # MiniMax can place its namespace separator immediately before ordinary
+    # HTML closing tags. It is transport markup, not part of the requested
+    # file. Removing it also exposes the first real document boundary before
+    # a repeated closing-tag spiral.
+    cleaned = payload.replace("]<]minimax[>[", "").lstrip()
+    if not re.match(r"(?is)(?:<!doctype\s+html\b|<html\b)", cleaned):
+        return ""
+    lower = cleaned.lower()
+    body_open = lower.find("<body")
+    if body_open < 0:
+        return ""
+    for match in re.finditer(r"(?is)</html\s*>", cleaned):
+        body_close = lower.rfind("</body>", body_open, match.start())
+        if body_close < body_open:
+            continue
+        candidate = cleaned[:match.end()].rstrip()
+        if "<script" in candidate.lower():
+            script_close = candidate.lower().rfind("</script>")
+            if script_close < body_open or script_close > body_close:
+                continue
+        return candidate
+    return ""
+
+
+def _safe_recovered_file_path(value):
+    path = str(value or "").strip().strip("'\"`")
+    if (
+        not path
+        or len(path) > 1024
+        or path.startswith("-")
+        or "*" in path
+        or "]<]minimax[>[" in path
+        or any(ord(char) < 32 for char in path)
+        or any(char in path for char in "<>")
+    ):
+        return ""
+    return path
+
+
+def _synthesize_complete_add_file_artifact_text(full_output, tools):
+    """Close a malformed Add File envelope around a complete HTML artifact.
+
+    This is intentionally narrower than general partial-patch recovery. It
+    accepts only an advertised apply_patch invocation, one safe HTML target,
+    and a document that already contains its own closing body/html boundary.
+    Update/Delete patches and incomplete source remain non-executable.
+    """
+    if not isinstance(full_output, str) or not full_output or not tools:
+        return ""
+    apply_names = [
+        name
+        for name in _tool_names_from_schema(tools)
+        if _is_apply_patch_tool_name(name)
+    ]
+    if len(apply_names) != 1:
+        return ""
+    apply_name = apply_names[0]
+    invocation = _tool_invocation_match(full_output, apply_name)
+    if not invocation:
+        return ""
+    region = full_output[invocation.start():]
+    if re.search(
+        r"\*{3}\s*(?:Update|Delete)\s+File\s*:",
+        region,
+        flags=re.IGNORECASE,
+    ):
+        return ""
+
+    path = ""
+    content = ""
+    # Native malformed flavor observed in Codex-shaped traffic:
+    # <invoke name="apply_patch"><file_path>...</file_path><patch>...</patch>
+    path_match = re.search(
+        r"(?is)<(?P<tag>file_?path|filepath|target|file)>"
+        r"(?P<value>.*?)</(?P=tag)>",
+        region,
+    )
+    payload_match = re.search(
+        r"(?is)<(?:patch|input|content|diff)>",
+        region,
+    )
+    if path_match and payload_match:
+        path = _safe_recovered_file_path(
+            path_match.group("value").replace("]<]minimax[>[", "")
+        )
+        content = _complete_html_document_prefix(
+            region[payload_match.end():]
+        )
+
+    # Standard free-form apply_patch flavor with a missing End Patch marker.
+    if not path or not content:
+        plain = region.replace("]<]minimax[>[", "")
+        if "*** Begin Patch" not in plain:
+            return ""
+        add_match = re.search(
+            r"(?im)^\s*\*{3}\s*Add\s+File\s*:\s*(?P<path>[^\r\n]+)$",
+            plain,
+        )
+        if not add_match:
+            return ""
+        path = _safe_recovered_file_path(add_match.group("path"))
+        body_lines = plain[add_match.end():].lstrip("\r\n").splitlines()
+        added_lines = []
+        for line in body_lines:
+            if re.match(r"^\s*\*{3}\s*End\s+Patch", line, re.IGNORECASE):
+                break
+            if not line.startswith("+"):
+                return ""
+            added_lines.append(line[1:])
+        content = _complete_html_document_prefix("\n".join(added_lines))
+
+    if not path or not content:
+        return ""
+    if os.path.splitext(path)[1].lower() not in {".html", ".htm"}:
+        return ""
+    patch_lines = [
+        "*** Begin Patch",
+        f"*** Add File: {path}",
+        *(f"+{line}" for line in content.splitlines()),
+        "*** End Patch",
+    ]
+    patch = "\n".join(patch_lines)
+    if TOOL_WRITE_CHUNK_MAX_CHARS > 0 and len(patch) > TOOL_WRITE_CHUNK_MAX_CHARS:
+        return ""
+    required = _tool_schema_required_names(tools, apply_name)
+    properties = _tool_schema_property_names(tools, apply_name)
+    payload_key = next(
+        (
+            key
+            for key in required
+            if re.sub(r"[^a-z0-9]", "", key.lower())
+            in {"input", "patch", "patchtext", "content", "diff"}
+        ),
+        None,
+    ) or next(
+        (
+            key
+            for key in properties
+            if re.sub(r"[^a-z0-9]", "", key.lower())
+            in {"input", "patch", "patchtext", "content", "diff"}
+        ),
+        None,
+    )
+    if not payload_key:
+        return ""
+    arguments = _canonicalize_tool_argument_keys(
+        {payload_key: patch},
+        tools,
+        apply_name,
+    )
+    if any(arguments.get(key) in (None, "") for key in required):
+        return ""
+    candidate = _openai_tool_call(apply_name, arguments, 0)
+    validated = _validate_outgoing_tool_calls([candidate], tools)
+    if len(validated) != 1:
+        return ""
+    return _tool_call_as_display_text(validated[0])
 
 
 _RELATIVE_MUTATION_TARGET_RE = re.compile(
@@ -11094,7 +11319,25 @@ def _tool_retry_recovery_hint(
             + (f" containing every required argument: {required_text}. "
                if required_text else ". ")
         )
-        if normalized in {"edit", "editfile", "multiedit", "applypatch"}:
+        if normalized == "applypatch":
+            patch_arg = next(
+                (
+                    key
+                    for key in ("input", "patch", "patch_text", "patchText")
+                    if key in required
+                ),
+                "input",
+            )
+            return base + (
+                f"Put one complete focused patch in `{patch_arg}`. It must "
+                "start with `*** Begin Patch`, contain one Add/Update/Delete "
+                "File operation, and end with `*** End Patch`. Keep the patch "
+                f"near {TOOL_WRITE_CHUNK_TARGET_CHARS} characters and below "
+                f"{TOOL_WRITE_CHUNK_MAX_CHARS} characters. Do not regenerate "
+                "the entire artifact in one patch; continue with another "
+                "focused patch after the client executes this one."
+            )
+        if normalized in {"edit", "editfile", "multiedit"}:
             size_limit = ""
             if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
                 size_limit = (
@@ -11110,6 +11353,7 @@ def _tool_retry_recovery_hint(
             )
         if TOOL_WRITE_CHUNK_MAX_CHARS > 0:
             return base + (
+                "Place the destination path argument before the content. "
                 "Create only a small working scaffold and keep the file "
                 f"content near {TOOL_WRITE_CHUNK_TARGET_CHARS} characters "
                 "and below the hard ceiling of "
@@ -11307,6 +11551,13 @@ def _tool_retry_recovery_hint(
                     set(_tool_schema_required_names(tools, name)),
                     "did not close before the generation budget ended",
                 )
+    single_apply_patch = _single_apply_patch_tool_name(tools)
+    if single_apply_patch:
+        return _mutation_hint(
+            single_apply_patch,
+            set(_tool_schema_required_names(tools, single_apply_patch)),
+            "did not produce an executable call",
+        )
     if _tool_intent_without_call(raw_output):
         if explicit_read:
             fn = explicit_read["function"]
@@ -11403,6 +11654,29 @@ def _tool_retry_prefers_no_think(
         TOOL_RETRY_NO_THINK
         and _enable_thinking_for_generation(thinking_mode)
         and int(attempt or 0) >= max(1, int(total_attempts or 0))
+        and (
+            TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS <= 0
+            or prompt_tokens <= TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS
+        )
+    )
+
+
+def _single_apply_patch_tool_name(tools):
+    """Return the advertised name when apply_patch is the only tool."""
+    names = _tool_names_from_schema(tools)
+    if len(names) != 1:
+        return ""
+    name = next(iter(names))
+    normalized = re.sub(r"[^a-z0-9]", "", name.lower())
+    return name if normalized == "applypatch" else ""
+
+
+def _single_apply_patch_fast_recovery(tools, prompt_tokens=0):
+    """Allow an immediate no-thinking retry for a short apply_patch turn."""
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    return bool(
+        TOOL_RETRY_NO_THINK
+        and _single_apply_patch_tool_name(tools)
         and (
             TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS <= 0
             or prompt_tokens <= TOOL_RETRY_NO_THINK_MAX_PROMPT_TOKENS
@@ -11596,6 +11870,25 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                          thinking_mode, require_call=require_call):
         return full_output
     label = "stream" if stream else "non-stream"
+    completed_artifact = _synthesize_complete_add_file_artifact_text(
+        full_output,
+        tools,
+    )
+    if completed_artifact and _usable_tool_turn(
+        completed_artifact,
+        tool_module,
+        tools,
+        processed_messages,
+        thinking_mode,
+        require_call=require_call,
+    ):
+        logger.warning(
+            "[rank 0] %s %s recovered a complete Add File artifact from "
+            "an unterminated apply_patch envelope",
+            label,
+            req_id,
+        )
+        return completed_artifact
     bounded_scaffold = _synthesize_bounded_write_scaffold_text(
         full_output,
         tools,
@@ -11619,8 +11912,32 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
     retry_max_tokens = min(ceiling, max(int(max_tokens or 0), 2048) * 2)
     if TOOL_UNUSABLE_RETRY_MAX_TOKENS > 0:
         retry_max_tokens = min(retry_max_tokens, TOOL_UNUSABLE_RETRY_MAX_TOKENS)
+    mutation_stop = _file_mutation_stop_info(full_output, tools) or {}
+    oversized_mutation_recovery = bool(
+        int(mutation_stop.get("payload_chars") or 0)
+        > int(mutation_stop.get("threshold_chars") or 0)
+        > 0
+    )
+    oversized_apply_patch = bool(
+        oversized_mutation_recovery
+        and mutation_stop.get("normalized_name") == "applypatch"
+    )
+    single_apply_patch = bool(_single_apply_patch_tool_name(tools))
+    fast_apply_patch_recovery = _single_apply_patch_fast_recovery(
+        tools,
+        len(token_ids or []),
+    )
+    retry_attempts = TOOL_UNUSABLE_RETRY_ATTEMPTS
+    if oversized_mutation_recovery and not oversized_apply_patch:
+        # A malformed giant mutation must not receive another full-size
+        # runway to repeat the same payload. Atomic Write can become a small
+        # scaffold. apply_patch must retain enough runway to close a complete
+        # focused patch because partial patches are never safe to execute.
+        retry_max_tokens = min(retry_max_tokens, 4096)
+    if oversized_apply_patch or single_apply_patch:
+        retry_attempts = min(retry_attempts, 2)
     logged_no_think_recovery = False
-    for attempt in range(1, TOOL_UNUSABLE_RETRY_ATTEMPTS + 1):
+    for attempt in range(1, retry_attempts + 1):
         if should_abort and should_abort():
             return full_output
         retry_params = _tool_retry_gen_params(gen_params, attempt)
@@ -11628,7 +11945,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         logger.warning(
             "[rank 0] %s %s produced an unusable tool turn; retry %d/%d "
             "(temperature=%s, max_tokens=%s, raw_head=%r, raw_tail=%r)",
-            label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            label, req_id, attempt, retry_attempts,
             retry_params.get("temperature"), retry_max_tokens,
             snippet[:200], snippet[-160:],
         )
@@ -11637,11 +11954,17 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         # no-call guard keeps duplicate private reasoning bounded. Switch to
         # native no-thinking only for the final fallback, where prefix safety
         # deliberately releases incompatible RAM KV before a cold rebuild.
-        hidden_no_think_recovery = _tool_retry_prefers_no_think(
-            thinking_mode,
-            attempt,
-            TOOL_UNUSABLE_RETRY_ATTEMPTS,
-            len(token_ids or []),
+        hidden_no_think_recovery = bool(
+            _enable_thinking_for_generation(thinking_mode)
+            and (
+                fast_apply_patch_recovery
+                or _tool_retry_prefers_no_think(
+                    thinking_mode,
+                    attempt,
+                    retry_attempts,
+                    len(token_ids or []),
+                )
+            )
         )
         retry_thinking_mode = _tool_retry_thinking_mode(
             thinking_mode,
@@ -11772,6 +12095,27 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 label, req_id, attempt, e,
             )
             return full_output
+        retry_artifact = _synthesize_complete_add_file_artifact_text(
+            full_output,
+            tools,
+        )
+        if retry_artifact and _usable_tool_turn(
+            retry_artifact,
+            tool_module,
+            tools,
+            processed_messages,
+            retry_thinking_mode,
+            require_call=require_call,
+        ):
+            logger.warning(
+                "[rank 0] %s %s tool retry %d/%d recovered a complete "
+                "Add File artifact from an unterminated apply_patch envelope",
+                label,
+                req_id,
+                attempt,
+                retry_attempts,
+            )
+            return retry_artifact
         retry_scaffold = _synthesize_bounded_write_scaffold_text(
             full_output,
             tools,
@@ -11790,7 +12134,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 label,
                 req_id,
                 attempt,
-                TOOL_UNUSABLE_RETRY_ATTEMPTS,
+                retry_attempts,
             )
             return retry_scaffold
         if _usable_tool_turn(full_output, tool_module, tools,
@@ -11799,11 +12143,11 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             logger.warning(
                 "[rank 0] %s %s tool retry %d/%d recovered a usable tool turn "
                 "(mode=%s)",
-                label, req_id, attempt, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+                label, req_id, attempt, retry_attempts,
                 retry_thinking_mode,
             )
             return full_output
-        if attempt < TOOL_UNUSABLE_RETRY_ATTEMPTS:
+        if attempt < retry_attempts:
             # rank 1 returns to its request loop between mirrored retries and
             # clears transient Metal allocations there. Rank 0 stays inside
             # this helper, so give it the same cleanup cadence without touching
@@ -11836,14 +12180,14 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             "after %d malformed retries",
             label,
             req_id,
-            TOOL_UNUSABLE_RETRY_ATTEMPTS,
+            retry_attempts,
         )
         return explicit_read_text
     snippet = re.sub(r"\s+", " ", full_output or "")
     logger.warning(
         "[rank 0] %s %s tool turn still unusable after %d retries; "
         "sending compatibility fallback (raw_head=%r, raw_tail=%r)",
-        label, req_id, TOOL_UNUSABLE_RETRY_ATTEMPTS,
+        label, req_id, retry_attempts,
         snippet[:200], snippet[-160:],
     )
     # Forensics: every exhausted ladder means a markup flavor all parse
@@ -14322,6 +14666,43 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
     return calls
 
 
+def _recover_complete_calls_before_unclosed_tail(text, tool_module, tools):
+    """Keep closed native calls when a later call is left unfinished.
+
+    MiniMax can finish a valid Write/Edit and immediately start a verification
+    call before sampling EOS.  Rejecting the final open block must not discard
+    the already atomic action.  Parse only the prefix before the last opener,
+    require its last native block to be closed, and return schema-valid calls.
+    The unfinished tail is never parsed or exposed.
+    """
+    if not text or tool_module is None or not tools:
+        return [], ""
+    start, _ = _tool_call_markers(tool_module)
+    marker_at = text.rfind(start) if start else -1
+    if marker_at <= 0:
+        return [], ""
+    prefix = text[:marker_at]
+    if start not in prefix or not _tool_block_emission_finished(
+        prefix,
+        tool_module,
+    ):
+        return [], ""
+    try:
+        from mlx_vlm.server.responses_state import process_tool_calls
+
+        parsed = process_tool_calls(prefix, tool_module, tools)
+        calls = parsed.get("calls") or []
+        validated = _validate_outgoing_tool_calls(calls, tools)
+        if not validated:
+            return [], ""
+        # Narration after a completed action belongs to the abandoned second
+        # action. Preserve only text that preceded the first native call.
+        remaining = prefix[:prefix.find(start)]
+        return validated, remaining.rstrip()
+    except Exception:
+        return [], ""
+
+
 def _parse_tool_calls(text, tool_module, tools):
     if not text or tool_module is None:
         return [], text
@@ -14338,6 +14719,20 @@ def _parse_tool_calls(text, tool_module, tools):
         and not _tool_block_emission_finished(text, tool_module)
         and "</invoke" not in open_tail
     ):
+        completed, completed_remaining = (
+            _recover_complete_calls_before_unclosed_tail(
+                text,
+                tool_module,
+                tools,
+            )
+        )
+        if completed:
+            logger.warning(
+                "preserved %d complete native tool call(s) before an "
+                "unfinished trailing call",
+                len(completed),
+            )
+            return completed, completed_remaining
         recovered = _recover_complete_json_unclosed_tool_call(
             text, tool_module, tools
         )
@@ -15100,6 +15495,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     tool_call_started = False
     tool_complete_seen = False
     raw_tool_fragment_tokens = 0
+    tool_detokenizer_silent_tokens = 0
     stopped = False
     runaway_budget = (
         TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
@@ -15149,6 +15545,13 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         )
                     if rank == 0:
                         text += token_text
+                if tools and tool_call_started:
+                    if token_text:
+                        tool_detokenizer_silent_tokens = 0
+                    else:
+                        tool_detokenizer_silent_tokens += 1
+                else:
+                    tool_detokenizer_silent_tokens = 0
                 n += 1
                 if rank == 0 and progress_cb is not None:
                     metrics = {}
@@ -15167,6 +15570,29 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         except Exception:
                             pass
                 _watchdog_tick(progress=True)
+                if (
+                    rank == 0
+                    and _BATCH_PATH_ACTIVE["value"]
+                    and not _FORCE_EOS.get("active")
+                    and tools
+                    and tool_call_started
+                    and TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET > 0
+                    and tool_detokenizer_silent_tokens
+                    >= TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+                ):
+                    logger.warning(
+                        "rank 0: tool detokenizer produced no text for %d "
+                        "consecutive tokens at token %d; arming synchronized "
+                        "EOS for bounded recovery",
+                        tool_detokenizer_silent_tokens,
+                        n,
+                    )
+                    if _arm_rank0_semantic_eos(
+                        rank,
+                        "tool_detokenizer_silent_tail",
+                        n,
+                    ):
+                        stopped = True
                 # Safe decode-phase stop (2026-07-06 EOS redesign): the stop
                 # file exists only on rank 0, so rank 0 arms EOS injection in
                 # the sampled-token sync instead of breaking; rank 1 simply
@@ -15580,6 +16006,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     stopped = False
     malformed_thinking = False
     raw_silent_tokens = 0
+    tool_detokenizer_silent_tokens = 0
     tool_complete_seen = False
     thinking_active = _enable_thinking_for_generation(thinking_mode)
     runaway_budget = (
@@ -15648,7 +16075,37 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                             tool_guard_text,
                             tool_module,
                         )
+                if tools and tool_call_started:
+                    if token_text:
+                        tool_detokenizer_silent_tokens = 0
+                    else:
+                        tool_detokenizer_silent_tokens += 1
+                else:
+                    tool_detokenizer_silent_tokens = 0
                 _watchdog_tick(progress=True)
+                if (
+                    rank == 0
+                    and _BATCH_PATH_ACTIVE["value"]
+                    and not _FORCE_EOS.get("active")
+                    and tools
+                    and tool_call_started
+                    and TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET > 0
+                    and tool_detokenizer_silent_tokens
+                    >= TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+                ):
+                    logger.warning(
+                        "rank 0: streaming tool detokenizer produced no text "
+                        "for %d consecutive tokens at token %d; arming "
+                        "synchronized EOS for bounded recovery",
+                        tool_detokenizer_silent_tokens,
+                        n,
+                    )
+                    if _arm_rank0_semantic_eos(
+                        rank,
+                        "stream_tool_detokenizer_silent_tail",
+                        n,
+                    ):
+                        stopped = True
                 # Safe decode-phase stop: rank 0 watches the coordinated stop
                 # file every 8 tokens and, when the boundary is reached, ARMS
                 # EOS injection (it does NOT break here — that would desync
@@ -19165,6 +19622,11 @@ def run_http_server(model, processor, rank):
                                     "\n[Tool action is still processing.]\n"
                                 )
                                 last_progress_pulse_at = now
+                            # A comment is the SSE-standard transport
+                            # heartbeat. Keep the empty OpenAI delta below as
+                            # well because a few agent clients only reset
+                            # their idle timer after parsing a data event.
+                            yield _sse_keepalive_comment()
                             keepalive = {
                                 "id": req_id,
                                 "object": "chat.completion.chunk",
@@ -19212,7 +19674,11 @@ def run_http_server(model, processor, rank):
                     )
                     raise
 
-            return StreamingResponse(sse_stream(), media_type="text/event-stream")
+            return StreamingResponse(
+                sse_stream(),
+                media_type="text/event-stream",
+                headers=SSE_STREAM_HEADERS,
+            )
 
         # Non-streaming path
         req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
