@@ -25,14 +25,36 @@ PID_FILE="$SCRIPT_DIR/model_gateway.pid"
 LOG_FILE="$SCRIPT_DIR/model_gateway.log"
 
 if curl -s --max-time 2 "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+  LISTENER_PID="$(lsof -nP -t -iTCP:"${PORT}" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
   if [[ -f "$PID_FILE" ]]; then
     OLD_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
-    if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" >/dev/null 2>&1; then
+    if [[ -n "$OLD_PID" && "$OLD_PID" == "$LISTENER_PID" ]] \
+        && kill -0 "$OLD_PID" >/dev/null 2>&1; then
       echo "Gateway already listening on ${HOST}:${PORT}"
       exit 0
     fi
   fi
-  echo "Gateway port responds but pid file is stale; restarting gateway..."
+  if [[ -n "$LISTENER_PID" ]]; then
+    LISTENER_COMMAND="$(ps -p "$LISTENER_PID" -o command= 2>/dev/null || true)"
+    if [[ "$LISTENER_COMMAND" == *"/model_gateway.py"* ]]; then
+      echo "Gateway port is owned by stale ThunderMLX process ${LISTENER_PID}; replacing it..."
+      kill -TERM "$LISTENER_PID" >/dev/null 2>&1 || true
+      for _ in {1..20}; do
+        if ! kill -0 "$LISTENER_PID" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.25
+      done
+      if kill -0 "$LISTENER_PID" >/dev/null 2>&1; then
+        kill -KILL "$LISTENER_PID" >/dev/null 2>&1 || true
+      fi
+    else
+      echo "Port ${PORT} is owned by a non-ThunderMLX process: ${LISTENER_COMMAND}"
+      exit 2
+    fi
+  else
+    echo "Gateway health responds but no listener PID was found; restarting gateway..."
+  fi
 fi
 
 if [[ -f "$PID_FILE" ]]; then

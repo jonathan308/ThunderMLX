@@ -9309,10 +9309,10 @@ def _tool_invocation_match(text, tool_name):
     return min(matches, key=lambda match: match.start()) if matches else None
 
 
-def _file_write_payload_chars(text, tools):
-    """Characters emitted after a file-write invocation starts, or zero."""
+def _file_mutation_payload_info(text, tools):
+    """Describe the active advertised file mutation, if one has started."""
     if not isinstance(text, str) or not text:
-        return 0
+        return None
     for tool in tools or []:
         name = _tool_function_name(tool)
         normalized = re.sub(r"[^a-z0-9]", "", name.lower())
@@ -9320,8 +9320,19 @@ def _file_write_payload_chars(text, tools):
             continue
         match = _tool_invocation_match(text, name)
         if match:
-            return len(text) - match.end()
-    return 0
+            return {
+                "name": name,
+                "normalized_name": normalized,
+                "payload_chars": len(text) - match.end(),
+                "scaffoldable": normalized in _WRITE_FILE_TOOL_NAMES,
+            }
+    return None
+
+
+def _file_write_payload_chars(text, tools):
+    """Characters emitted after a file mutation invocation, or zero."""
+    info = _file_mutation_payload_info(text, tools)
+    return int((info or {}).get("payload_chars") or 0)
 
 
 def _shell_create_file_payload_info(text, tools):
@@ -9382,6 +9393,41 @@ def _shell_create_file_payload_info(text, tools):
             "payload_chars": len(payload),
         }
     return None
+
+
+def _file_mutation_stop_info(text, tools):
+    """Return the applicable early-stop policy for an open file mutation.
+
+    Atomic Write and shell-create calls can be replaced by a safe scaffold,
+    so they use the lower scaffold threshold. Edit payloads cannot be
+    truncated without changing replacement semantics; let those calls close
+    naturally up to the existing hard mutation ceiling instead of clipping
+    them at the Write-only threshold and entering an expensive retry ladder.
+    """
+    direct = _file_mutation_payload_info(text, tools)
+    shell = _shell_create_file_payload_info(text, tools)
+    direct_chars = int((direct or {}).get("payload_chars") or 0)
+    shell_chars = int((shell or {}).get("payload_chars") or 0)
+    if direct_chars <= 0 and shell_chars <= 0:
+        return None
+    if shell_chars >= direct_chars:
+        return {
+            "kind": "file-producing shell",
+            "payload_chars": shell_chars,
+            "threshold_chars": _tool_write_early_stop_chars(),
+            "scaffoldable": True,
+        }
+    scaffoldable = bool((direct or {}).get("scaffoldable"))
+    return {
+        "kind": "file-write" if scaffoldable else "file-edit",
+        "payload_chars": direct_chars,
+        "threshold_chars": (
+            _tool_write_early_stop_chars()
+            if scaffoldable
+            else TOOL_WRITE_CHUNK_MAX_CHARS
+        ),
+        "scaffoldable": scaffoldable,
+    }
 
 
 def _tool_intent_without_call(text):
@@ -14924,24 +14970,21 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         and tool_call_started
                         and write_scaffold_threshold > 0
                         and n % 8 == 0):
-                    write_payload_chars = _file_write_payload_chars(
+                    mutation_stop = _file_mutation_stop_info(
                         tool_accumulated,
                         tools,
+                    ) or {}
+                    oversized_payload_chars = int(
+                        mutation_stop.get("payload_chars") or 0
                     )
-                    shell_write = _shell_create_file_payload_info(
-                        tool_accumulated,
-                        tools,
-                    )
-                    shell_write_payload_chars = int(
-                        (shell_write or {}).get("payload_chars") or 0
-                    )
-                    oversized_payload_chars = max(
-                        write_payload_chars,
-                        shell_write_payload_chars,
+                    mutation_threshold = int(
+                        mutation_stop.get("threshold_chars") or 0
                     )
                     if (
+                        mutation_threshold > 0
+                        and
                         oversized_payload_chars
-                        > write_scaffold_threshold
+                        > mutation_threshold
                         and not _tool_call_complete_for_stop(
                             tool_accumulated,
                             tool_module,
@@ -14950,18 +14993,18 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     ):
                         logger.warning(
                             "rank 0: oversized %s payload at token %d "
-                            "(%d chars after invocation, scaffold=%d, hard=%d) "
-                            "— forcing EOS for immediate scaffold",
-                            (
-                                "file-producing shell"
-                                if shell_write_payload_chars
-                                >= oversized_payload_chars
-                                else "file-write"
-                            ),
+                            "(%d chars after invocation, limit=%d, hard=%d) "
+                            "— forcing EOS for %s",
+                            mutation_stop.get("kind") or "file mutation",
                             n,
                             oversized_payload_chars,
-                            write_scaffold_threshold,
+                            mutation_threshold,
                             TOOL_WRITE_CHUNK_MAX_CHARS,
+                            (
+                                "immediate scaffold"
+                                if mutation_stop.get("scaffoldable")
+                                else "bounded retry"
+                            ),
                         )
                         _FORCE_EOS["active"] = True
                         stopped = True
@@ -15408,24 +15451,21 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         and tool_call_started
                         and write_scaffold_threshold > 0
                         and n % 8 == 0):
-                    write_payload_chars = _file_write_payload_chars(
+                    mutation_stop = _file_mutation_stop_info(
                         tool_guard_text,
                         tools,
+                    ) or {}
+                    oversized_payload_chars = int(
+                        mutation_stop.get("payload_chars") or 0
                     )
-                    shell_write = _shell_create_file_payload_info(
-                        tool_guard_text,
-                        tools,
-                    )
-                    shell_write_payload_chars = int(
-                        (shell_write or {}).get("payload_chars") or 0
-                    )
-                    oversized_payload_chars = max(
-                        write_payload_chars,
-                        shell_write_payload_chars,
+                    mutation_threshold = int(
+                        mutation_stop.get("threshold_chars") or 0
                     )
                     if (
+                        mutation_threshold > 0
+                        and
                         oversized_payload_chars
-                        > write_scaffold_threshold
+                        > mutation_threshold
                         and not _tool_call_complete_for_stop(
                             tool_guard_text,
                             tool_module,
@@ -15434,18 +15474,18 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     ):
                         logger.warning(
                             "rank 0: oversized streaming %s payload at token "
-                            "%d (%d chars after invocation, scaffold=%d, "
-                            "hard=%d) — forcing EOS for immediate scaffold",
-                            (
-                                "file-producing shell"
-                                if shell_write_payload_chars
-                                >= oversized_payload_chars
-                                else "file-write"
-                            ),
+                            "%d (%d chars after invocation, limit=%d, "
+                            "hard=%d) — forcing EOS for %s",
+                            mutation_stop.get("kind") or "file mutation",
                             n,
                             oversized_payload_chars,
-                            write_scaffold_threshold,
+                            mutation_threshold,
                             TOOL_WRITE_CHUNK_MAX_CHARS,
+                            (
+                                "immediate scaffold"
+                                if mutation_stop.get("scaffoldable")
+                                else "bounded retry"
+                            ),
                         )
                         _FORCE_EOS["active"] = True
                         stopped = True
