@@ -303,9 +303,14 @@ MLX_M3_DEFAULT_TEMPERATURE=0.2
 MLX_M3_MAX_CONCURRENT_REQUESTS=1
 MLX_M3_PROMPT_CACHE=1
 MLX_M3_PROMPT_CACHE_THINKING_MODE=visible
-MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS=4
+MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS=2
 MLX_M3_PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS=750000
 ```
+
+The resident-token budget limits extra parked RAM caches, not the active
+request's context window. An active long session can still use the configured
+model context; sessions that cannot be parked within a rank's resident budget
+fall back to SSD persistence or cold prefill when revisited.
 
 The portable `.env.example` leaves SSD cache disabled by default. Enable it only
 after validating your storage paths:

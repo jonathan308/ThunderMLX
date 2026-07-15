@@ -147,6 +147,9 @@ def main():
     parser.add_argument("--base", default=BASE)
     parser.add_argument("--records", type=int, default=600)
     parser.add_argument("--model", default="Minimax-M3-No-Think")
+    parser.add_argument("--seed-max-tokens", type=int, default=64)
+    parser.add_argument("--short-max-tokens", type=int, default=16)
+    parser.add_argument("--followup-max-tokens", type=int, default=32)
     parser.add_argument("--session-a", default="cache-map-agent-a")
     parser.add_argument("--session-b", default="cache-map-short-b")
     parser.add_argument(
@@ -185,7 +188,7 @@ def main():
         "seed_agent_session",
         seed_messages,
         model=args.model,
-        max_tokens=64,
+        max_tokens=args.seed_max_tokens,
         session_id=None if args.implicit_sessions else args.session_a,
         timeout=900,
     )
@@ -196,7 +199,7 @@ def main():
         "interleaved_short_session",
         [{"role": "user", "content": "Say OK."}],
         model=args.model,
-        max_tokens=16,
+        max_tokens=args.short_max_tokens,
         session_id=None if args.implicit_sessions else args.session_b,
         timeout=180,
     )
@@ -209,7 +212,7 @@ def main():
     row = {
         "live": live,
         "resident_slots": slots,
-        "entries": entries,
+        "entry_count": len(entries),
         "cache_len": pcache.get("cache_len"),
         "short_action": short.get("cache_action"),
     }
@@ -226,13 +229,16 @@ def main():
             {"role": "user", "content": "Give one follow-up sentence about the original cache-map prompt."},
         ],
         model=args.model,
-        max_tokens=32,
+        max_tokens=args.followup_max_tokens,
         session_id=None if args.implicit_sessions else args.session_a,
         timeout=300,
     )
 
     failures = []
-    if short.get("cache_action") != "session_switch_stash_rebuild":
+    expected_short_actions = {"session_switch_stash_rebuild"}
+    if args.implicit_sessions:
+        expected_short_actions.add("auto_session_isolation_rebuild")
+    if short.get("cache_action") not in expected_short_actions:
         failures.append(f"short action={short.get('cache_action')}")
     expected_resident_session = seed.get("cache_session_id") if args.implicit_sessions else args.session_a
     short_session = short.get("cache_session_id")
