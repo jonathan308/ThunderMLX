@@ -32,6 +32,7 @@ import sharded_server as server
 
 from sharded_server import (
     NATIVE_TOOL_ACTION_RETRY_ATTEMPTS,
+    NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS,
     TOOL_ACTION_NO_CALL_TOKEN_BUDGET,
     TOOL_COMPAT_OVERLAY,
     TOOL_NO_CALL_TOKEN_BUDGET,
@@ -40,6 +41,7 @@ from sharded_server import (
     TOOL_SYSTEM_HINT_ENABLED,
     TOOL_THINKING_RUNAWAY_TOKEN_BUDGET,
     _parse_tool_calls,
+    _native_tool_retry_ram_reset_reason,
     _tool_text_requests_action,
     _tool_call_complete_for_stop,
     _validate_outgoing_tool_calls,
@@ -376,6 +378,79 @@ def test_native_incomplete_call_after_tool_result_gets_one_retry():
     assert broadcast.call_count == 1, broadcast.call_count
 
 
+def test_corrupt_long_native_retry_releases_only_live_ram_kv():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                },
+                "required": ["command"],
+            },
+        },
+    }]
+    recovered = (
+        f"{NS}<tool_call>"
+        f'{NS}<invoke name="Bash">'
+        f"{NS}<command>pwd{NS}</command>"
+        f"{NS}</invoke>{NS}</tool_call>"
+    )
+    malformed = (
+        f"{NS}<tool_call>{NS}<invoke name=\"Bash\">"
+        f"{NS}<command>pwd" + ("\x00" * 32)
+    )
+    assert _native_tool_retry_ram_reset_reason(
+        malformed,
+        NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS,
+    ) == "corrupt_control_bytes"
+    with (
+        patch.object(server, "_bcast") as broadcast,
+        patch.object(server, "_clear_stop_request"),
+        patch.object(server, "_clear_prefill_stop_file"),
+        patch.object(server, "_tool_retry_recovery_hint", return_value=None),
+        patch.object(server, "_reset_prompt_cache_on_all_ranks") as reset,
+        patch.object(server, "run_generation", return_value=recovered) as generate,
+    ):
+        output = server._ensure_usable_tool_turn(
+            object(),
+            object(),
+            0,
+            full_output=malformed,
+            rank_request={"tool_choice": "auto"},
+            prompt="prompt",
+            max_tokens=512,
+            thinking_mode="disabled",
+            gen_params={"temperature": 0.0},
+            image_path=None,
+            token_ids=list(range(NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS)),
+            session_id="native-corrupt-retry-smoke",
+            session_source="test",
+            tool_module=minimax_m3,
+            tools=tools,
+            processed_messages=[{
+                "role": "user",
+                "content": "Use Bash to inspect the working directory.",
+            }],
+            req_id="native-corrupt-retry-smoke",
+            stream=True,
+            action_tool_task=True,
+        )
+    assert output == recovered, output
+    assert generate.call_count == 1, generate.call_count
+    assert broadcast.call_count == 1, broadcast.call_count
+    reset.assert_called_once_with(
+        0,
+        reason="native tool retry RAM reset:corrupt_control_bytes",
+        clear_memory=True,
+        clear_manifest=False,
+        clear_resident=False,
+    )
+
+
 def test_tool_decode_reuse_override_is_request_scoped():
     class FakeLanguage:
         _MSA_DECODE_TOPK_REUSE_TOKENS = 48
@@ -574,6 +649,7 @@ def main():
     assert TOOL_NO_CALL_TOKEN_BUDGET == 0
     assert TOOL_ACTION_NO_CALL_TOKEN_BUDGET == 0
     assert NATIVE_TOOL_ACTION_RETRY_ATTEMPTS == 1
+    assert NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS == 65536
     assert _tool_text_requests_action("Send the email using the terminal tool.")
     assert _tool_text_requests_action(
         "Set a goal to create a fun small HTML game in this workspace."
@@ -585,6 +661,7 @@ def main():
     test_native_responses_style_to_attribute_recovers_exact_schema_name()
     test_native_action_reasoning_only_turn_gets_one_native_retry()
     test_native_incomplete_call_after_tool_result_gets_one_retry()
+    test_corrupt_long_native_retry_releases_only_live_ram_kv()
     test_tool_decode_reuse_override_is_request_scoped()
     test_legacy_display_style_is_not_recovered_by_default()
     test_closed_native_write_survives_unfinished_followup()
