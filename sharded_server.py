@@ -179,6 +179,21 @@ NATIVE_TOOL_ACTION_RETRY_ATTEMPTS = max(
     0,
     int(os.environ.get("MLX_M3_NATIVE_TOOL_ACTION_RETRY_ATTEMPTS", "1") or "0"),
 )
+# Retrying an unusable native tool turn against a large live KV can briefly
+# retain both generations' graphs.  On the 128GB rank that exhausted wired
+# memory after a 92K-token ZCode turn even though the steady-state KV fit.
+# Release only the active RAM KV before this rare recovery; the validated SSD
+# checkpoint remains available and is restored by the normal cache path.
+NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS = max(
+    0,
+    int(
+        os.environ.get(
+            "MLX_M3_NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS",
+            "65536",
+        )
+        or "0"
+    ),
+)
 TOOL_PARSE_DIAGNOSTICS = os.environ.get(
     "MLX_M3_TOOL_PARSE_DIAGNOSTICS", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -6332,13 +6347,30 @@ def _clear_mlx_memory(reason):
     """Best-effort MLX/Metal cleanup before ordinary process exits."""
     try:
         logger.info(f"clearing MLX/Metal cache ({reason})")
+        # Drop Python references first so their MLX buffers enter the allocator
+        # cache before we flush it.  Clearing in the opposite order leaves the
+        # just-collected buffers wired until a later request.
+        gc.collect()
         mx.clear_cache()
         if hasattr(mx, "metal") and hasattr(mx.metal, "clear_cache"):
             mx.metal.clear_cache()
-        gc.collect()
         logger.info(f"MLX/Metal cache cleared ({reason})")
     except Exception as e:
         logger.warning(f"MLX/Metal cache clear failed during {reason}: {e}")
+
+
+def _clear_transient_mlx_memory(reason):
+    """Release completed-request graphs without touching live prompt KV."""
+    try:
+        collected = gc.collect()
+        mx.clear_cache()
+        logger.debug(
+            "cleared transient MLX allocations (%s, collected=%d)",
+            reason,
+            collected,
+        )
+    except Exception as e:
+        logger.debug("transient MLX cleanup failed during %s: %s", reason, e)
 
 
 def _install_shutdown_handlers():
@@ -6766,6 +6798,9 @@ def _generation_defaults_status():
         "tool_compat_overlay": TOOL_COMPAT_OVERLAY,
         "native_tool_action_retry_attempts": (
             NATIVE_TOOL_ACTION_RETRY_ATTEMPTS
+        ),
+        "native_tool_action_retry_ram_reset_tokens": (
+            NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS
         ),
         "inject_date_context": INJECT_DATE_CONTEXT,
         "tool_no_call_token_budget": TOOL_NO_CALL_TOKEN_BUDGET,
@@ -11957,6 +11992,28 @@ def _remaining_tool_reasoning(buffered_reasoning, live_reasoning):
     return ""
 
 
+def _native_tool_retry_ram_reset_reason(full_output, prompt_tokens):
+    """Return why a native retry must start from a clean RAM cache."""
+    output = full_output or ""
+    control_bytes = sum(
+        1
+        for char in output
+        if ord(char) < 32 and char not in "\n\r\t"
+    )
+    if "\x00" in output or control_bytes >= 8:
+        return "corrupt_control_bytes"
+    prompt_tokens = max(0, int(prompt_tokens or 0))
+    if (
+        NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS > 0
+        and prompt_tokens >= NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS
+    ):
+        return (
+            "long_context:"
+            f"{prompt_tokens}>={NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS}"
+        )
+    return None
+
+
 def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                              rank_request, prompt, max_tokens, thinking_mode,
                              gen_params, image_path, token_ids, session_id,
@@ -12075,6 +12132,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
     if oversized_apply_patch or single_apply_patch:
         retry_attempts = min(retry_attempts, 2)
     logged_no_think_recovery = False
+    retry_ram_reset_done = False
     for attempt in range(1, retry_attempts + 1):
         if should_abort and should_abort():
             return full_output
@@ -12181,6 +12239,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                         clear_manifest=False,
                         clear_resident=True,
                     )
+                    retry_ram_reset_done = True
             except Exception as e:
                 logger.warning(
                     "[rank 0] %s %s could not render targeted tool retry "
@@ -12212,6 +12271,34 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             bool(action_tool_task),
             bool(require_call),
         )
+        retry_ram_reset_reason = (
+            _native_tool_retry_ram_reset_reason(
+                full_output,
+                len(retry_token_ids or []),
+            )
+            if native_action_retry and not retry_ram_reset_done
+            else None
+        )
+        if retry_ram_reset_reason:
+            logger.warning(
+                "[rank 0] %s %s tool retry %d releasing active distributed "
+                "RAM KV before recovery (%s); preserving SSD checkpoints",
+                label,
+                req_id,
+                attempt,
+                retry_ram_reset_reason,
+            )
+            _reset_prompt_cache_on_all_ranks(
+                rank,
+                reason=(
+                    "native tool retry RAM reset:"
+                    f"{retry_ram_reset_reason}"
+                ),
+                clear_memory=True,
+                clear_manifest=False,
+                clear_resident=False,
+            )
+            retry_ram_reset_done = True
         _clear_stop_request()
         _clear_prefill_stop_file("rank 0 tool retry")
         _bcast(retry_request, rank)
@@ -19653,8 +19740,11 @@ def run_http_server(model, processor, rank):
                         if CLEAR_CACHE_AFTER_REQUEST or (
                             producer_error is not None and CLEAR_CACHE_AFTER_ERROR
                         ):
-                            mx.clear_cache()
-                        gc.collect()
+                            _clear_transient_mlx_memory(
+                                f"rank 0 stream {req_id} complete"
+                            )
+                        else:
+                            gc.collect()
                         release_generation_slot(req_id, active, producer_error)
                         done_event.set()
                         if client_connected.is_set():
@@ -19915,8 +20005,11 @@ def run_http_server(model, processor, rank):
                     if CLEAR_CACHE_AFTER_REQUEST or (
                         job_error is not None and CLEAR_CACHE_AFTER_ERROR
                     ):
-                        mx.clear_cache()
-                    gc.collect()
+                        _clear_transient_mlx_memory(
+                            f"rank 0 non-stream {req_id} complete"
+                        )
+                    else:
+                        gc.collect()
                     release_generation_slot(req_id, active, job_error)
                     done_event.set()
 
@@ -20222,7 +20315,9 @@ def run_mirror(model, processor, rank):
                 session_source=req.get("session_source"),
             )
             if CLEAR_CACHE_AFTER_REQUEST:
-                mx.clear_cache()
+                _clear_transient_mlx_memory("rank 1 prompt-cache prewarm")
+            else:
+                gc.collect()
             continue
         if isinstance(req, dict) and req.get("op") == "generation_barrier":
             logger.info(
@@ -20277,7 +20372,9 @@ def run_mirror(model, processor, rank):
                                "no_call_token_budget"
                            ))
             if CLEAR_CACHE_AFTER_REQUEST:
-                mx.clear_cache()
+                _clear_transient_mlx_memory("rank 1 request complete")
+            else:
+                gc.collect()
             logger.info(
                 "rank 1: mirror done, mlx_cache_cleared=%s",
                 CLEAR_CACHE_AFTER_REQUEST,
@@ -20285,7 +20382,9 @@ def run_mirror(model, processor, rank):
         except Exception as e:
             logger.error(f"rank 1: generation error, releasing memory: {e}")
             if CLEAR_CACHE_AFTER_ERROR:
-                mx.clear_cache()
+                _clear_transient_mlx_memory("rank 1 request error")
+            else:
+                gc.collect()
             logger.info("rank 1: recovered from error, waiting for next request")
             # CRITICAL: do NOT exit — keep the loop alive so the cluster
             # survives errors instead of dying and orphaning memory.
