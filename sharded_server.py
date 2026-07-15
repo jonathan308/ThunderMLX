@@ -270,13 +270,13 @@ TOOL_UNUSABLE_RETRY_MAX_TOKENS = int(
 # the call. Once a real marker begins this guard permanently disengages, so a
 # large Write/Edit payload is never clipped. 0 disables.
 TOOL_NO_CALL_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "768") or "0"
+    os.environ.get("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "0") or "0"
 )
 # Later rounds of an action task may legitimately finish in prose. Give them
 # more room than the mandatory first call, but do not let a fresh code draft
 # run for thousands of tokens before finally emitting an empty marker.
 TOOL_ACTION_NO_CALL_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536") or "0"
+    os.environ.get("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "0") or "0"
 )
 # Hidden schema-repair retries already have focused recovery instructions.
 # This is the no-thinking budget; thinking action retries inherit the larger
@@ -434,15 +434,16 @@ SSE_STREAM_HEADERS = {
 def _sse_keepalive_comment() -> str:
     """Return a protocol-level SSE heartbeat ignored by event consumers."""
     return ": keepalive\n\n"
-# Native MiniMax tool XML can be malformed yet recoverable only after the
-# complete decode. Buffer the full transaction by default so a failed first
-# attempt cannot leak markup before a validated retry is ready.
+# Native mode streams ordinary reasoning/content while retaining the short
+# marker holdback below. Transaction-wide buffering remains opt-in for operators
+# that deliberately enable the compatibility retry layer.
 TOOL_STREAM_BUFFER_ALL = os.environ.get(
-    "MLX_M3_TOOL_STREAM_BUFFER_ALL", "1"
+    "MLX_M3_TOOL_STREAM_BUFFER_ALL", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-# Legacy opt-in for live visible content on tool turns. It is ignored while
-# TOOL_STREAM_BUFFER_ALL is enabled.
-TOOL_STREAM_CONTENT = os.environ.get("MLX_M3_TOOL_STREAM_CONTENT", "0") == "1"
+# Stream ordinary visible content on native tool-capable turns. The marker
+# holdback below prevents MiniMax tool XML from reaching the client; full-turn
+# buffering remains available as an explicit compatibility mode.
+TOOL_STREAM_CONTENT = os.environ.get("MLX_M3_TOOL_STREAM_CONTENT", "1") == "1"
 TOOL_STREAM_HOLDBACK_CHARS = max(
     8, int(os.environ.get("MLX_M3_TOOL_STREAM_HOLDBACK_CHARS", "24") or "24")
 )
@@ -1299,8 +1300,8 @@ THINKING_RUNAWAY_TOKEN_BUDGET = int(
 # progress toward a call. End that attempt so the existing no-thinking retry
 # can emit the tool call without spending the full prose-thinking budget.
 TOOL_THINKING_RUNAWAY_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "2048")
-    or "2048"
+    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0")
+    or "0"
 )
 # Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
 # the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
@@ -9262,9 +9263,9 @@ def _last_user_instruction_text(processed_messages):
 
 
 _TOOL_ACTION_VERBS = (
-    "add|audit|build|check|copy|create|delete|edit|execute|explore|fetch|"
+    "add|audit|browse|build|check|copy|create|delete|download|edit|email|execute|explore|fetch|"
     "find|fix|implement|inspect|install|list|make|modify|move|open|patch|"
-    "read|remove|rename|review|rewrite|run|save|search|strip|test|update|validate|"
+    "navigate|read|remove|rename|review|rewrite|run|save|search|send|strip|test|update|upload|validate|"
     "verify|write"
 )
 
@@ -18955,7 +18956,8 @@ def run_http_server(model, processor, rank):
                                         }],
                                     })
                                 continue
-                            # Legacy live tool-delta path, explicitly opt-in.
+                            # Native live tool-delta path. Ordinary text streams
+                            # immediately; native tool XML is held for EOS parse.
                             if tools:
                                 # Thinking streams live on tool turns exactly
                                 # like oMLX: the splitter routes tool markup to

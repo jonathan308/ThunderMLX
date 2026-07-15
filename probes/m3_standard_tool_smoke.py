@@ -20,12 +20,24 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.setdefault("MLX_M3_TOOL_COMPAT_OVERLAY", "0")
 os.environ.setdefault("MLX_M3_TOOL_SYSTEM_HINT", "0")
+os.environ.setdefault("MLX_M3_TOOL_STREAM_BUFFER_ALL", "0")
+os.environ.setdefault("MLX_M3_TOOL_STREAM_CONTENT", "1")
+os.environ.setdefault("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0")
+os.environ.setdefault("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "0")
+os.environ.setdefault("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "0")
 
 import mlx_vlm.tool_parsers.minimax_m3 as minimax_m3
 
 from sharded_server import (
+    TOOL_ACTION_NO_CALL_TOKEN_BUDGET,
     TOOL_COMPAT_OVERLAY,
+    TOOL_NO_CALL_TOKEN_BUDGET,
+    TOOL_STREAM_BUFFER_ALL,
+    TOOL_STREAM_CONTENT,
+    TOOL_SYSTEM_HINT_ENABLED,
+    TOOL_THINKING_RUNAWAY_TOKEN_BUDGET,
     _parse_tool_calls,
+    _tool_text_requests_action,
     _tool_call_complete_for_stop,
     _validate_outgoing_tool_calls,
 )
@@ -151,6 +163,13 @@ def test_closed_native_write_survives_unfinished_followup():
 
 def main():
     assert TOOL_COMPAT_OVERLAY is False
+    assert TOOL_SYSTEM_HINT_ENABLED is False
+    assert TOOL_STREAM_BUFFER_ALL is False
+    assert TOOL_STREAM_CONTENT is True
+    assert TOOL_THINKING_RUNAWAY_TOKEN_BUDGET == 0
+    assert TOOL_NO_CALL_TOKEN_BUDGET == 0
+    assert TOOL_ACTION_NO_CALL_TOKEN_BUDGET == 0
+    assert _tool_text_requests_action("Send the email using the terminal tool.")
     test_native_claude_style_write_call_with_camel_schema()
     test_native_claude_style_write_call_maps_to_snake_schema()
     test_legacy_display_style_is_not_recovered_by_default()
