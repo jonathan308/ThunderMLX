@@ -156,8 +156,31 @@ TOOL_DEFAULT_TEMPERATURE = float(
 TOOL_DEFAULT_TOP_P = float(os.environ.get("MLX_M3_TOOL_DEFAULT_TOP_P", "1.0") or "1.0")
 TOOL_DEFAULT_TOP_K = int(os.environ.get("MLX_M3_TOOL_DEFAULT_TOP_K", "0") or "0")
 TOOL_DEFAULT_MIN_P = float(os.environ.get("MLX_M3_TOOL_DEFAULT_MIN_P", "0.0") or "0.0")
+# Approximate sparse-block reuse is an excellent prose decode optimization,
+# but a live OpenCode A/B showed that it can drift inside exact structured
+# arguments (tool names, absolute paths, and required fields). Tool requests
+# therefore default to exact per-token block selection while ordinary chat
+# keeps the independently tuned runtime value (48 on the reference cluster).
+TOOL_DECODE_TOPK_REUSE_TOKENS = max(
+    0,
+    min(
+        64,
+        int(os.environ.get("MLX_M3_TOOL_DECODE_TOPK_REUSE_TOKENS", "0") or "0"),
+    ),
+)
 TOOL_COMPAT_OVERLAY = os.environ.get(
     "MLX_M3_TOOL_COMPAT_OVERLAY", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+# Native-first mode still needs one bounded continuation when an explicit
+# action turn ends after private reasoning without emitting a call. This is
+# not a parser overlay: the retry uses the same model template, submitted tool
+# schema, and native mlx-vlm parser. Successful native turns never enter it.
+NATIVE_TOOL_ACTION_RETRY_ATTEMPTS = max(
+    0,
+    int(os.environ.get("MLX_M3_NATIVE_TOOL_ACTION_RETRY_ATTEMPTS", "1") or "0"),
+)
+TOOL_PARSE_DIAGNOSTICS = os.environ.get(
+    "MLX_M3_TOOL_PARSE_DIAGNOSTICS", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 TOOL_THINKING_MODE = os.environ.get("MLX_M3_TOOL_THINKING_MODE", "request").strip().lower()
 if TOOL_THINKING_MODE not in {"request", "enabled", "disabled", "adaptive"}:
@@ -785,9 +808,11 @@ def _clear_decode_topk_caches(model):
         if oid in seen:
             return
         seen.add(oid)
-        if hasattr(obj, "_minimax_m3_decode_topk_cache"):
+        for attr in ("_m3_decode_topk_cache", "_minimax_m3_decode_topk_cache"):
+            if not hasattr(obj, attr):
+                continue
             try:
-                delattr(obj, "_minimax_m3_decode_topk_cache")
+                delattr(obj, attr)
                 cleared += 1
             except Exception:
                 pass
@@ -874,6 +899,97 @@ def _apply_runtime_model_tuning(model):
         "sparse_topk_blocks": sparse_result,
         "decode_runtime": decode_result,
     }
+
+
+def _decode_topk_language_module():
+    """Return the loaded ThunderMLX MiniMax language module."""
+    import sys
+
+    candidates = []
+    try:
+        from mlx_vlm.models.minimax_m3_vl import language as minimax_language
+
+        candidates.append(minimax_language)
+    except Exception:
+        pass
+    candidates.extend(
+        module
+        for name, module in tuple(sys.modules.items())
+        if name.endswith("minimax_m3_vl.language") and module is not None
+    )
+    for module in candidates:
+        if callable(getattr(module, "set_decode_topk_reuse_tokens", None)):
+            return module
+    raise RuntimeError("patched MiniMax decode runtime module is not loaded")
+
+
+def _begin_request_decode_topk_reuse(tools, rank):
+    """Apply the exact structured-decode profile for one tool request.
+
+    The server is single-flight and both ranks receive the same advertised
+    tool list, so this process-local override is symmetric. The generation
+    epoch invalidates layer-local selections between requests; restoring the
+    configured chat value in ``finally`` cannot expose a stale selection.
+    """
+    if not tools:
+        return None
+    try:
+        minimax_language = _decode_topk_language_module()
+
+        previous = int(
+            getattr(
+                minimax_language,
+                "_MSA_DECODE_TOPK_REUSE_TOKENS",
+                _runtime_tuning_status().get("decode_topk_reuse_tokens") or 0,
+            )
+            or 0
+        )
+        target = int(TOOL_DECODE_TOPK_REUSE_TOKENS)
+        if previous != target:
+            minimax_language.set_decode_topk_reuse_tokens(target)
+            logger.info(
+                "rank %s: tool decode top-k reuse override %d -> %d",
+                rank,
+                previous,
+                target,
+            )
+        return minimax_language, previous
+    except Exception as exc:
+        logger.warning(
+            "rank %s: tool decode top-k reuse override unavailable: %s",
+            rank,
+            exc,
+        )
+        return None
+
+
+def _restore_request_decode_topk_reuse(state, rank):
+    if state is None:
+        return
+    minimax_language, previous = state
+    try:
+        current = int(
+            getattr(
+                minimax_language,
+                "_MSA_DECODE_TOPK_REUSE_TOKENS",
+                previous,
+            )
+            or 0
+        )
+        if current != previous:
+            minimax_language.set_decode_topk_reuse_tokens(previous)
+            logger.info(
+                "rank %s: restored chat decode top-k reuse %d",
+                rank,
+                previous,
+            )
+    except Exception as exc:
+        logger.warning(
+            "rank %s: failed to restore decode top-k reuse to %d: %s",
+            rank,
+            previous,
+            exc,
+        )
 
 
 REFRESH_GENERATION_STREAM = os.environ.get(
@@ -6644,9 +6760,13 @@ def _generation_defaults_status():
         "tool_top_p": TOOL_DEFAULT_TOP_P,
         "tool_top_k": TOOL_DEFAULT_TOP_K,
         "tool_min_p": TOOL_DEFAULT_MIN_P,
+        "tool_decode_topk_reuse_tokens": TOOL_DECODE_TOPK_REUSE_TOKENS,
         "tool_seed": TOOL_DEFAULT_SEED,
         "tool_thinking_mode": TOOL_THINKING_MODE,
         "tool_compat_overlay": TOOL_COMPAT_OVERLAY,
+        "native_tool_action_retry_attempts": (
+            NATIVE_TOOL_ACTION_RETRY_ATTEMPTS
+        ),
         "inject_date_context": INJECT_DATE_CONTEXT,
         "tool_no_call_token_budget": TOOL_NO_CALL_TOKEN_BUDGET,
         "tool_action_no_call_token_budget": (
@@ -9266,7 +9386,7 @@ _TOOL_ACTION_VERBS = (
     "add|audit|browse|build|check|copy|create|delete|download|edit|email|execute|explore|fetch|"
     "find|fix|implement|inspect|install|list|make|modify|move|open|patch|"
     "navigate|read|remove|rename|review|rewrite|run|save|search|send|strip|test|update|upload|validate|"
-    "verify|write"
+    "verify|write|set"
 )
 
 
@@ -11853,10 +11973,6 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
     as a final answer and end a long-running goal. Each retry re-broadcasts a
     normal generation request, so rank 1 mirrors it like any client retry.
     """
-    if not (TOOL_COMPAT_OVERLAY and tools and tool_module is not None):
-        return full_output
-    if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
-        return full_output
     # Explicit OpenAI forcing and clear first-turn action requests both need
     # a real call. A prose draft is not successful execution. The inference
     # helper deliberately stops inferring once a tool result exists, so a
@@ -11865,6 +11981,24 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         processed_messages,
         rank_request or {},
     )
+    native_marker_retry = bool(
+        not TOOL_COMPAT_OVERLAY
+        and NATIVE_TOOL_ACTION_RETRY_ATTEMPTS > 0
+        and _looks_like_raw_tool_fragment(full_output or "", tool_module)
+    )
+    native_action_retry = bool(
+        not TOOL_COMPAT_OVERLAY
+        and NATIVE_TOOL_ACTION_RETRY_ATTEMPTS > 0
+        and (action_tool_task or require_call or native_marker_retry)
+    )
+    if not (
+        tools
+        and tool_module is not None
+        and (TOOL_COMPAT_OVERLAY or native_action_retry)
+    ):
+        return full_output
+    if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
+        return full_output
     if _usable_tool_turn(full_output, tool_module, tools, processed_messages,
                          thinking_mode, require_call=require_call):
         return full_output
@@ -11927,6 +12061,11 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         len(token_ids or []),
     )
     retry_attempts = TOOL_UNUSABLE_RETRY_ATTEMPTS
+    if native_action_retry:
+        retry_attempts = min(
+            retry_attempts,
+            NATIVE_TOOL_ACTION_RETRY_ATTEMPTS,
+        )
     if oversized_mutation_recovery and not oversized_apply_patch:
         # A malformed giant mutation must not receive another full-size
         # runway to repeat the same payload. Atomic Write can become a small
@@ -11954,7 +12093,8 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         # native no-thinking only for the final fallback, where prefix safety
         # deliberately releases incompatible RAM KV before a cold rebuild.
         hidden_no_think_recovery = bool(
-            _enable_thinking_for_generation(thinking_mode)
+            TOOL_COMPAT_OVERLAY
+            and _enable_thinking_for_generation(thinking_mode)
             and (
                 fast_apply_patch_recovery
                 or _tool_retry_prefers_no_think(
@@ -12257,267 +12397,64 @@ def _validate_outgoing_tool_calls(
                 if raw_name:
                     dropped_names.append(str(raw_name))
                 continue
-            if not isinstance(decoded, dict):
-                decoded = {}
-            decoded = _canonicalize_tool_argument_keys(decoded, tools, name)
-            decoded = _coerce_json_encoded_schema_values(decoded, tools, name)
-            decoded = _coerce_codex_control_tool_arguments(decoded, tools, name)
-            decoded, stripped_path_tags = _strip_minimax_closing_tags_from_paths(
-                decoded
-            )
-            for key, source, target in stripped_path_tags:
-                logger.warning(
-                    "stripped MiniMax closing tag from outgoing %s.%s: %r -> %r",
-                    name,
-                    key,
-                    source,
-                    target,
+            # Match oMLX / mlx-vlm native behavior: preserve a complete call
+            # and let the client execute it or return an ordinary tool error.
+            # Keep only lossless schema shaping. Native mode must not rewrite
+            # paths, invent fields, bound payloads, suppress mutations, or
+            # synthesize a different command.
+            if isinstance(arguments, str):
+                try:
+                    native_decoded = (
+                        json.loads(arguments) if arguments.strip() else {}
+                    )
+                except json.JSONDecodeError:
+                    native_decoded = None
+            elif isinstance(arguments, dict):
+                native_decoded = dict(arguments)
+            else:
+                native_decoded = None
+            if isinstance(native_decoded, dict):
+                native_decoded = _canonicalize_tool_argument_keys(
+                    native_decoded, tools, name
                 )
-            decoded, stripped_payload_tags = (
-                _strip_minimax_closing_tags_from_payloads(name, decoded)
-            )
-            for key, source_len, target_len in stripped_payload_tags:
-                logger.warning(
-                    "stripped MiniMax closing fragment from outgoing %s.%s "
-                    "(%d -> %d characters)",
-                    name,
-                    key,
-                    source_len,
-                    target_len,
+                native_decoded = _coerce_json_encoded_schema_values(
+                    native_decoded, tools, name
                 )
-            decoded, reversed_write = _repair_reversed_write_path_and_content(
-                name,
-                decoded,
-            )
-            if reversed_write:
-                logger.warning(
-                    "swapped reversed outgoing %s %s/%s arguments for %r "
-                    "(%d payload characters)",
-                    name,
-                    reversed_write["path_key"],
-                    reversed_write["content_key"],
-                    reversed_write["path"],
-                    reversed_write["payload_chars"],
+                if call.get("_m3_schema_recovered"):
+                    mismatches = _tool_schema_type_mismatches(
+                        native_decoded, tools, name
+                    )
+                    required = _tool_schema_required_names(tools, name)
+                    missing = [
+                        key for key in required
+                        if key not in native_decoded
+                        or native_decoded.get(key) in (None, "")
+                    ]
+                    if mismatches or missing:
+                        logger.warning(
+                            "dropping schema-invalid recovered %s call "
+                            "(mismatches=%s, missing=%s)",
+                            name,
+                            mismatches,
+                            missing,
+                        )
+                        dropped += 1
+                        dropped_names.append(str(name))
+                        continue
+                native_arguments = json.dumps(
+                    native_decoded, ensure_ascii=False
                 )
-            decoded, relative_user_paths = (
-                _anchor_file_tool_path_to_user_relative_target(
-                    name,
-                    decoded,
-                    processed_messages,
-                )
-            )
-            for key, source, target in relative_user_paths:
-                logger.warning(
-                    "anchored outgoing %s.%s from %r to user workspace "
-                    "relative path %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, filled_paths = _fill_missing_mutating_tool_path(
-                name,
-                decoded,
-                tools,
-                processed_messages,
-                raw_output,
-            )
-            for key, target in filled_paths:
-                logger.warning(
-                    "filled missing outgoing %s.%s from the explicit client "
-                    "target %r",
-                    name,
-                    key,
-                    target,
-                )
-            decoded, intent_anchored_paths = (
-                _anchor_mutating_tool_path_from_named_read(
-                    name,
-                    decoded,
-                    processed_messages,
-                    raw_output,
-                )
-            )
-            for key, source, target in intent_anchored_paths:
-                logger.warning(
-                    "anchored outgoing %s.%s from %r to named read target %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, basename_anchored_paths = (
-                _anchor_mutating_tool_path_from_read_basename(
-                    name,
-                    decoded,
-                    processed_messages,
-                )
-            )
-            for key, source, target in basename_anchored_paths:
-                logger.warning(
-                    "anchored outgoing %s.%s from %r to unique read target %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, anchored_paths = _anchor_mutating_tool_paths(
-                name,
-                decoded,
-                processed_messages,
-            )
-            for key, source, target in anchored_paths:
-                logger.warning(
-                    "anchored outgoing %s.%s from %r to client path %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, anchored_workdirs = _anchor_command_working_directory(
-                name,
-                decoded,
-                tools,
-                processed_messages,
-            )
-            for key, source, target in anchored_workdirs:
-                logger.warning(
-                    "anchored outgoing %s.%s from %r to client working "
-                    "directory %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, anchored_command_paths = _anchor_command_paths_from_read_history(
-                name,
-                decoded,
-                tools,
-                processed_messages,
-            )
-            for key, source, target in anchored_command_paths:
-                logger.warning(
-                    "anchored outgoing %s.%s path from %r to proven read "
-                    "target %r",
-                    name,
-                    key,
-                    source,
-                    target,
-                )
-            decoded, repaired_python_command = _repair_non_executable_python_command(
-                name,
-                decoded,
-                tools,
-                processed_messages,
-            )
-            if repaired_python_command:
-                logger.warning(
-                    "repaired outgoing %s.%s from %r to %r after proven "
-                    "permission-denied result",
-                    name,
-                    repaired_python_command["key"],
-                    repaired_python_command["source"],
-                    repaired_python_command["target"],
-                )
-            mutation_fingerprint = _exact_mutation_fingerprint(name, decoded)
-            if mutation_fingerprint in successful_mutations:
-                logger.warning(
-                    "dropping exact duplicate %s mutation that already "
-                    "completed successfully in this user turn (path=%r)",
-                    name,
-                    _file_write_path(decoded),
-                )
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
-            decoded, oversized_write_chars = _bound_large_file_write_arguments(
-                name,
-                decoded,
-            )
-            if oversized_write_chars:
-                logger.warning(
-                    "bounded outgoing %s content from %d characters to a "
-                    "small scaffold; continue through subsequent Edit calls",
-                    name,
-                    oversized_write_chars,
-                )
-            type_mismatches = _tool_schema_type_mismatches(
-                decoded,
-                tools,
-                name,
-            )
-            if type_mismatches:
-                logger.warning(
-                    "dropping outgoing %s tool call with schema type "
-                    "mismatches=%s",
-                    name,
-                    type_mismatches,
-                )
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
-            required = _tool_schema_required_names(tools, name)
-            missing_required = [
-                key for key in required
-                if key not in decoded or decoded.get(key) in (None, "")
-            ]
-            if missing_required:
-                logger.warning(
-                    "dropping outgoing %s tool call missing required arguments=%s",
-                    name,
-                    missing_required,
-                )
-                dropped += 1
-                if name:
-                    dropped_names.append(str(name))
-                continue
-            oversized_mutation = _oversized_mutating_file_payload(name, decoded)
-            if oversized_mutation:
-                logger.warning(
-                    "dropping outgoing %s tool call with oversized %s=%d "
-                    "characters (budget=%d)",
-                    name,
-                    oversized_mutation[0],
-                    oversized_mutation[1],
-                    TOOL_WRITE_CHUNK_MAX_CHARS,
-                )
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
-            command_violation = _command_tool_payload_violation(
-                name,
-                decoded,
-                tools,
-            )
-            if command_violation:
-                logger.warning(
-                    "dropping outgoing %s tool call: %s",
-                    name,
-                    command_violation,
-                )
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
-            if _is_apply_patch_tool_name(name) and not _apply_patch_payload_is_valid(decoded):
-                logger.warning("dropping outgoing apply_patch tool call with malformed patch payload")
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
-            path_violation = _tool_request_path_violation(
-                name, decoded, processed_messages
-            )
-            if path_violation:
-                logger.warning("dropping outgoing tool call: %s", path_violation)
-                dropped += 1
-                dropped_names.append(str(name))
-                continue
+            elif isinstance(arguments, str):
+                native_arguments = arguments
+            else:
+                native_arguments = json.dumps(arguments, ensure_ascii=False)
             validated.append({
                 "type": "function",
                 "index": index,
                 "id": call.get("id") or str(uuid.uuid4()),
                 "function": {
                     "name": name,
-                    "arguments": json.dumps(decoded, ensure_ascii=False),
+                    "arguments": native_arguments,
                 },
             })
             continue
@@ -13050,9 +12987,25 @@ def _nested_array_args_from_ns_tags(raw_body, ns_token, tools, name):
             start = first_close
             opener_len = len(close_tag)
             end = second_close
+    wrapperless_items = False
     if start < 0 or end < 0:
-        return None
-    container = raw_body[start + opener_len:end]
+        # Native MiniMax retry drift observed with ZCode TodoWrite: the model
+        # emitted several complete schema-shaped item groups and explicit
+        # </item> boundaries, but omitted only the outer ``<todos>`` wrapper.
+        # Recover this only when the tool has exactly one required array field
+        # and at least two item boundaries. A lone loose object remains too
+        # ambiguous and is regenerated by the bounded native retry instead.
+        top_required = set(_tool_schema_required_names(tools, name))
+        if (
+            prop not in top_required
+            or raw_body.count(item_close) < 2
+            or item_open in raw_body
+        ):
+            return None
+        container = raw_body
+        wrapperless_items = True
+    else:
+        container = raw_body[start + opener_len:end]
     item_spec = spec.get("items") or {}
     child_specs = item_spec.get("properties")
     child_specs = child_specs if isinstance(child_specs, dict) else {}
@@ -13134,6 +13087,12 @@ def _nested_array_args_from_ns_tags(raw_body, ns_token, tools, name):
                 if lowered not in {"true", "false"}:
                     continue
                 value = lowered == "true"
+            allowed = (
+                child_spec.get("enum")
+                if isinstance(child_spec, dict) else None
+            )
+            if isinstance(allowed, list) and allowed and value not in allowed:
+                continue
             item[child] = value
         # ZCode occasionally omits only the display-oriented activeForm on a
         # later todo item while still emitting complete content/status. Its
@@ -13145,27 +13104,16 @@ def _nested_array_args_from_ns_tags(raw_body, ns_token, tools, name):
             compact = re.sub(r"[^a-z0-9]", "", child.lower())
             if compact == "activeform" and item.get("content"):
                 item[child] = str(item["content"])
-            elif compact == "status":
-                child_spec = child_specs.get(child) or {}
-                allowed = (
-                    child_spec.get("enum")
-                    if isinstance(child_spec, dict) else None
-                )
-                if not allowed or "pending" in allowed:
-                    item[child] = "pending"
-            elif compact == "priority":
-                child_spec = child_specs.get(child) or {}
-                allowed = (
-                    child_spec.get("enum")
-                    if isinstance(child_spec, dict) else None
-                )
-                if not allowed or "medium" in allowed:
-                    item[child] = "medium"
         if any(item.get(key) in (None, "") for key in child_required):
             return None
         if item:
             items.append(item)
-    return {prop: items} if items else None
+    result = {prop: items} if items else None
+    if result and _tool_schema_type_mismatches(result, tools, name):
+        return None
+    if wrapperless_items and len(items) < 2:
+        return None
+    return result
 
 
 def _labeled_json_array_args_from_body(raw_body, tools, name):
@@ -14351,7 +14299,11 @@ def _recover_malformed_xml_tool_calls(text, tool_module, tools):
         flags=re.DOTALL,
     )
     name_attr_re = re.compile(
-        r"""\bname\s*=\s*(?:(["'])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))""",
+        # MiniMax occasionally borrows the Responses-style `to=` spelling
+        # while keeping the rest of its native XML envelope intact. Accept it
+        # only inside a completed native block and still require the value to
+        # map to an advertised schema name before a call can be emitted.
+        r"""\b(?:name|to)\s*=\s*(?:(["'])(?P<quoted>.*?)\1|(?P<bare>[^\s>]+))""",
         flags=re.DOTALL,
     )
     broken_name_re = re.compile(
@@ -14702,6 +14654,95 @@ def _recover_complete_calls_before_unclosed_tail(text, tool_module, tools):
         return [], ""
 
 
+def _capture_suspicious_native_tool_parse(text, calls, tools):
+    """Persist an opt-in raw fixture when a large Write collapses to a stub.
+
+    MiniMax tool output can contain source markup that resembles its own XML
+    argument envelope. Keep diagnostics disabled by default because the raw
+    response can contain user data; this hook is only for local parser audits.
+    """
+    if not TOOL_PARSE_DIAGNOSTICS or len(text or "") < 4096:
+        return
+
+    suspicious = []
+    for call in calls or []:
+        if not isinstance(call, dict):
+            continue
+        fn = call.get("function") if isinstance(call.get("function"), dict) else call
+        name = fn.get("name") if isinstance(fn, dict) else ""
+        normalized_name = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+        if normalized_name not in _WRITE_FILE_TOOL_NAMES:
+            continue
+        arguments = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = {"$raw": arguments}
+        if not isinstance(arguments, dict):
+            continue
+        payload_key = next(
+            (
+                key for key in ("content", "contents", "text", "data", "body")
+                if isinstance(arguments.get(key), str)
+            ),
+            "",
+        )
+        payload = arguments.get(payload_key, "") if payload_key else ""
+        # Diagnostics are explicitly opt-in, so prefer a harmless extra capture
+        # over missing the failure when the native parser has already discarded
+        # the unrecognized material.
+        schema_keys = set(_tool_schema_property_names(tools, name))
+        extra_keys = [str(key) for key in arguments if key not in schema_keys]
+        extra_chars = sum(
+            len(value) if isinstance(value, str) else len(json.dumps(value, default=str))
+            for key, value in arguments.items()
+            if key not in schema_keys
+        )
+        if len(payload) > 512:
+            continue
+        suspicious.append({
+            "name": name,
+            "payload_key": payload_key,
+            "payload_chars": len(payload),
+            "argument_keys": [str(key) for key in arguments],
+            "extra_keys": extra_keys,
+            "extra_chars": extra_chars,
+        })
+
+    if not suspicious:
+        return
+    try:
+        diagnostic_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "ops",
+            "logs",
+            "tool_parse_diagnostics",
+        )
+        os.makedirs(diagnostic_dir, exist_ok=True)
+        path = os.path.join(
+            diagnostic_dir,
+            f"native-write-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json",
+        )
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "captured_at": time.time(),
+                    "suspicious": suspicious,
+                    "raw_output": text,
+                    "parser_calls": calls,
+                    "tools": tools,
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        logger.warning("captured suspicious native Write parse at %s", path)
+    except Exception as exc:
+        logger.warning("failed to capture suspicious native Write parse: %s", exc)
+
+
 def _parse_tool_calls(text, tool_module, tools):
     if not text or tool_module is None:
         return [], text
@@ -14712,12 +14753,14 @@ def _parse_tool_calls(text, tool_module, tools):
     # truncated file. A tool response is atomic: if its last native block did
     # not close, discard every call and let the bounded retry regenerate it.
     marker_at = text.rfind(start) if start else -1
-    open_tail = text[marker_at:] if marker_at >= 0 else ""
-    if (
-        marker_at >= 0
-        and not _tool_block_emission_finished(text, tool_module)
-        and "</invoke" not in open_tail
-    ):
+    if marker_at >= 0 and not _tool_block_emission_finished(text, tool_module):
+        # A closed inner </invoke> does not make an unclosed outer
+        # <tool_call> atomic. MiniMax can abandon a large Write body, start a
+        # second complete Bash invoke, and then emit EOS without closing
+        # either outer block. The permissive recovery parser used to salvage
+        # the first Write and collapse markup-bearing content to its <title>.
+        # Only a complete earlier outer block (handled below) or a complete
+        # JSON payload is safe to expose to a client.
         completed, completed_remaining = (
             _recover_complete_calls_before_unclosed_tail(
                 text,
@@ -14732,8 +14775,10 @@ def _parse_tool_calls(text, tool_module, tools):
                 len(completed),
             )
             return completed, completed_remaining
-        recovered = _recover_complete_json_unclosed_tool_call(
-            text, tool_module, tools
+        recovered = (
+            _recover_complete_json_unclosed_tool_call(text, tool_module, tools)
+            if TOOL_COMPAT_OVERLAY
+            else []
         )
         if recovered:
             logger.warning(
@@ -14788,6 +14833,8 @@ def _parse_tool_calls(text, tool_module, tools):
         parsed = process_tool_calls(text, tool_module, tools)
         calls = parsed.get("calls") or []
         remaining = parsed.get("remaining_text") or ""
+        if calls:
+            _capture_suspicious_native_tool_parse(text, calls, tools)
         if TOOL_COMPAT_OVERLAY and len(calls) == 1:
             parsed_name = _tool_call_name_for_loop(calls[0])
             if _positional_recovery_is_underspecified(
@@ -14827,6 +14874,24 @@ def _parse_tool_calls(text, tool_module, tools):
             return calls, remaining
         if not TOOL_COMPAT_OVERLAY:
             if start and start in text:
+                # Native-first does not mean discarding a complete native
+                # block solely because the invoke target drifted from
+                # `name="Bash"` to `to="bash"`. This schema-grounded fallback
+                # runs only after mlx-vlm returned zero calls.
+                recovered = _recover_malformed_xml_tool_calls(
+                    text,
+                    tool_module,
+                    tools,
+                )
+                if recovered:
+                    for call in recovered:
+                        if isinstance(call, dict):
+                            call["_m3_schema_recovered"] = True
+                    logger.warning(
+                        "recovered schema-matching native invoke drift after "
+                        "mlx-vlm parser miss"
+                    )
+                    return recovered, _strip_raw_tool_blocks(text, tool_module)
                 logger.warning(
                     "native tool marker was generated but no valid OpenAI "
                     "tool_calls were parsed; stripping raw tool markup"
@@ -15323,6 +15388,16 @@ def _generation_iter(rank, gen_kwargs):
     error raises into the existing symmetric generation-error protocol.
     """
     from mlx_vlm.generate import stream_generate
+    try:
+        from mlx_vlm.models.minimax_m3_vl import language as minimax_language
+
+        begin_generation = getattr(
+            minimax_language, "begin_decode_topk_generation", None
+        )
+        if callable(begin_generation):
+            begin_generation()
+    except Exception as e:
+        logger.debug("decode top-k generation epoch unavailable: %s", e)
     import m3_batch_cancel
     import m3_eagle3
 
@@ -15511,6 +15586,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
             else TOOL_NO_CALL_TOKEN_BUDGET
         )
     write_scaffold_threshold = _tool_write_early_stop_chars()
+    request_decode_reuse_state = _begin_request_decode_topk_reuse(tools, rank)
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -15882,6 +15958,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         raise
     finally:
         _disarm_constrained_tools()
+        _restore_request_decode_topk_reuse(request_decode_reuse_state, rank)
         if cache_marked_in_use:
             _mark_prompt_cache_in_use(False)
 
@@ -16020,6 +16097,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         else TOOL_NO_CALL_TOKEN_BUDGET
     )
     write_scaffold_threshold = _tool_write_early_stop_chars()
+    request_decode_reuse_state = _begin_request_decode_topk_reuse(tools, rank)
     _arm_constrained_tools(processor, tools, rank)
     try:
         force_eval = _decode_eval_force_for_request(thinking_mode, token_ids)
@@ -16513,6 +16591,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         raise
     finally:
         _disarm_constrained_tools()
+        _restore_request_decode_topk_reuse(request_decode_reuse_state, rank)
         if cache_marked_in_use:
             _mark_prompt_cache_in_use(False)
 
@@ -19213,7 +19292,11 @@ def run_http_server(model, processor, rank):
                                         raw_output=full_output,
                                     )
                                 )
-                            if not tool_calls and dropped_invalid_tool_calls:
+                            if (
+                                TOOL_COMPAT_OVERLAY
+                                and not tool_calls
+                                and dropped_invalid_tool_calls
+                            ):
                                 synthesized = _synthesize_write_command_tool_call(
                                     processed_messages,
                                     tools,
@@ -19898,7 +19981,11 @@ def run_http_server(model, processor, rank):
                     processed_messages=processed_messages,
                     raw_output=text,
                 )
-            if not tool_calls and dropped_invalid_tool_calls:
+            if (
+                TOOL_COMPAT_OVERLAY
+                and not tool_calls
+                and dropped_invalid_tool_calls
+            ):
                 synthesized = _synthesize_write_command_tool_call(
                     processed_messages,
                     tools,

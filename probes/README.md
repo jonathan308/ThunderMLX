@@ -36,6 +36,31 @@ during this gate.
   cache-session lifetime; new or idle-expired sessions still receive the
   current date.
 
+## Exact structured-decode gate (2026-07-14)
+
+Real-client A/B testing found that decode top-k reuse `48` remained the fastest
+chat profile but could drift inside long structured tool arguments. Production
+now applies `MLX_M3_TOOL_DECODE_TOPK_REUSE_TOKENS=0` only while a request
+advertises tools and restores the chat setting in `finally` on both ranks. A
+per-generation epoch also prevents a layer-local block selection from crossing
+session, retry, SSD-restore, or prewarm boundaries.
+
+- Fresh OpenCode no-thinking and thinking projects completed 14 and 17 agent
+  steps and finished with 18/18 and 22/22 generated tests passing.
+- Actual ZCode 0.15.2 headless goals passed in both modes, executing the full
+  native ZCode tool harness and finishing independently verified 7/7 and 8/8
+  Python test suites.
+- Four alternating extended Claude Code suites added 56 successful requests in
+  about ten minutes without incrementing failures or leaking the active slot.
+- A 49k agent/tool SSD roundtrip restored 99.92% of the prompt; OpenWebUI-shaped
+  34-tool follow-ups reached 0.25s no-thinking and 0.65s thinking TTFT.
+- Disconnect, explicit stop, image, OpenAI, Anthropic, Codex Responses, MSA
+  numerical, and short-speed gates passed. No-tool short decode remained
+  31.99 tok/s, so the exactness profile did not regress ordinary chat.
+
+Full evidence and reproduction commands are in
+[`docs/NATIVE-TOOLS-2026-07-14.md`](../docs/NATIVE-TOOLS-2026-07-14.md).
+
 Common probes:
 
 - `m3_turn_probe.py`: thinking/no-thinking multi-turn hot-cache check. The
@@ -94,6 +119,14 @@ Common probes:
 - `m3_tool_call_smoke.py`: actual OpenAI-compatible tool-call smoke. It checks
   non-stream and streaming `finish_reason=tool_calls`, verifies `tool_calls`
   are present, and fails if raw MiniMax tool markers leak into streamed chunks.
+- `m3_openai_multitool_live_probe.py`: ZCode-shaped streamed OpenAI agent loop.
+  It executes real Read/Write/Edit/Bash calls, verifies the resulting file, and
+  requires the model to finish rather than stop after planning.
+- `m3_msa_contract_smoke.py`: request-epoch and decode-selection-cache cleanup
+  contract. Run with the production `bin/mlx-python` interpreter.
+- `m3_msa_numerical_smoke.py`: grouped top-k plus Steel-MMA prefill/decode
+  numerical comparison against dense selected-attention references. Run it on
+  both ranks with the production interpreter.
 - `m3_image_smoke.py`: OpenAI multimodal `image_url` VLM smoke. It sends an
   in-memory red/blue PNG data URI, verifies the response mentions both colors,
   and fails if the server failure count increases.
