@@ -133,6 +133,19 @@ across follow-up calls, and decoded at 24-25 tok/s. OpenAI streaming and
 non-streaming tools, Anthropic `tool_use`, and Codex Responses/schema probes
 all passed; the legacy compatibility overlay remains opt-in for diagnostics.
 
+The final July 14 qualification isolated structured decode from the prose
+speed approximation. Tool-bearing requests now select MSA blocks exactly on
+every token, while ordinary chat keeps decode top-k reuse `48`. Fresh thinking
+and no-thinking OpenCode projects finished 14-17 real agent steps and passed
+18/18 and 22/22 generated tests. The installed ZCode 0.15.2 harness then
+completed separate native-tool goals in both modes and independently passed
+7/7 and 8/8 generated tests. Four alternating extended Claude Code suites
+added 56 clean inference requests in a ten-minute soak. OpenWebUI-shaped
+34-tool follow-ups reached `0.25s` no-thinking and `0.65s` thinking TTFT;
+ordinary short decode remained `31.99 tok/s`. See
+[docs/NATIVE-TOOLS-2026-07-14.md](docs/NATIVE-TOOLS-2026-07-14.md) for the root
+cause, exact gates, and rollback knobs.
+
 ## Quick Start
 
 > 🤖 **Setting up with an AI agent?** Hand your agent
@@ -321,6 +334,9 @@ distributed Apple Silicon inference:
 - Memory-bounded blockwise grouped MSA top-k construction for long prefill.
 - Sparse decode path and decode top-k reuse, currently tuned with
   `MLX_M3_DECODE_TOPK_REUSE_TOKENS=48`.
+- Request-scoped exact MSA selection for structured tool output, controlled by
+  `MLX_M3_TOOL_DECODE_TOPK_REUSE_TOKENS=0`; the faster chat value is restored
+  immediately after each tool-bearing request.
 - Sparse top-k override tuning, currently `MLX_M3_SPARSE_TOPK_BLOCKS_OVERRIDE=16`.
 - Split-verify attention kernel for speculative verify blocks (2<=L<=8):
   per-query sparse history + dense causal tail, LSE-merged (gated behind
@@ -351,6 +367,7 @@ Useful smoke tests against a running endpoint:
 
 ```bash
 python3 probes/m3_tool_call_smoke.py --base http://127.0.0.1:8080
+python3 probes/m3_openai_multitool_live_probe.py --base http://127.0.0.1:8010/v1
 python3 probes/m3_image_smoke.py --base http://127.0.0.1:8080
 python3 probes/m3_tool_prefix_reuse_probe.py --base http://127.0.0.1:8080
 python3 probes/m3_agent_staged_suffix_probe.py --base http://127.0.0.1:8080

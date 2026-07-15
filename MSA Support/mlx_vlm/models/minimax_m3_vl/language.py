@@ -116,6 +116,17 @@ _MSA_COMPACT_DECODE_SORT_TOPK = _msa_os.environ.get(
     "MLX_M3_COMPACT_DECODE_SORT_TOPK", "0"
 ).strip().lower() not in {"0", "false", "no", "off"}
 
+# Scope block-selection reuse to one generator invocation. Attention modules
+# outlive requests, while their KV backing can be replaced by a different
+# session, retry, restore, or prewarm pass with the same length.
+_DECODE_TOPK_GENERATION_EPOCH = 0
+
+
+def begin_decode_topk_generation() -> int:
+    global _DECODE_TOPK_GENERATION_EPOCH
+    _DECODE_TOPK_GENERATION_EPOCH += 1
+    return _DECODE_TOPK_GENERATION_EPOCH
+
 
 def set_decode_topk_reuse_tokens(value: int) -> int:
     """Update fused-decode selection reuse for safe runtime A/B tests."""
@@ -2111,6 +2122,8 @@ class MiniMaxM3Indexer:
                 cached = getattr(attention, "_m3_decode_topk_cache", None)
                 if (
                     cached is not None
+                    and cached.get("generation_epoch")
+                    == _DECODE_TOPK_GENERATION_EPOCH
                     and cached.get("remaining", 0) > 0
                     and cached.get("total_len", -2) + 1 == total_len
                     and cached.get("num_blocks") == num_blocks
@@ -2153,6 +2166,7 @@ class MiniMaxM3Indexer:
                             "_m3_decode_topk_cache",
                             {
                                 "block_indices": fused_idx,
+                                "generation_epoch": _DECODE_TOPK_GENERATION_EPOCH,
                                 "total_len": total_len,
                                 "num_blocks": num_blocks,
                                 "cur_block": cur_block,

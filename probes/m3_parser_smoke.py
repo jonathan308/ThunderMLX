@@ -812,6 +812,7 @@ def check_invoke_name_attr_drift_recovers():
         f'{ns}<invoke_name="exec_command">'
         f"{ns}<cmd>ls /tmp | head{ns}</cmd>"
         f"{ns}</invoke>"
+        f"{ns}</tool_call>"
     )
     calls, remaining = _parse_tool_calls(text, FakeMiniMaxToolModule, tools)
     assert remaining == "", remaining
