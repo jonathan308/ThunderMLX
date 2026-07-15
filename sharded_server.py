@@ -7961,20 +7961,17 @@ def _add_tool_system_hint_if_needed(processed_messages, request, tools, tool_loo
             "results already provide the needed evidence, answer from them; "
             "otherwise answer directly when no tool is needed."
         ]
-        task_requests_action = (
-            _tool_choice_required_name(request)[0]
-            or _tool_text_requests_action(
-                _last_user_instruction_text(processed_messages)
-            )
+        # Keep this primer byte-for-byte stable across conversational and
+        # action-looking turns. Conditionally adding the execution clause near
+        # the front of a long agent prompt invalidates every later KV entry
+        # whenever that lightweight classifier changes its answer.
+        hint_parts.append(
+            "Tool execution rule for this task: if more work is needed, "
+            "keep reasoning brief and emit exactly one focused function "
+            "call using the provided tool format; if the task is complete, "
+            "answer normally. Do not draft code, commands, arguments, or "
+            "tool payloads inside <mm:think> or plain prose."
         )
-        if task_requests_action:
-            hint_parts.append(
-                "Tool execution rule for this task: if more work is needed, "
-                "keep reasoning brief and emit exactly one focused function "
-                "call using the provided tool format; if the task is complete, "
-                "answer normally. Do not draft code, commands, arguments, or "
-                "tool payloads inside <mm:think> or plain prose."
-            )
         write_hint = _file_write_chunk_hint(tools)
         if write_hint:
             hint_parts.append(write_hint)

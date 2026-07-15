@@ -1977,6 +1977,44 @@ def check_thinking_tool_hint_covers_fresh_information():
     assert "otherwise answer directly" in patched[0]["content"], patched[0]
 
 
+def check_thinking_tool_hint_is_cache_stable_across_turn_intent():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    system = {
+        "role": "system",
+        "content": (
+            "<env>\nCurrent working directory: /private/tmp/project\n</env>"
+        ),
+    }
+    conversational = _add_tool_system_hint_if_needed(
+        [system, {"role": "user", "content": "What did we establish?"}],
+        {"thinking_mode": "enabled"},
+        tools,
+    )
+    action = _add_tool_system_hint_if_needed(
+        [system, {"role": "user", "content": "Create the requested file."}],
+        {"thinking_mode": "enabled"},
+        tools,
+    )
+    assert conversational[0]["role"] == "system", conversational
+    assert action[0]["role"] == "system", action
+    assert conversational[0]["content"] == action[0]["content"], (
+        conversational[0],
+        action[0],
+    )
+    assert "Tool execution rule" in conversational[0]["content"]
+    assert "/private/tmp/project" in conversational[0]["content"]
+
+
 def check_soft_tool_loop_steering_preserves_tools():
     tools = [{
         "type": "function",
@@ -4881,6 +4919,7 @@ def main():
     check_post_tool_hint_tells_model_to_answer()
     check_daily_date_context_injection()
     check_thinking_tool_hint_covers_fresh_information()
+    check_thinking_tool_hint_is_cache_stable_across_turn_intent()
     check_soft_tool_loop_steering_preserves_tools()
     check_soft_tool_loop_hint_is_cache_stable()
     check_targeted_repeated_tool_breaker_is_scoped()
