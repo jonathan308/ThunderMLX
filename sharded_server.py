@@ -1180,7 +1180,7 @@ PROMPT_CACHE_SESSION_MAP_MAX = int(
 )
 PROMPT_CACHE_RESIDENT_SLOTS = max(
     1,
-    int(os.environ.get("MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS", "1") or "1"),
+    int(os.environ.get("MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS", "2") or "2"),
 )
 def _env_int_rank_aware(name, default):
     """Per-rank env override: NAME_RANK<n> beats NAME. The ranks have very
