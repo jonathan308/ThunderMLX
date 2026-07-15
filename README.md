@@ -124,6 +124,15 @@ Repeated identical command/result pairs now end the affected agent turn after
 four unchanged results instead of looping forever; productive reruns with
 changing output remain untouched.
 
+The July 14 native-path gate removed the compatibility primer, semantic
+no-call caps, and full-turn buffering from production defaults. Fresh ZCode
+thinking and no-thinking tasks both completed native Read/Write/Bash/Edit
+chains, streamed without raw XML leakage, and finished healthy. A 25.9k-token
+tool session cold-prefilled at 351.9 tok/s, reused more than 99% of its prefix
+across follow-up calls, and decoded at 24-25 tok/s. OpenAI streaming and
+non-streaming tools, Anthropic `tool_use`, and Codex Responses/schema probes
+all passed; the legacy compatibility overlay remains opt-in for diagnostics.
+
 ## Quick Start
 
 > 🤖 **Setting up with an AI agent?** Hand your agent
