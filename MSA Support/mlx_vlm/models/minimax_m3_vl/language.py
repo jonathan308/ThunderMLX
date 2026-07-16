@@ -16,7 +16,7 @@ from ..switch_layers import SwitchGLU, SwitchLinear
 from .config import ModelConfig, TextConfig
 
 # ---- ThunderMLX MSA prefill overlay ----------------------------------------
-# This file is the UNMODIFIED native mlx-vlm 0.6.4 language.py plus ONE
+# This file is the UNMODIFIED native mlx-vlm 0.6.5 language.py plus ONE
 # addition: a fused blockwise-sparse PREFILL fast path (msa.py kernels).
 # Decode steps (L==1) never enter it — they run the native code below
 # byte-for-byte, which is the configuration proven wedge-free in production.
@@ -2336,8 +2336,12 @@ class MiniMaxSparseMoeBlock(nn.Module):
         self.scoring_func = args.scoring_func
         self.shared_expert_index = args.num_local_experts
         self.pack_shared_expert = (
-            args.n_shared_experts == 1
-            and args.shared_intermediate_size == args.intermediate_size
+            (
+                args.n_shared_experts == 1
+                and args.shared_intermediate_size == args.intermediate_size
+            )
+            if getattr(args, "pack_shared_expert", None) is None
+            else args.pack_shared_expert
         )
 
         self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)

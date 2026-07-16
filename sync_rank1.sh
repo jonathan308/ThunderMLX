@@ -62,10 +62,12 @@ for f in "${FILES[@]}"; do
   fi
 done
 
-if [[ -f "$CLUSTER/ops/known_answer.py" ]]; then
-  scp -o BatchMode=yes -o ConnectTimeout=10 \
-    "$CLUSTER/ops/known_answer.py" "$PEER:$CLUSTER/ops/known_answer.py" >/dev/null
-fi
+for f in ops/known_answer.py ops/check_runtime_compat.py; do
+  if [[ -f "$CLUSTER/$f" ]]; then
+    scp -o BatchMode=yes -o ConnectTimeout=10 \
+      "$CLUSTER/$f" "$PEER:$CLUSTER/$f" >/dev/null
+  fi
+done
 
 if [[ -d "$CLUSTER/docs" ]]; then
   ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \

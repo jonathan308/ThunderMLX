@@ -15,7 +15,7 @@ Expect 30–60 minutes plus the model download.
   Ethernet works for control traffic but the data path wants Thunderbolt.
 - **macOS** on both, same major version preferred.
 - **Python 3.12+** on both, with [MLX](https://github.com/ml-explore/mlx) and
-  [mlx-vlm ≥ 0.6.4](https://github.com/Blaizzy/mlx-vlm) installed in the same
+  [mlx-vlm >= 0.6.5](https://github.com/Blaizzy/mlx-vlm) installed in the same
   interpreter path on each machine.
 - At least ~250GB free disk on the primary for the ~225GB model plus download
   and runtime headroom. If you enable the SSD prompt-cache tier, budget its
@@ -167,10 +167,12 @@ and can auto-switch backends — guarded so it never interrupts active work).
 - **Logs**: server `/private/tmp/minimax-m3-cluster-logs/startup.log`,
   gateway `model_gateway.log`, dashboard `cluster_gui.log`.
 - **Runtime updates**: use the Models tab. Updates are staged and applied to
-  both ranks as one transaction. MLX-VLM and MLX-LM use exact PyPI wheels
-  without replacing the custom MLX core; MLX and MLX-Metal are always
-  installed as a validated pair. Successful updates restart the managed stack
-  automatically.
+  both ranks as one transaction. MLX-VLM, MLX-LM, and Transformers use exact
+  PyPI wheels and roll back together without replacing the custom MLX core;
+  MLX and MLX-Metal are always installed as a validated pair. Successful
+  updates restart the managed stack automatically. Persistent cache entries
+  include a runtime fingerprint, so entries from an older runtime safely miss
+  and rebuild instead of restoring incompatible KV state.
 
 ## Troubleshooting
 

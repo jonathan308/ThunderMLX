@@ -37,6 +37,7 @@ from sharded_server import (
     _FORCE_EOS,
     _add_date_system_context,
     _add_tool_system_hint_if_needed,
+    _apply_tool_choice_instruction,
     _assistant_content_for_template,
     _anchor_command_working_directory,
     _anchor_command_paths_from_read_history,
@@ -63,6 +64,8 @@ from sharded_server import (
     _tool_retry_prefers_no_think,
     _tool_retry_thinking_mode,
     _tool_retry_recovery_hint,
+    _tool_choice_validation_error,
+    _tools_from_request,
     _single_apply_patch_fast_recovery,
     _tool_write_early_stop_chars,
     _tool_loop_steering_diag,
@@ -5010,6 +5013,58 @@ def check_title_metadata_detection_is_narrow():
     })
 
 
+def check_openai_tool_choice_semantics():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in ("get_weather", "get_time")
+    ]
+    named_request = {
+        "tools": tools,
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "get_time"},
+        },
+    }
+    selected = _tools_from_request(named_request)
+    assert [tool["function"]["name"] for tool in selected] == ["get_time"]
+    assert _tool_choice_validation_error(named_request, selected) is None
+
+    messages = [{"role": "user", "content": "Use the selected function."}]
+    patched = _apply_tool_choice_instruction(messages, named_request)
+    assert "get_time" in patched[-1]["content"], patched
+    assert patched[-1]["role"] == "user", patched
+
+    multimodal = [{"role": "user", "content": [
+        {"type": "text", "text": "Inspect this."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+    ]}]
+    patched_multimodal = _apply_tool_choice_instruction(multimodal, named_request)
+    assert patched_multimodal[-1]["content"][-1]["type"] == "text"
+    assert "get_time" in patched_multimodal[-1]["content"][-1]["text"]
+
+    required_without_tools = {"tool_choice": "required"}
+    assert "requires at least one tool" in _tool_choice_validation_error(
+        required_without_tools, None
+    )
+    unknown = {
+        "tools": tools,
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "missing_tool"},
+        },
+    }
+    assert "unknown function" in _tool_choice_validation_error(
+        unknown, _tools_from_request(unknown)
+    )
+    assert _tools_from_request({"tools": tools, "tool_choice": "none"}) is None
+
+
 def check_stop_request_targeting_is_stale_safe():
     active = {"id": "chatcmpl-current"}
     assert _stop_request_target({}) is None
@@ -5115,6 +5170,7 @@ def main():
     check_ssd_restore_append_capacity_is_bounded()
     check_ssd_thinking_boundary_restore_is_narrow()
     check_title_metadata_detection_is_narrow()
+    check_openai_tool_choice_semantics()
     check_stop_request_targeting_is_stale_safe()
     print("PASS")
 

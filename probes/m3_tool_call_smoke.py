@@ -4,7 +4,9 @@
 This verifies actual tool invocation, not just prompts that carry tool schemas:
 non-stream and stream requests must both return OpenAI `tool_calls` with
 `finish_reason=tool_calls`, and streaming output must not leak raw MiniMax XML
-tool markers to clients.
+tool markers to clients. It also verifies named-function forcing and
+`tool_choice=none`, matching the OpenAI semantics added upstream in mlx-vlm
+0.6.5.
 """
 import argparse
 import json
@@ -188,6 +190,76 @@ def run_stream(model, max_tokens, timeout):
     return row
 
 
+def run_tool_choice_semantics(model, max_tokens, timeout):
+    choice_tools = tool_schema() + [{
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Get the current time for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"location": {"type": "string"}},
+                "required": ["location"],
+            },
+        },
+    }]
+    named = request_json(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Use the selected function for Paris."}
+            ],
+            "tools": choice_tools,
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "get_time"},
+            },
+            "temperature": 0,
+            "max_tokens": max(256, max_tokens),
+        },
+        timeout=timeout,
+    )
+    named_choice = (named.get("choices") or [{}])[0]
+    named_calls = (named_choice.get("message") or {}).get("tool_calls") or []
+    named_names = [
+        str((call.get("function") or {}).get("name") or "")
+        for call in named_calls
+    ]
+    if named_choice.get("finish_reason") != "tool_calls" or named_names != ["get_time"]:
+        raise SystemExit(f"named tool_choice was not enforced: {named}")
+
+    none = request_json(
+        "POST",
+        "/v1/chat/completions",
+        {
+            "model": model,
+            "messages": [
+                {"role": "user", "content": "Reply with exactly TOOL-NONE-OK."}
+            ],
+            "tools": tool_schema(),
+            "tool_choice": "none",
+            "temperature": 0,
+            "max_tokens": 64,
+        },
+        timeout=timeout,
+    )
+    none_choice = (none.get("choices") or [{}])[0]
+    none_message = none_choice.get("message") or {}
+    if none_message.get("tool_calls") or "TOOL-NONE-OK" not in str(
+        none_message.get("content") or ""
+    ):
+        raise SystemExit(f"tool_choice=none was not enforced: {none}")
+    print(json.dumps({
+        "tool_choice": True,
+        "named_finish": named_choice.get("finish_reason"),
+        "named_tools": named_names,
+        "none_finish": none_choice.get("finish_reason"),
+        "none_tools": none_message.get("tool_calls"),
+    }, sort_keys=True), flush=True)
+
+
 def main():
     global BASE
     parser = argparse.ArgumentParser(description=__doc__)
@@ -202,6 +274,7 @@ def main():
         raise SystemExit(f"endpoint unhealthy: {h}")
     run_nonstream(args.model, args.max_tokens, args.timeout)
     run_stream(args.model, args.max_tokens, args.timeout)
+    run_tool_choice_semantics(args.model, args.max_tokens, args.timeout)
     print("PASS", flush=True)
 
 

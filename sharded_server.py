@@ -7653,6 +7653,93 @@ def _tool_choice_required_name(request):
     return (False, None)
 
 
+def _tool_choice_validation_error(request, tools):
+    """Return an OpenAI-compatible validation error for ``tool_choice``."""
+    has_tool_choice = "tool_choice" in request
+    choice = request.get("tool_choice", request.get("function_call"))
+    if choice is None:
+        return None
+    if isinstance(choice, str):
+        normalized = choice.strip().lower()
+        if normalized not in {"none", "auto", "required"}:
+            return (
+                "Invalid tool_choice. Expected 'none', 'auto', 'required', "
+                "or a specific function."
+            )
+        if normalized == "required" and not tools:
+            return "tool_choice 'required' requires at least one tool."
+        return None
+    if not isinstance(choice, dict):
+        return "Invalid tool_choice."
+
+    function = choice.get("function")
+    if has_tool_choice:
+        if choice.get("type") != "function" or not isinstance(function, dict):
+            return (
+                "A specific tool_choice must be "
+                "{'type':'function','function':{'name':'...'}}."
+            )
+        name = function.get("name")
+    else:
+        name = function.get("name") if isinstance(function, dict) else choice.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return "A specific function choice requires a non-empty function name."
+    if not any(_tool_function_name(tool) == name for tool in (tools or [])):
+        return f"tool_choice references unknown function {name!r}."
+    return None
+
+
+def _apply_tool_choice_instruction(messages, request):
+    """Place explicit tool forcing where MiniMax's template can see it.
+
+    MiniMax's chat template consumes an initial system/developer message and
+    user messages, but ignores a trailing system role. Put the instruction in
+    the same visible locations used by mlx-vlm's OpenAI server so named and
+    required choices cannot silently degrade to prose.
+    """
+    required, name = _tool_choice_required_name(request)
+    if not required:
+        return list(messages or [])
+    instruction = (
+        f"You must call the function {name!r} to answer this request. "
+        "Do not call any other function and do not answer directly."
+        if name
+        else (
+            "You must call one or more of the available functions to answer "
+            "this request. Do not answer directly without calling a function."
+        )
+    )
+    patched = [dict(message) if isinstance(message, dict) else message
+               for message in (messages or [])]
+
+    first_has_instruction = False
+    if patched and isinstance(patched[0], dict):
+        first = patched[0]
+        if first.get("role") in {"root", "system", "developer"}:
+            content = first.get("content")
+            if isinstance(content, str):
+                first["content"] = f"{content}\n\n{instruction}".strip()
+                first_has_instruction = True
+
+    user_has_instruction = False
+    for message in reversed(patched):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            message["content"] = f"{content}\n\n{instruction}".strip()
+            user_has_instruction = True
+        elif isinstance(content, list):
+            message["content"] = list(content) + [
+                {"type": "text", "text": instruction}
+            ]
+            user_has_instruction = True
+        break
+    if not first_has_instruction and not user_has_instruction:
+        patched.insert(0, {"role": "system", "content": instruction})
+    return patched
+
+
 def _tools_from_request(request):
     """Return OpenAI tool schemas, accepting legacy `functions` clients too."""
     if _tool_choice_disables_tools(request):
@@ -18783,22 +18870,20 @@ def run_http_server(model, processor, rank):
                 )
                 max_tokens = TITLE_DEFAULT_MAX_TOKENS
                 max_tokens_source = "title_metadata_default"
-        # OpenAI tool_choice "required"/named forcing: resampling alone
-        # cannot make the model WANT to call a tool on prompts it would
-        # answer in prose, so inject an explicit instruction; the usable-
-        # turn ladder then backstops any turn that still skips the call.
+        tool_choice_error = _tool_choice_validation_error(request, tools)
+        if tool_choice_error:
+            return JSONResponse(
+                status_code=400,
+                content={"error": {
+                    "message": tool_choice_error,
+                    "type": "invalid_request_error",
+                    "param": "tool_choice",
+                }},
+            )
+        # Required/named choices need an instruction in a template-visible
+        # role. A trailing system role is ignored by MiniMax's native template.
         if tools and _tool_choice_required_name(request)[0]:
-            _forced = _tool_choice_required_name(request)[1]
-            msgs = list(msgs or [])
-            msgs.append({
-                "role": "system",
-                "content": (
-                    "Tool use is REQUIRED for this turn: respond with a "
-                    + (f"call to the function `{_forced}`" if _forced
-                       else "call to exactly one of the available functions")
-                    + ". Do not reply with plain text."
-                ),
-            })
+            msgs = _apply_tool_choice_instruction(msgs, request)
         if (
             tools
             and TOOL_THINKING_MODE != "request"

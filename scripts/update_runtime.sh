@@ -1,9 +1,10 @@
 #!/bin/zsh
 # Transactional two-rank runtime updater used by the dashboard.
 #
-# MLX-VLM/MLX-LM are staged as exact PyPI wheels and installed with --no-deps
-# so they cannot replace the custom MLX core. MLX itself is installed only from
-# a validated, version-matched mlx + mlx-metal wheel pair under
+# MLX-VLM, MLX-LM, and the Transformers version required by MLX-VLM are staged
+# as exact PyPI wheels and installed with --no-deps so they cannot replace the
+# custom MLX core. MLX itself is installed only from a validated,
+# version-matched mlx + mlx-metal wheel pair under
 # runtime_patches/variants/<label>.
 set -euo pipefail
 setopt NULL_GLOB
@@ -215,7 +216,7 @@ PY
 else
   UPDATE_PACKAGES=("$PACKAGE")
   if [[ "$PACKAGE" == "mlx-vlm" ]]; then
-    UPDATE_PACKAGES+=("mlx-lm")
+    UPDATE_PACKAGES+=("mlx-lm" "transformers")
   fi
   primary_current=""
   for staged_package in "${UPDATE_PACKAGES[@]}"; do
@@ -271,7 +272,7 @@ fi
 
 VERIFY_PACKAGES=("$PACKAGE")
 if [[ "$PACKAGE" == "mlx-vlm" ]]; then
-  VERIFY_PACKAGES+=("mlx-lm")
+  VERIFY_PACKAGES+=("mlx-lm" "transformers")
 fi
 local_version=""
 for verify_package in "${VERIFY_PACKAGES[@]}"; do
@@ -283,8 +284,9 @@ for verify_package in "${VERIFY_PACKAGES[@]}"; do
   }
   [[ -n "$local_version" ]] || local_version="$rank0_version"
 done
-"$PY" -m pip check
-remote "cd ${CLUSTER:q} && ./bin/mlx-python -m pip check"
+"$PY" "$CLUSTER/ops/check_runtime_compat.py" \
+  "$CLUSTER/runtime_patches/mlx_variants.json"
+remote "cd ${CLUSTER:q} && ./bin/mlx-python ops/check_runtime_compat.py runtime_patches/mlx_variants.json"
 
 if [[ "$PACKAGE" == "mlx" ]]; then
   "$PY" "$CLUSTER/ops/known_answer.py"

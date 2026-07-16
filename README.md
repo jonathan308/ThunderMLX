@@ -74,9 +74,9 @@ of real agentic use.
 - 🧠 **Live thinking** — reasoning deltas stream token-by-token on every
   wire, including during tool-bearing agent turns
 - 🛠️ **Agent-grade tool calling** — native `mlx-vlm` tool emission first,
-  parallel calls and streamed args, with narrowly evidenced repairs only for
-  structurally invalid calls; completed calls stop decode without exposing raw
-  MiniMax markup
+  OpenAI `tool_choice` auto/none/required/named semantics, parallel calls and
+  streamed args, with narrowly evidenced repairs only for structurally invalid
+  calls; completed calls stop decode without exposing raw MiniMax markup
 - 🗄️ **Tiered prompt/KV cache** — hot RAM residents with keepwarm → SSD
   (5-day TTL, 400GB LRU, per-rank) → re-prefill; sessions survive restarts;
   strict per-session isolation
@@ -206,9 +206,10 @@ MiniMax-M3 MLX model.
    ```
 
    The Models tab checks runtime versions on both ranks. `Update MLX-VLM`
-   stages exact MLX-VLM and MLX-LM release wheels, preserves the custom MLX
-   core, updates both ranks, reapplies runtime patches, validates dependencies, and restarts the
-   managed cluster. `Update MLX` accepts only the production-validated paired
+   stages exact MLX-VLM, MLX-LM, and Transformers release wheels as one
+   rollback unit, preserves the custom MLX core, updates both ranks, reapplies
+   runtime patches, validates dependencies, and restarts the managed cluster.
+   `Update MLX` accepts only the production-validated paired
    MLX/MLX-Metal build declared in `runtime_patches/mlx_variants.json`; it runs
    kernel known-answer checks on both Macs and restores the previous pair if a
    validation step fails.
