@@ -21,8 +21,8 @@ Confirm with the user before touching anything:
 1. Which Mac is primary (rank 0, more RAM — serves the API) and which is the
    worker (rank 1)? You should be running on the primary.
 2. Are both Macs physically connected by a Thunderbolt cable?
-3. Do they want the model downloaded fresh (~130GB) or do they already have
-   `mlx-community/MiniMax-M3-4bit` on disk? **ASK — never start a 130GB
+3. Do they want the model downloaded fresh (~225GB) or do they already have
+   `mlx-community/MiniMax-M3-4bit` on disk? **ASK — never start a 225GB
    download unannounced.**
 
 ## Phase 1 — Hardware discovery (read-only)
@@ -43,8 +43,9 @@ Then the same over SSH on the worker once Phase 2 establishes access.
 - Combined RAM ≥ 288GB (the 4-bit model needs ~220GB of weights plus KV
   headroom; the reference pair is 256GB + 128GB)
 - Both machines Apple Silicon
-- ≥140GB free disk on the primary (model + headroom), more if they want a
-  large SSD prompt-cache tier
+- At least 250GB free disk on the primary for the model plus download/runtime
+  headroom, and additional free space on each rank if they enable the local
+  SSD prompt-cache tier. The cache cap is a limit, not preallocated space.
 
 ## Phase 2 — Network + SSH
 

@@ -17,8 +17,10 @@ Expect 30–60 minutes plus the model download.
 - **Python 3.12+** on both, with [MLX](https://github.com/ml-explore/mlx) and
   [mlx-vlm ≥ 0.6.4](https://github.com/Blaizzy/mlx-vlm) installed in the same
   interpreter path on each machine.
-- ~130GB free disk on the primary for the model, plus whatever you allot the
-  SSD prompt-cache tier (default cap 400GB, it grows as used).
+- At least ~250GB free disk on the primary for the ~225GB model plus download
+  and runtime headroom. If you enable the SSD prompt-cache tier, budget its
+  configured cap separately on each rank (the portable default cap is 400GB,
+  but it grows only as cache entries are written).
 
 ## 2. Network: Thunderbolt bridge
 
