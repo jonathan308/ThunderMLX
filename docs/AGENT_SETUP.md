@@ -91,12 +91,16 @@ worker streams its shards over Thunderbolt at boot.
 - `M3_RANK1_DIRECT_SSH`, `M3_PEER`, `M3_SSH_KEY` — the SSH path to the worker
 - `M3_RANK0_DATA_IP` / `M3_RANK1_DATA_IP` — the bridge IPs
 - `MLX_M3_MODEL` — the model path; `MLX_M3_MODEL_ID` — its HF id
-- `M3_PIPELINE_LAYERS` — the split. Rule of thumb at 4-bit: each of the 60
-  layers ≈ 3.7GB of weights. Give the worker as many layers as fit in
-  (worker RAM − ~25GB headroom), primary takes the rest. 256+128GB → `38,22`
-  (38 on the worker-side stack listed first... copy the reference: worker
-  count first, primary second, and sanity-check totals before boot).
-  Present your computed split to the user before proceeding.
+- `M3_PIPELINE_LAYERS` — rank-ordered layer counts: `rank0,rank1`. Rank 0 is
+  the primary/API process and owns the final layers; rank 1 is the worker and
+  owns the initial layers. The values must sum to 60. As a rough Q4 planning
+  estimate, each transformer layer accounts for about 3.7GB of weights before
+  rank-specific overhead, KV cache, Metal buffers, and macOS headroom. The
+  validated 256GB-primary + 128GB-worker reference is `38,22`: final 38 layers
+  on rank 0, initial 22 on rank 1. For other Macs, preserve at least 20-30GB
+  of working headroom on each rank, then verify actual per-rank memory under a
+  cold prefill before increasing context or resident-cache budgets. Present
+  the proposed split and its headroom to the user before proceeding.
 
 `./sync_rank1.sh` to push the runtime to the worker, and verify it reports
 success.
