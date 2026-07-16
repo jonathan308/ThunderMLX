@@ -74,6 +74,7 @@ from sharded_server import (
     _prompt_cache_ssd_restore_backing_state,
     _prompt_cache_ssd_round_capacity,
     _prompt_cache_ssd_thinking_boundary_restore_safe,
+    _request_looks_like_title_metadata,
     _recover_malformed_xml_tool_calls,
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
@@ -4963,6 +4964,47 @@ def check_ssd_thinking_boundary_restore_is_narrow():
     )
 
 
+def check_title_metadata_detection_is_narrow():
+    title_request = {
+        "model": "Minimax-M3",
+        "temperature": 0.3,
+        "messages": [
+            {
+                "role": "system",
+                "content": "Generate a concise title for this conversation.",
+            },
+            {
+                "role": "user",
+                "content": "Return only the title and do not include quotation marks.",
+            },
+        ],
+    }
+    assert _request_looks_like_title_metadata(title_request)
+    assert not _request_looks_like_title_metadata(
+        {**title_request, "stream": True}
+    )
+    assert not _request_looks_like_title_metadata(
+        {**title_request, "max_tokens": 4096}
+    )
+    assert not _request_looks_like_title_metadata(
+        {
+            **title_request,
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {"type": "object"},
+                },
+            }],
+        }
+    )
+    assert not _request_looks_like_title_metadata({
+        "messages": [
+            {"role": "user", "content": "Write a long essay titled The Future."}
+        ]
+    })
+
+
 def main():
     assert _server_sse_keepalive_comment() == ": keepalive\n\n"
     check_complete_analysis_channel()
@@ -5050,6 +5092,7 @@ def main():
     check_bash_rejects_source_and_numeric_fragments()
     check_ssd_restore_append_capacity_is_bounded()
     check_ssd_thinking_boundary_restore_is_narrow()
+    check_title_metadata_detection_is_narrow()
     print("PASS")
 
 
