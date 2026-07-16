@@ -84,6 +84,7 @@ from sharded_server import (
     _synthesize_explicit_read_tool_call,
     _synthesize_write_command_tool_call,
     _tool_call_complete_for_stop,
+    _completed_tool_detokenizer_tail_reached,
     _tool_call_contains_complete_but_invalid,
     _tool_fragment_looks_degenerate,
     _validate_outgoing_tool_calls,
@@ -967,6 +968,53 @@ def check_incomplete_native_write_is_never_emitted():
         True,
         closed,
         FakeMiniMaxToolModule,
+    )
+
+
+def check_silent_tool_tail_waits_for_complete_native_block():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
+            },
+        },
+    }]
+    ns = "]<]minimax[>["
+    partial = (
+        f"{ns}<tool_call>"
+        f'{ns}<invoke name="Bash">'
+        f'{ns}<parameter name="cmd">echo ready'
+    )
+    complete = (
+        partial
+        + f"{ns}</parameter>"
+        + f"{ns}</invoke>"
+        + f"{ns}</tool_call>"
+    )
+    assert not _completed_tool_detokenizer_tail_reached(
+        64,
+        True,
+        partial,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert not _completed_tool_detokenizer_tail_reached(
+        63,
+        True,
+        complete,
+        FakeMiniMaxToolModule,
+        tools,
+    )
+    assert _completed_tool_detokenizer_tail_reached(
+        64,
+        True,
+        complete,
+        FakeMiniMaxToolModule,
+        tools,
     )
 
 
@@ -4940,6 +4988,7 @@ def main():
     check_loose_segment_command_tool_call_recovers()
     check_incomplete_loose_segment_command_is_not_emitted()
     check_incomplete_native_write_is_never_emitted()
+    check_silent_tool_tail_waits_for_complete_native_block()
     check_complete_native_write_survives_unfinished_followup()
     check_complete_json_call_survives_missing_outer_close()
     check_large_write_chunk_hint_and_retry_feedback()

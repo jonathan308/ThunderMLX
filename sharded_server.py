@@ -379,10 +379,11 @@ else:
 TOOL_INCOMPLETE_CALL_TOKEN_BUDGET = int(
     os.environ.get("MLX_M3_TOOL_INCOMPLETE_CALL_TOKEN_BUDGET", "32768") or "0"
 )
-# Some malformed MiniMax tool turns finish their useful payload, then sample
-# control tokens that the detokenizer buffers without producing text.  A
-# conservative consecutive-empty-token budget lets the synchronized batch
-# sampler end that tail while preserving every byte already generated.
+# Some MiniMax tool turns finish a complete native call, then sample control
+# tokens that the detokenizer buffers without producing text. A consecutive
+# empty-token budget may end only that post-completion tail. An OPEN tool call
+# can legitimately contain long runs of buffered structural tokens, so it is
+# governed by the much larger incomplete-call budget instead.
 TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET = int(
     os.environ.get(
         "MLX_M3_TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET",
@@ -15207,6 +15208,28 @@ def _incomplete_tool_call_budget_reached(
     return not _tool_block_emission_finished(text, tool_module)
 
 
+def _completed_tool_detokenizer_tail_reached(
+    silent_tokens,
+    tool_call_started,
+    text,
+    tool_module,
+    tools,
+):
+    """Stop a silent detokenizer tail only after a tool call is complete.
+
+    Empty ``response.text`` values are not evidence of a stalled decode while
+    MiniMax is still emitting a native tool block. Structural/control tokens
+    can be buffered for many steps, including long array-valued arguments.
+    """
+    if (
+        TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET <= 0
+        or not tool_call_started
+        or int(silent_tokens or 0) < TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+    ):
+        return False
+    return _tool_call_complete_for_stop(text, tool_module, tools)
+
+
 def _tool_call_contains_complete_but_invalid(text, tool_module, tools):
     if not text or tool_module is None or not tools:
         return False
@@ -15812,10 +15835,13 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     and _BATCH_PATH_ACTIVE["value"]
                     and not _FORCE_EOS.get("active")
                     and tools
-                    and tool_call_started
-                    and TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET > 0
-                    and tool_detokenizer_silent_tokens
-                    >= TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+                    and _completed_tool_detokenizer_tail_reached(
+                        tool_detokenizer_silent_tokens,
+                        tool_call_started,
+                        tool_accumulated,
+                        tool_module,
+                        tools,
+                    )
                 ):
                     logger.warning(
                         "rank 0: tool detokenizer produced no text for %d "
@@ -16327,10 +16353,13 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     and _BATCH_PATH_ACTIVE["value"]
                     and not _FORCE_EOS.get("active")
                     and tools
-                    and tool_call_started
-                    and TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET > 0
-                    and tool_detokenizer_silent_tokens
-                    >= TOOL_DETOKENIZER_SILENT_TOKEN_BUDGET
+                    and _completed_tool_detokenizer_tail_reached(
+                        tool_detokenizer_silent_tokens,
+                        tool_call_started,
+                        tool_guard_text,
+                        tool_module,
+                        tools,
+                    )
                 ):
                     logger.warning(
                         "rank 0: streaming tool detokenizer produced no text "
