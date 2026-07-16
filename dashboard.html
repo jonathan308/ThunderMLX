@@ -768,8 +768,8 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
         distributed) — PINNED custom builds carrying our jaccl fixes, managed by
         ops/install_mlx_variant.sh; pip "update" would replace them with an older
         release, so they are check-only here. mlx-vlm is the model runtime
-        (MiniMax-M3-VL, generation loop, tool parsers); mlx-lm is its
-        text-LM dependency.</p>
+        (MiniMax-M3-VL, generation loop, tool parsers); mlx-lm and Transformers
+        are staged and rolled back atomically with it when required.</p>
     </div>
   </div>
   <div class="gap card">
@@ -1420,7 +1420,7 @@ async function checkRuntimeStack(){
       const action = p.updatable
         ? '<button class="btn sm'+(updAvail ? " primary" : "")+'" onclick="updateRuntimePackage(\''+p.package+'\')">'
           + (updAvail ? "Update" : (p.package === "mlx" ? "Reinstall pair" : "Reinstall")) + "</button>"
-        : '<span class="chip">pinned</span>';
+        : '<span class="chip">'+(p.update_mode === "paired-with-mlx-vlm" ? "paired" : "pinned")+'</span>';
       return "<tr>"
         + "<td><b>"+esc(p.package)+"</b></td>"
         + "<td>"+esc(p.rank0 || "—")+"</td>"

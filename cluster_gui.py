@@ -711,20 +711,21 @@ print(json.dumps({"ok": True, "installed": installed, "latest": latest, "update_
     return data
 
 
-# The serving stack is four packages: mlx + mlx-metal (core array framework,
+# The serving stack is five packages: mlx + mlx-metal (core array framework,
 # Metal kernels, jaccl/ring distributed — PINNED to a custom-built wheel, a
 # pip update would silently replace it with an older release), mlx-lm
 # (text-LM building blocks + some tool parsers; dependency of mlx-vlm) and
 # mlx-vlm (the model runtime: MiniMax-M3-VL implementation, generation loop,
-# minimax_m3 tool parser, vision path).
-RUNTIME_PACKAGES = ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm")
+# minimax_m3 tool parser, vision path). Transformers is updated atomically with
+# mlx-vlm when its minimum supported version changes.
+RUNTIME_PACKAGES = ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm", "transformers")
 RUNTIME_UPDATABLE = {"mlx", "mlx-lm", "mlx-vlm"}
 MLX_VARIANTS_MANIFEST = CLUSTER / "runtime_patches" / "mlx_variants.json"
 
 _VERSIONS_SNIPPET = r"""
 import importlib.metadata, json
 out = {}
-for p in ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm"):
+for p in ("mlx", "mlx-metal", "mlx-lm", "mlx-vlm", "transformers"):
     try:
         out[p] = importlib.metadata.version(p)
     except Exception:
@@ -800,7 +801,7 @@ def runtime_stack_versions():
         except Exception:
             remote = {"error": rout.get("stderr") or "worker unreachable"}
     latest = {}
-    for package in ("mlx", "mlx-lm", "mlx-vlm"):
+    for package in ("mlx", "mlx-lm", "mlx-vlm", "transformers"):
         try:
             latest[package] = _pypi_latest(package)
         except Exception:
@@ -823,6 +824,11 @@ def runtime_stack_versions():
             target_version = mlx_variant.get("version")
             update_mode = "paired-with-mlx"
             note = "updated atomically with MLX; never install this package alone"
+        elif package == "transformers":
+            updatable = False
+            target_version = latest.get(package)
+            update_mode = "paired-with-mlx-vlm"
+            note = "updated atomically with MLX-VLM when required"
         else:
             updatable = package in RUNTIME_UPDATABLE
             target_version = latest.get(package)

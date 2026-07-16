@@ -94,6 +94,9 @@ class TextConfig(BaseModelConfig):
     index_local_blocks: Optional[int] = None
     attention_output_gate: bool = False
     architectures: Optional[List[str]] = None
+    # None preserves the dimension-derived packed layout. False permits a
+    # separately quantized, higher-precision shared expert.
+    pack_shared_expert: Optional[bool] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
