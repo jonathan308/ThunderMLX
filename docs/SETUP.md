@@ -160,6 +160,10 @@ and can auto-switch backends — guarded so it never interrupts active work).
   supervisor; nothing shuts down on idle.
 - **Stops from clients** (Esc in your agent, stop button in OpenWebUI)
   cancel distributed generation within a few tokens and free the slot.
+- **Dashboard cancellation**: the Sessions tab targets the displayed request
+  ID. Stale clicks are rejected rather than stopping a newer request. Prefill
+  stops take effect at the next synchronized prefill chunk boundary; decode
+  stops take effect at the next synchronized token boundary.
 - **Logs**: server `/private/tmp/minimax-m3-cluster-logs/startup.log`,
   gateway `model_gateway.log`, dashboard `cluster_gui.log`.
 - **Runtime updates**: use the Models tab. Updates are staged and applied to

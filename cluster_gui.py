@@ -343,10 +343,13 @@ def persistent_cache_action(action):
         return {"ok": False, "error": str(e)}
 
 
-def stop_generation():
+def stop_generation(request_id=None):
+    payload = {}
+    if request_id is not None and str(request_id).strip():
+        payload["request_id"] = str(request_id).strip()
     req = urllib.request.Request(
         f"{ENDPOINT}/v1/stop",
-        data=b"{}",
+        data=json.dumps(payload).encode("utf-8"),
         method="POST",
         headers={"Content-Type": "application/json"},
     )
@@ -1206,10 +1209,16 @@ def api_chat_warmup():
 
 
 @APP.post("/api/generation/stop")
-def api_generation_stop():
-    result = stop_generation()
+async def api_generation_stop(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    request_id = payload.get("request_id") if isinstance(payload, dict) else None
+    result = stop_generation(request_id=request_id)
     if result.get("ok") is False:
-        return JSONResponse(status_code=502, content=result)
+        status_code = int(result.get("status_code") or 502)
+        return JSONResponse(status_code=status_code, content=result)
     return result
 
 
