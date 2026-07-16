@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 
 
@@ -32,6 +33,29 @@ def post_json(url: str, payload: dict | None = None, timeout: int = 120) -> dict
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def post_json_status(
+    url: str,
+    payload: dict | None = None,
+    timeout: int = 120,
+) -> tuple[int, dict]:
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload or {}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return int(response.status), json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            body = {"error": raw}
+        return int(exc.code), body
 
 
 def get_json(url: str, timeout: int = 10) -> dict:
@@ -130,7 +154,26 @@ def explicit_stop(base_url: str, baseline_failed: int) -> dict:
     thread.start()
     before = wait_active(base_url)
     time.sleep(0.2)
-    stopped = post_json(f"{base_url}/v1/stop")
+    stale_id = f"{before['id']}-stale"
+    stale_status, stale_response = post_json_status(
+        f"{base_url}/v1/stop",
+        {"request_id": stale_id},
+    )
+    if stale_status != 409 or stale_response.get("stopped") is not False:
+        raise RuntimeError(
+            "stale request-id stop was not rejected safely: "
+            f"status={stale_status} response={stale_response}"
+        )
+    still_active = active_request(base_url)
+    if not still_active or still_active.get("id") != before.get("id"):
+        raise RuntimeError(
+            "stale request-id stop altered active generation: "
+            f"before={before.get('id')} after={still_active}"
+        )
+    stopped = post_json(
+        f"{base_url}/v1/stop",
+        {"request_id": before["id"]},
+    )
     if not stopped.get("stopped") or stopped.get("mode") != "distributed_token_boundary":
         raise RuntimeError(f"bad /v1/stop response: {stopped}")
     final = wait_idle(base_url)
@@ -139,6 +182,10 @@ def explicit_stop(base_url: str, baseline_failed: int) -> dict:
         raise RuntimeError(f"explicit stop incremented failures: {final}")
     return {
         "before": before,
+        "stale_guard": {
+            "status": stale_status,
+            "response": stale_response,
+        },
         "stop_response": stopped,
         "stream_result": result,
         "final_completed": final.get("requests_completed"),
@@ -376,7 +423,10 @@ def dashboard_proxy_stop(base_url: str, dashboard_url: str, baseline_failed: int
     thread = threading.Thread(target=stream_worker, args=(base_url, payload, result), daemon=True)
     thread.start()
     before = wait_active(base_url)
-    stopped = post_json(f"{dashboard_url}/api/generation/stop")
+    stopped = post_json(
+        f"{dashboard_url}/api/generation/stop",
+        {"request_id": before["id"]},
+    )
     if not stopped.get("stopped") or stopped.get("mode") != "distributed_token_boundary":
         raise RuntimeError(f"bad dashboard stop response: {stopped}")
     final = wait_idle(base_url)

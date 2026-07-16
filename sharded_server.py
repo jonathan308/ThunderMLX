@@ -1456,6 +1456,11 @@ DECODE_REPETITION_GUARD_TOKENS = int(
 _STOP_FLAG = threading.Event()
 _STOP_KIND_LOCK = threading.Lock()
 _STOP_KIND = None
+_STOP_REQUEST_ID = None
+# Request id + nonce are kept outside the public active-request payload. The
+# pair lets a dashboard cancel target the request it actually displayed even
+# if that request finishes while the stop call is crossing to rank 1.
+_ACTIVE_STOP_TARGET = {"request_id": None, "nonce": None}
 
 
 def _clear_prefill_stop_file(reason="new request"):
@@ -1585,6 +1590,7 @@ def _prefill_stop_payload(
     phase=None,
     nonce=None,
     decode_stop_at_tokens=None,
+    request_id=None,
 ):
     payload = {
         "version": 1,
@@ -1605,6 +1611,8 @@ def _prefill_stop_payload(
         payload["phase"] = str(phase)
     if nonce:
         payload["nonce"] = str(nonce)
+    if request_id:
+        payload["request_id"] = str(request_id)
     return payload
 
 
@@ -1634,6 +1642,7 @@ def _touch_local_prefill_stop_file(
     phase=None,
     nonce=None,
     decode_stop_at_tokens=None,
+    request_id=None,
 ):
     if not PREFILL_STOP_FILE:
         return False
@@ -1643,6 +1652,7 @@ def _touch_local_prefill_stop_file(
         phase,
         nonce,
         decode_stop_at_tokens,
+        request_id,
     )
     try:
         parent = os.path.dirname(PREFILL_STOP_FILE)
@@ -1663,6 +1673,7 @@ def _touch_remote_prefill_stop_file(
     phase=None,
     nonce=None,
     decode_stop_at_tokens=None,
+    request_id=None,
 ):
     if not RANK1_SSH or not PREFILL_STOP_FILE:
         return None
@@ -1674,6 +1685,7 @@ def _touch_remote_prefill_stop_file(
             phase,
             nonce,
             decode_stop_at_tokens,
+            request_id,
         ),
         separators=(",", ":"),
     )
@@ -1710,18 +1722,20 @@ def _touch_remote_prefill_stop_file(
         return False
 
 
-def _set_stop_request(kind="user"):
-    global _STOP_KIND
+def _set_stop_request(kind="user", request_id=None):
+    global _STOP_KIND, _STOP_REQUEST_ID
     with _STOP_KIND_LOCK:
         _STOP_KIND = str(kind or "user")
+        _STOP_REQUEST_ID = str(request_id).strip() if request_id else None
         _STOP_FLAG.set()
 
 
 def _clear_stop_request():
-    global _STOP_KIND
+    global _STOP_KIND, _STOP_REQUEST_ID
     with _STOP_KIND_LOCK:
         _STOP_FLAG.clear()
         _STOP_KIND = None
+        _STOP_REQUEST_ID = None
 
 
 def _local_stop_kind():
@@ -1731,9 +1745,33 @@ def _local_stop_kind():
         return _STOP_KIND or "user"
 
 
-def _user_stop_requested():
+def _user_stop_requested(request_id=None):
     kind = _local_stop_kind()
-    return bool(kind and kind != "tool")
+    if not kind or kind == "tool":
+        return False
+    if request_id:
+        with _STOP_KIND_LOCK:
+            target = _STOP_REQUEST_ID
+        if target and target != str(request_id):
+            return False
+    return True
+
+
+def _stop_request_target(payload):
+    if not isinstance(payload, dict):
+        return None
+    for key in ("request_id", "expected_request_id", "id"):
+        value = payload.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def _stop_request_matches_active(payload, active_info):
+    expected = _stop_request_target(payload)
+    if expected is None:
+        return True
+    return bool(active_info and str(active_info.get("id") or "") == expected)
 
 
 def _stop_boundaries_from_active(active_info=None):
@@ -1747,8 +1785,14 @@ def _stop_boundaries_from_active(active_info=None):
     }
 
 
-def _request_inflight_stop(reason="stop", active_info=None):
-    _set_stop_request("user")
+def _request_inflight_stop(
+    reason="stop",
+    active_info=None,
+    request_id=None,
+    stop_nonce=None,
+):
+    request_id = request_id or (active_info or {}).get("id")
+    _set_stop_request("user", request_id=request_id)
     # Carry independent future-safe boundaries for BOTH phases. A stop can
     # arrive after the request slot is visible but before prefill/decode metrics
     # are published. The old single-phase payload classified that race as
@@ -1758,13 +1802,14 @@ def _request_inflight_stop(reason="stop", active_info=None):
     decode_stop_at_tokens = boundaries["decode_stop_at_tokens"]
     stop_at_tokens = boundaries["prefill_stop_at_tokens"]
     phase = "any"
-    nonce = _STOP_NONCE.get("value")
+    nonce = stop_nonce or _STOP_NONCE.get("value")
     remote_ok = _touch_remote_prefill_stop_file(
         reason,
         stop_at_tokens,
         phase,
         nonce,
         decode_stop_at_tokens,
+        request_id,
     )
     local_ok = False
     if remote_ok is not False:
@@ -1774,6 +1819,7 @@ def _request_inflight_stop(reason="stop", active_info=None):
             phase,
             nonce,
             decode_stop_at_tokens,
+            request_id,
         )
     else:
         logger.warning(
@@ -1785,6 +1831,7 @@ def _request_inflight_stop(reason="stop", active_info=None):
         "prefill_stop_remote": remote_ok,
         "prefill_stop_at_tokens": stop_at_tokens,
         "decode_stop_at_tokens": decode_stop_at_tokens,
+        "request_id": request_id,
     }
 
 
@@ -5789,18 +5836,17 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
 
 
 def _keep_prompt_prefix_after_cancel(token_ids, reason="cancelled"):
-    """Trim the cache to the request's INPUT prefix and keep it (2026-07-09).
+    """Trim this rank's cache to the request's input prefix.
 
     Cancelled streams used to _reset_prompt_cache, but agent clients retry
     the SAME conversation after a client-side timeout, and the reset forced
-    a full re-prefill of the whole context on every retry. The generated
-    tail past the input is exactly what the next turn's prepare would trim
-    anyway; dropping it eagerly is symmetric across ranks WITHOUT any new
-    collective (each rank trims its own physical KV to len(token_ids) —
-    the lockstep drain guarantees both physicals sit at the same length),
-    and _prefix_plan_consensus re-verifies agreement on the next request
-    regardless. Returns True when the prefix was kept; callers fall back
-    to the old full reset on False."""
+    a full re-prefill of the whole context on every retry. This helper is a
+    rank-local best effort only: a distributed caller must not assume both
+    ranks retained the same physical cache merely because rank 0 succeeded.
+    User/client cancellation therefore follows this local trim with a
+    coordinated two-rank reset at the HTTP transaction boundary. Returns
+    True when this rank retained the prefix; local callers may otherwise
+    fall back to a full reset."""
     if (
         not PROMPT_CACHE_KEEP_ON_CANCEL
         or not PROMPT_CACHE_ENABLED
@@ -6306,7 +6352,19 @@ def _check_prefill_stop(rank, processed_tokens, total_tokens):
     chunk_index = max(1, int((int(processed_tokens or 0) + step - 1) // step))
     stop_payload = _read_prefill_stop_file()
     if stop_payload is not None:
-        _set_stop_request("user")
+        payload_nonce = str(stop_payload.get("nonce") or "")
+        active_nonce = str(_STOP_NONCE.get("value") or "")
+        if payload_nonce and active_nonce and payload_nonce != active_nonce:
+            logger.debug(
+                "ignoring stale prefill stop nonce %s for active nonce %s",
+                payload_nonce[:8],
+                active_nonce[:8],
+            )
+            return
+        _set_stop_request(
+            "user",
+            request_id=stop_payload.get("request_id"),
+        )
         stop_at = stop_payload.get("prefill_stop_at_tokens")
         if stop_at is None:
             stop_at = stop_payload.get("stop_at_tokens")
@@ -17774,8 +17832,15 @@ def run_http_server(model, processor, rank):
         except RuntimeError:
             return False
 
-    async def acquire_generation_slot(req_id, *, stream, max_tokens, image_count,
-                                      request_shape=None):
+    async def acquire_generation_slot(
+        req_id,
+        *,
+        stream,
+        max_tokens,
+        image_count,
+        request_shape=None,
+        stop_nonce=None,
+    ):
         recover_stale_generation_lock(f"before acquire {req_id}")
         acquired = False
         queued_counted = False
@@ -17833,6 +17898,8 @@ def run_http_server(model, processor, rank):
                 request_state["queued"] -= 1
                 queued_counted = False
                 request_state["active"] = active
+                _ACTIVE_STOP_TARGET["request_id"] = req_id
+                _ACTIVE_STOP_TARGET["nonce"] = stop_nonce
         except BaseException:
             with state_lock:
                 if queued_counted:
@@ -18014,6 +18081,10 @@ def run_http_server(model, processor, rank):
                     history.clear()
                 shutdown_after_release = bool(request_state["shutdown_requested"])
             _persist_lifetime_tokens()
+        with state_lock:
+            if _ACTIVE_STOP_TARGET.get("request_id") == req_id:
+                _ACTIVE_STOP_TARGET["request_id"] = None
+                _ACTIVE_STOP_TARGET["nonce"] = None
         logger.info(
             "[rank 0] request %s released distributed generation slot "
             "(elapsed=%.2fs, first_token=%.2fs, prompt_tps=%.2f, tokens=%s, "
@@ -18600,16 +18671,34 @@ def run_http_server(model, processor, rank):
         interrupt a collective mid-flight; it takes effect at the next decode
         step. If no generation is active, this is a no-op.
         """
+        try:
+            body = await req.json()
+        except Exception:
+            body = {}
+        expected_request_id = _stop_request_target(body)
         with state_lock:
             active = request_state.get("active")
             active_info = dict(active) if active else None
+            stop_target = dict(_ACTIVE_STOP_TARGET)
         if active_info is None:
             return {
                 "stopped": False,
                 "mode": "drain_only",
                 "reason": "no active generation",
+                "expected_request_id": expected_request_id,
                 "active_request": None,
             }
+        if not _stop_request_matches_active(body, active_info):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "stopped": False,
+                    "mode": "request_id_guard",
+                    "reason": "active request changed before cancellation",
+                    "expected_request_id": expected_request_id,
+                    "active_request": active_info,
+                },
+            )
         if not SAFE_DECODE_STOP:
             return {
                 "stopped": False,
@@ -18618,7 +18707,18 @@ def run_http_server(model, processor, rank):
                            "pending offline acceptance; the request drains to its budget"),
                 "active_request": active_info,
             }
-        stop_state = _request_inflight_stop("api stop", active_info)
+        active_request_id = str(active_info.get("id") or "") or None
+        stop_nonce = (
+            stop_target.get("nonce")
+            if stop_target.get("request_id") == active_request_id
+            else None
+        )
+        stop_state = _request_inflight_stop(
+            "api stop",
+            active_info,
+            request_id=active_request_id,
+            stop_nonce=stop_nonce,
+        )
         if active_info is not None:
             logger.info("[rank 0] in-flight stop requested for %s", active_info.get("id"))
         return {
@@ -19439,24 +19539,21 @@ def run_http_server(model, processor, rank):
                             })
 
                         # Generation complete. Parse tool calls from full output.
-                        if generation_cancelled or _user_stop_requested():
-                            # Keep the input-prefix KV so a client retry of the
-                            # same conversation reuses it (rank 1's own cancel
-                            # handler performs the identical local trim — the
-                            # lockstep drain leaves both physicals equal, and
-                            # the prefix-plan consensus verifies next request).
-                            # Only on keep-failure fall back to the old
-                            # broadcast reset.
-                            if not _keep_prompt_prefix_after_cancel(
-                                request_token_ids, "cancelled stream"
-                            ):
-                                _reset_prompt_cache_on_all_ranks(
-                                    rank,
-                                    "reset after cancelled stream",
-                                    clear_memory=False,
-                                    clear_manifest=False,
-                                    clear_resident=False,
-                                )
+                        if generation_cancelled or _user_stop_requested(req_id):
+                            # A cancelled distributed decode can leave one
+                            # rank with a locally retained input prefix while
+                            # the peer has already dropped its physical KV.
+                            # The next prefix-consensus call is too late: JACCL
+                            # may already see mismatched cache shapes. Reset
+                            # only the uncertain active RAM cache on both ranks
+                            # now; completed resident and SSD sessions remain.
+                            _reset_prompt_cache_on_all_ranks(
+                                rank,
+                                "reset after cancelled stream",
+                                clear_memory=False,
+                                clear_manifest=False,
+                                clear_resident=False,
+                            )
                             logger.info(
                                 "[rank 0] stream %s cancelled before final "
                                 "tool/content parse; finishing without retry text",
@@ -19502,7 +19599,7 @@ def run_http_server(model, processor, rank):
                                 stream=True,
                                 should_abort=lambda: (
                                     not client_connected.is_set()
-                                    or _user_stop_requested()
+                                    or _user_stop_requested(req_id)
                                 ),
                                 progress_cb=_retry_progress,
                                 action_tool_task=action_tool_task,
@@ -19966,6 +20063,7 @@ def run_http_server(model, processor, rank):
                 active = await acquire_generation_slot(
                     req_id, stream=True, max_tokens=max_tokens,
                     image_count=len(images), request_shape=request_shape,
+                    stop_nonce=rank_request.get("stop_nonce"),
                 )
                 submit_generation_job(_producer)
                 last_payload_at = time.monotonic()
@@ -20030,6 +20128,8 @@ def run_http_server(model, processor, rank):
                         stop_state = _request_inflight_stop(
                             "client_disconnect",
                             dict(active) if active else None,
+                            request_id=req_id,
+                            stop_nonce=rank_request.get("stop_nonce"),
                         )
                         updates["cancel_requested"] = True
                         updates["cancel_reason"] = "client_disconnect"
@@ -20059,6 +20159,7 @@ def run_http_server(model, processor, rank):
             active = await acquire_generation_slot(
                 req_id, stream=False, max_tokens=max_tokens,
                 image_count=len(images), request_shape=request_shape,
+                stop_nonce=rank_request.get("stop_nonce"),
             )
             done_event = threading.Event()
             result = {}
@@ -20079,6 +20180,8 @@ def run_http_server(model, processor, rank):
                     op_channel_held = True
                     _clear_stop_request()
                     _clear_prefill_stop_file("rank 0 non-stream generation start")
+                    _STOP_NONCE["value"] = rank_request.get("stop_nonce")
+                    _FORCE_EOS["active"] = False
                     request_start_keepwarm(req_id)
                     _bcast(rank_request, rank)
                     rank_request_broadcast = True
@@ -20127,7 +20230,7 @@ def run_http_server(model, processor, rank):
                         require_tool_call=require_tool_call,
                         action_tool_task=action_tool_task,
                     )
-                    if tools:
+                    if tools and not _user_stop_requested(req_id):
                         result["text"] = _ensure_usable_tool_turn(
                             model, processor, rank,
                             full_output=result["text"],
@@ -20145,7 +20248,7 @@ def run_http_server(model, processor, rank):
                             processed_messages=processed_messages,
                             req_id=req_id,
                             stream=False,
-                            should_abort=_user_stop_requested,
+                            should_abort=lambda: _user_stop_requested(req_id),
                             progress_cb=_progress,
                             action_tool_task=action_tool_task,
                         )
@@ -20155,6 +20258,17 @@ def run_http_server(model, processor, rank):
                 finally:
                     if rank_request_broadcast:
                         try:
+                            if _user_stop_requested(req_id):
+                                # Match the streaming path: never carry an
+                                # unproven rank-local KV prefix across a
+                                # cancelled distributed transaction.
+                                _reset_prompt_cache_on_all_ranks(
+                                    rank,
+                                    "reset after cancelled non-stream request",
+                                    clear_memory=False,
+                                    clear_manifest=False,
+                                    clear_resident=False,
+                                )
                             update_generation_slot(
                                 active,
                                 mirror_sync_started_s=round(
@@ -20230,6 +20344,8 @@ def run_http_server(model, processor, rank):
                     stop_state = _request_inflight_stop(
                         "client_disconnect",
                         dict(active) if active else None,
+                        request_id=req_id,
+                        stop_nonce=rank_request.get("stop_nonce"),
                     )
                     update_generation_slot(
                         active, client_connected=False,

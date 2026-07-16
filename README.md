@@ -87,7 +87,8 @@ of real agentic use.
   gateway swaps backends (never while M3 is busy or recently active), then
   auto-starts M3 back on demand
 - 📊 **Live dashboard** — per-request phase, tokens, cache hits, TTFT
-  breakdown, wired-memory health for both ranks
+  breakdown, wired-memory health for both ranks, plus a Sessions tab with an
+  exact request-bound cancel control and recent-request history
 - 🖱️ **One-click ops** — `M3_Start` / `M3_Stop` / `M3_Restore_Gold` desktop
   commands: full-stack boot with crash-self-healing supervisor, graceful
   teardown with orphan check, and a tagged known-good restore point
@@ -211,6 +212,11 @@ MiniMax-M3 MLX model.
    MLX/MLX-Metal build declared in `runtime_patches/mlx_variants.json`; it runs
    kernel known-answer checks on both Macs and restores the previous pair if a
    validation step fails.
+
+   The Sessions tab shows the active request, phase, context, generated tokens,
+   cache reuse, queue state, and recent requests. `Cancel request` targets the
+   request ID currently shown; if that request finishes before the click
+   arrives, the server returns `409` and does not cancel the next request.
 
 7. Connect clients to:
 

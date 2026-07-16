@@ -75,6 +75,11 @@ from sharded_server import (
     _prompt_cache_ssd_round_capacity,
     _prompt_cache_ssd_thinking_boundary_restore_safe,
     _request_looks_like_title_metadata,
+    _stop_request_matches_active,
+    _stop_request_target,
+    _set_stop_request,
+    _clear_stop_request,
+    _user_stop_requested,
     _recover_malformed_xml_tool_calls,
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
@@ -5005,6 +5010,23 @@ def check_title_metadata_detection_is_narrow():
     })
 
 
+def check_stop_request_targeting_is_stale_safe():
+    active = {"id": "chatcmpl-current"}
+    assert _stop_request_target({}) is None
+    assert _stop_request_target({"request_id": " chatcmpl-current "}) == "chatcmpl-current"
+    assert _stop_request_target({"expected_request_id": "expected"}) == "expected"
+    assert _stop_request_matches_active({}, active)
+    assert _stop_request_matches_active({"request_id": "chatcmpl-current"}, active)
+    assert not _stop_request_matches_active({"request_id": "chatcmpl-stale"}, active)
+    try:
+        _set_stop_request("user", request_id="chatcmpl-current")
+        assert _user_stop_requested("chatcmpl-current")
+        assert not _user_stop_requested("chatcmpl-new")
+        assert _user_stop_requested()
+    finally:
+        _clear_stop_request()
+
+
 def main():
     assert _server_sse_keepalive_comment() == ": keepalive\n\n"
     check_complete_analysis_channel()
@@ -5093,6 +5115,7 @@ def main():
     check_ssd_restore_append_capacity_is_bounded()
     check_ssd_thinking_boundary_restore_is_narrow()
     check_title_metadata_detection_is_narrow()
+    check_stop_request_targeting_is_stale_safe()
     print("PASS")
 
 
