@@ -143,6 +143,10 @@ DEFAULT_MAX_TOKENS = int(os.environ.get("MLX_M3_DEFAULT_MAX_TOKENS", "4096"))
 NONSTREAM_DEFAULT_MAX_TOKENS = int(
     os.environ.get("MLX_M3_NONSTREAM_DEFAULT_MAX_TOKENS", "512") or "512"
 )
+TITLE_DEFAULT_MAX_TOKENS = max(
+    1,
+    int(os.environ.get("MLX_M3_TITLE_DEFAULT_MAX_TOKENS", "256") or "256"),
+)
 OPENWEBUI_DEFAULT_MAX_TOKENS = int(
     os.environ.get("MLX_M3_OPENWEBUI_DEFAULT_MAX_TOKENS", "2048") or "2048"
 )
@@ -7329,6 +7333,76 @@ def _request_looks_like_openwebui(request, processed_messages=None):
         "running locally",
     )
     return any(marker in text for marker in markers)
+
+
+def _request_looks_like_title_metadata(request, messages=None, tools=None):
+    """Identify short client-side chat-title jobs without matching user prose."""
+    if bool(request.get("stream", False)):
+        return False
+    if request.get("max_tokens", request.get("max_completion_tokens")) is not None:
+        return False
+    if tools or request.get("tools") or request.get("functions"):
+        return False
+
+    messages = messages if messages is not None else request.get("messages") or []
+    if not isinstance(messages, list) or not (1 <= len(messages) <= 4):
+        return False
+
+    # Hermes keeps the title instruction stable while embedding different chat
+    # excerpts in the user message. Retain the semantic checks below for other
+    # clients, and recognize this observed system template exactly so wording
+    # drift in the embedded excerpt cannot reopen the 32k sidecar path.
+    known_title_system_hashes = {"45a5d81d42c4"}
+    if any(
+        isinstance(message, dict)
+        and message.get("role") in {"system", "developer"}
+        and isinstance(message.get("content"), str)
+        and _short_hash(message["content"]) in known_title_system_hashes
+        for message in messages
+    ):
+        return True
+
+    text_parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            text_parts.append(content)
+    text = " ".join(" ".join(text_parts).lower().split())
+    if not text or len(text) > 8_192:
+        return False
+
+    title_markers = (
+        "generate a title",
+        "generate the title",
+        "generate a concise title",
+        "generate a short title",
+        "create a title for this conversation",
+        "create a concise title",
+        "create a short title",
+        "title for this conversation",
+        "title for the conversation",
+        "conversation title",
+        "chat title",
+    )
+    output_markers = (
+        "respond only with",
+        "return only",
+        "output only",
+        "do not include",
+        "no quotation marks",
+        "under 50 characters",
+        "under 80 characters",
+    )
+    has_system_context = any(
+        isinstance(message, dict)
+        and message.get("role") in {"system", "developer"}
+        for message in messages
+    )
+    return any(marker in text for marker in title_markers) and (
+        any(marker in text for marker in output_markers) or has_system_context
+    )
 
 
 _AUTHORITATIVE_DATE_CONTEXT_RE = re.compile(
@@ -18587,6 +18661,28 @@ def run_http_server(model, processor, rank):
         response_model = _response_model_id(request.get("model"))
         cache_session_id, cache_session_source = _request_cache_session(request)
         tools = _tools_from_request(request)
+        title_metadata_request = _request_looks_like_title_metadata(
+            request,
+            msgs,
+            tools,
+        )
+        if title_metadata_request:
+            # Chat frontends often inherit the selected thinking model for
+            # title generation. Letting that tiny no-tool sidecar use the
+            # agent-sized default can occupy the single distributed slot for
+            # thousands of hidden reasoning tokens and trigger duplicate
+            # client retries. Explicit max-token requests, streaming chat,
+            # and every tool request bypass this narrowly scoped policy.
+            request["_metadata_request"] = "title"
+            thinking_mode = "disabled"
+            if max_tokens > TITLE_DEFAULT_MAX_TOKENS:
+                logger.info(
+                    "using title metadata max_tokens=%s instead of text default %s",
+                    TITLE_DEFAULT_MAX_TOKENS,
+                    max_tokens,
+                )
+                max_tokens = TITLE_DEFAULT_MAX_TOKENS
+                max_tokens_source = "title_metadata_default"
         # OpenAI tool_choice "required"/named forcing: resampling alone
         # cannot make the model WANT to call a tool on prompts it would
         # answer in prose, so inject an explicit instruction; the usable-
