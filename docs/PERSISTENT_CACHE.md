@@ -43,6 +43,10 @@ reboot.
 - `MLX_M3_PROMPT_CACHE_SSD=0`: opt-in master switch.
 - `MLX_M3_PROMPT_CACHE_SSD_RESTORE=0`: separate restore gate. Enable only after
   save-only artifacts are validated across both ranks.
+- `MLX_M3_PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE=0`: permit the narrowly
+  validated append-only thinking restore where the stored artifact differs by
+  exactly one trailing `<mm:think>` marker. All other partial thinking restores
+  still cold-prefill.
 - `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE=0`: save complete eligible cache states
   automatically after successful turns.
 - `MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS=8192`: coalesce large
@@ -187,11 +191,12 @@ Current implementation:
    A miss is expected for expired entries, metadata/runtime mismatches, missing
    artifacts, and unsafe thinking partial restores. The only penalty is TTFT for
    that request; correctness and OpenAI compatibility take priority over reuse.
-6. Thinking requests allow exact durable restores but intentionally reject
-   partial SSD prefix restores for now. A partial thinking restore can land on an
-   unsafe control-token/reasoning boundary in the MiniMax template, so the stable
-   policy is `exact or cold prefill` until boundary-aware thinking checkpoints
-   are implemented.
+6. Thinking requests allow exact durable restores and otherwise reject partial
+   SSD prefix restores. With
+   `MLX_M3_PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE=1`, one boundary-aware
+   exception is allowed: an append-only continuation may crop exactly one stored
+   trailing `<mm:think>` generation marker. Larger crops, different markers,
+   shorter prompts, and non-prefix changes still cold-prefill.
 7. Expose bytes, entries, paths, last save/restore, miss reason, prune, clear,
    and RAM-vs-SSD status in `/health` and the dashboard.
 8. Prefer RAM live/resident caches first; SSD restore is only the durable fallback
