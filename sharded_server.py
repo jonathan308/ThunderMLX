@@ -1217,6 +1217,9 @@ PROMPT_CACHE_SSD_ENABLED = os.environ.get(
 PROMPT_CACHE_SSD_RESTORE_ENABLED = os.environ.get(
     "MLX_M3_PROMPT_CACHE_SSD_RESTORE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE = os.environ.get(
+    "MLX_M3_PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 PROMPT_CACHE_SSD_AUTO_SAVE = os.environ.get(
     "MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -3160,9 +3163,33 @@ def _flatten_arrays_from_structure(structure, out=None):
     return out
 
 
+def _prompt_cache_ssd_thinking_boundary_restore_safe(
+    processor, stored_ids, token_ids, restore_tokens
+):
+    """Allow only the harmless trailing MiniMax thinking-start marker crop."""
+    stored_ids = [int(token) for token in (stored_ids or [])]
+    token_ids = [int(token) for token in (token_ids or [])]
+    restore_tokens = int(restore_tokens or 0)
+    if len(token_ids) <= len(stored_ids):
+        return False
+    if restore_tokens != len(stored_ids) - 1:
+        return False
+    if stored_ids[:restore_tokens] != token_ids[:restore_tokens]:
+        return False
+    try:
+        tok = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        with _tokenizer_runtime_lock:
+            marker_ids = tok.encode("<mm:think>", add_special_tokens=False)
+        marker_ids = [int(token) for token in marker_ids]
+    except Exception:
+        return False
+    return len(marker_ids) == 1 and stored_ids[restore_tokens:] == marker_ids
+
+
 def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
                                               session_id, session_source,
                                               allow_partial_restore=True,
+                                              allow_thinking_boundary_restore=False,
                                               append_reserve_tokens=0):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None, None, None, "disabled"
@@ -3215,6 +3242,7 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
             return None, None, None, "stored_token_hash_mismatch"
         restore_tokens = key_tokens
         partial_restore = False
+        thinking_boundary_restore = False
         if len(token_ids) < key_tokens:
             reuse = _common_prefix_len(stored_ids, token_ids)
             partial_restore = True
@@ -3227,9 +3255,25 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
                 restore_tokens = reuse
         if partial_restore:
             if not allow_partial_restore:
-                return None, None, None, (
-                    f"partial_restore_disabled:prefix={restore_tokens}:"
-                    f"stored={key_tokens}"
+                thinking_boundary_restore = (
+                    allow_thinking_boundary_restore
+                    and _prompt_cache_ssd_thinking_boundary_restore_safe(
+                        processor,
+                        stored_ids,
+                        token_ids,
+                        restore_tokens,
+                    )
+                )
+                if not thinking_boundary_restore:
+                    return None, None, None, (
+                        f"partial_restore_disabled:prefix={restore_tokens}:"
+                        f"stored={key_tokens}"
+                    )
+                logger.info(
+                    "prompt-cache SSD accepted trailing <mm:think> boundary "
+                    "crop (%d/%d tokens)",
+                    restore_tokens,
+                    key_tokens,
                 )
             partial_min = max(
                 PROMPT_CACHE_MIN_REUSE,
@@ -3300,6 +3344,7 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
             stored_ids = stored_ids[:restore_tokens]
             meta["_partial_restore"] = True
             meta["_stored_key_tokens"] = key_tokens
+            meta["_thinking_boundary_restore"] = thinking_boundary_restore
         meta["_restore_tokens"] = restore_tokens
         meta["_restore_target_capacity"] = restore_target_capacity
         meta["_restore_capacity"] = (
@@ -3311,7 +3356,10 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
         meta["_restore_append_reserve_tokens"] = append_reserve_tokens
         meta["last_access_at"] = round(time.time(), 3)
         try:
-            _write_json_atomic(meta_path, meta)
+            _write_json_atomic(
+                meta_path,
+                {key: value for key, value in meta.items() if not key.startswith("_")},
+            )
         except Exception:
             pass
         return new_cache, stored_ids, meta, None
@@ -3322,6 +3370,7 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
 def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
                                            session_id=None, session_source=None,
                                            allow_partial_restore=True,
+                                           allow_thinking_boundary_restore=False,
                                            append_reserve_tokens=0):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None
@@ -3331,6 +3380,7 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
     cache, stored_ids, meta, miss_reason = _prompt_cache_ssd_load_candidate_unlocked(
         model, processor, token_ids, session_id, session_source,
         allow_partial_restore=allow_partial_restore,
+        allow_thinking_boundary_restore=allow_thinking_boundary_restore,
         append_reserve_tokens=append_reserve_tokens,
     )
     rank, world = _prompt_cache_ssd_current_rank_world()
@@ -3392,6 +3442,9 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         "last_restore_append_reserve_tokens": int(
             meta.get("_restore_append_reserve_tokens") or 0
         ),
+        "last_restore_thinking_boundary": bool(
+            meta.get("_thinking_boundary_restore")
+        ),
     })
     _prompt_cache_ssd_record_autosave_anchor_unlocked(
         session_key,
@@ -3414,6 +3467,9 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         ),
         ssd_append_reserve_tokens=int(
             meta.get("_restore_append_reserve_tokens") or 0
+        ),
+        ssd_thinking_boundary_restore=bool(
+            meta.get("_thinking_boundary_restore")
         ),
         **_prompt_cache_match_fields(len(token_ids or []), local_key_tokens),
     )
@@ -3439,6 +3495,9 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
             meta.get("_restore_append_reserve_tokens") or 0
         ),
         "ssd_partial_restore": bool(meta.get("_partial_restore")),
+        "ssd_thinking_boundary_restore": bool(
+            meta.get("_thinking_boundary_restore")
+        ),
         "ssd_stored_key_tokens": int(meta.get("_stored_key_tokens") or local_key_tokens),
     }
 
@@ -3457,6 +3516,7 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
                                              session_id=None, session_source=None,
                                              reason="miss",
                                              allow_partial_restore=True,
+                                             allow_thinking_boundary_restore=False,
                                              append_reserve_tokens=0):
     """Try durable restore only when RAM/live reuse has already missed.
 
@@ -3474,6 +3534,7 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
         session_id=session_id,
         session_source=session_source,
         allow_partial_restore=allow_partial_restore,
+        allow_thinking_boundary_restore=allow_thinking_boundary_restore,
         append_reserve_tokens=append_reserve_tokens,
     )
 
@@ -3555,6 +3616,9 @@ def _prompt_cache_ssd_status_unlocked(force_scan=False):
     return {
         "enabled": PROMPT_CACHE_SSD_ENABLED,
         "restore_enabled": PROMPT_CACHE_SSD_RESTORE_ENABLED,
+        "thinking_boundary_restore_enabled": (
+            PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE
+        ),
         "auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
         "auto_save_min_delta_tokens": (
             PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS
@@ -4752,10 +4816,14 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
         restored_slot = None
         restored_ssd = None
         # Thinking prompts include control tokens and hidden/visible routing
-        # boundaries. Durable partial restores are safe for the no-thinking path
-        # but can resume thinking decode from an unsafe boundary, so require an
-        # exact durable match and fall back to normal prefill otherwise.
-        allow_partial_ssd_restore = not _enable_thinking_for_generation(thinking_mode)
+        # boundaries. General partial durable restores remain disabled. The one
+        # safe exception is an append-only continuation where the stored cache
+        # differs solely by MiniMax's trailing <mm:think> generation marker.
+        thinking_enabled = _enable_thinking_for_generation(thinking_mode)
+        allow_partial_ssd_restore = not thinking_enabled
+        allow_thinking_boundary_restore = (
+            thinking_enabled and PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE
+        )
         if (
             session_id
             and holder.get("cache") is not None
@@ -4803,6 +4871,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="cold_or_empty_ram",
                 allow_partial_restore=allow_partial_ssd_restore,
+                allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
@@ -4915,6 +4984,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_source=session_source,
                     reason="auto_isolation_after_stash",
                     allow_partial_restore=allow_partial_ssd_restore,
+                    allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                     append_reserve_tokens=append_reserve_tokens,
                 )
                 if restored_ssd:
@@ -5001,6 +5071,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="session_switch_after_stash",
                 allow_partial_restore=allow_partial_ssd_restore,
+                allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
@@ -5169,6 +5240,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 session_source=session_source,
                 reason="low_reuse_before_rebuild",
                 allow_partial_restore=allow_partial_ssd_restore,
+                allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
             )
             if restored_ssd:
@@ -6951,6 +7023,9 @@ def _generation_defaults_status():
         "prompt_cache_resident_max_total_tokens": PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS,
         "prompt_cache_ssd": PROMPT_CACHE_SSD_ENABLED,
         "prompt_cache_ssd_restore": PROMPT_CACHE_SSD_RESTORE_ENABLED,
+        "prompt_cache_ssd_thinking_boundary_restore": (
+            PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE
+        ),
         "prompt_cache_ssd_auto_save": PROMPT_CACHE_SSD_AUTO_SAVE,
         "prompt_cache_ssd_auto_save_min_delta_tokens": (
             PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS

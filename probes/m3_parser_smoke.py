@@ -73,6 +73,7 @@ from sharded_server import (
     _prompt_cache_ssd_backing_state,
     _prompt_cache_ssd_restore_backing_state,
     _prompt_cache_ssd_round_capacity,
+    _prompt_cache_ssd_thinking_boundary_restore_safe,
     _recover_malformed_xml_tool_calls,
     _sanitize_inbound_tool_call_content,
     _sanitize_inbound_message_content,
@@ -4886,6 +4887,34 @@ def check_ssd_restore_append_capacity_is_bounded():
     )
 
 
+def check_ssd_thinking_boundary_restore_is_narrow():
+    class FakeTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            assert add_special_tokens is False
+            return [200059] if text == "<mm:think>" else [999]
+
+    class FakeProcessor:
+        tokenizer = FakeTokenizer()
+
+    processor = FakeProcessor()
+    stored = [11, 22, 200059]
+    assert _prompt_cache_ssd_thinking_boundary_restore_safe(
+        processor, stored, [11, 22, 33, 44], 2
+    )
+    assert not _prompt_cache_ssd_thinking_boundary_restore_safe(
+        processor, stored, [11, 22], 2
+    )
+    assert not _prompt_cache_ssd_thinking_boundary_restore_safe(
+        processor, [11, 22, 777], [11, 22, 33, 44], 2
+    )
+    assert not _prompt_cache_ssd_thinking_boundary_restore_safe(
+        processor, [11, 200059, 200059], [11, 33, 44, 55], 1
+    )
+    assert not _prompt_cache_ssd_thinking_boundary_restore_safe(
+        processor, stored, [11, 99, 33, 44], 2
+    )
+
+
 def main():
     assert _server_sse_keepalive_comment() == ": keepalive\n\n"
     check_complete_analysis_channel()
@@ -4971,6 +5000,7 @@ def main():
     check_semantic_decode_stop_is_rank0_owned()
     check_bash_rejects_source_and_numeric_fragments()
     check_ssd_restore_append_capacity_is_bounded()
+    check_ssd_thinking_boundary_restore_is_narrow()
     print("PASS")
 
 
