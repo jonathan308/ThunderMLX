@@ -280,7 +280,9 @@ two-Mac setup:
 - Rank 0 / primary: high-memory Mac Studio-class Apple Silicon system.
 - Rank 1 / worker: high-memory MacBook Pro-class Apple Silicon system.
 - Direct local data link: Thunderbolt/JACCL/RDMA.
-- MiniMax-M3 Q4 with the `38,22` pipeline split.
+- MiniMax-M3 Q4 with the `38,22` pipeline split. Split values are ordered
+  `rank0,rank1`: the primary owns the final 38 layers and API, while the worker
+  owns the initial 22 layers and embeddings.
 
 That setup is only a reference baseline, not a requirement. Other Macs, memory
 sizes, storage layouts, network interfaces, and model locations should be

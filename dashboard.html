@@ -1114,7 +1114,7 @@ const advancedSettingGroups = [
   ["Cluster And Network", [
     ["M3_MLX_BACKEND", "Distributed backend"],
     ["M3_SHARDING_MODE", "Sharding mode"],
-    ["M3_PIPELINE_LAYERS", "Pipeline layer split (keep 38,22)"],
+    ["M3_PIPELINE_LAYERS", "Pipeline layers by rank (rank0,rank1; sum 60)"],
     ["MLX_M3_RANK0_ONLY_LOGITS", "Only rank 0 computes logits"],
     ["MLX_M3_RANK0_DECODE_OWNER", "Rank 0 owns decode sampling"],
     ["MLX_M3_OMLX_MINIMAX_OVERLAY", "Apply the MiniMax MSA overlay"],

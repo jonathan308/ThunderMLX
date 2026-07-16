@@ -96,7 +96,8 @@ M3_MLX_BACKEND=jaccl
 MLX_M3_MODEL=/Users/you/models/MiniMax-M3-4bit
 MLX_M3_MODEL_ID=mlx-community/MiniMax-M3-4bit
 
-# pipeline split: layers on rank1,rank0 — 38,22 fits 256/128GB
+# Pipeline split is rank0,rank1 and must sum to 60. Rank 0 owns the final
+# layers/API; rank 1 owns the initial layers. This is the 256GB/128GB reference.
 M3_PIPELINE_LAYERS=38,22
 ```
 
@@ -179,9 +180,20 @@ and can auto-switch backends — guarded so it never interrupts active work).
 
 ## Hardware notes
 
-- The reference pair is 256GB + 128GB. Other splits work by changing
-  `M3_PIPELINE_LAYERS` — budget roughly: weights ≈ 3.7GB per layer at 4-bit
-  (60 layers), plus KV headroom on each rank (~95KB/token on a 38-layer rank,
-  ~55KB/token on a 22-layer rank).
+- The reference pair is a 256GB rank 0 + 128GB rank 1. `M3_PIPELINE_LAYERS`
+  is ordered `rank0,rank1` and must sum to 60. Rank 0 owns the final layers,
+  norm, LM head, and API; rank 1 owns the initial layers and embeddings. Thus
+  the reference `38,22` means final 38 layers on the primary and initial 22 on
+  the worker.
+- Other memory combinations can use a different split. Estimate roughly 3.7GB
+  of Q4 weights per transformer layer, then leave at least 20-30GB on each Mac
+  for rank-specific weights, KV cache, Metal buffers, and macOS. Treat that as
+  a starting estimate only: shard-file packing and runtime allocation are not
+  perfectly linear. Validate a cold prefill and both ranks' memory pressure
+  before raising context or resident-cache budgets.
+- The lower-level `tools/test_filter.py` diagnostic reports the exact layer
+  range and approximate shard bytes selected by each rank without loading the
+  weights. Normal users can instead confirm the ranges in the startup log and
+  monitor both machines from the dashboard during the first cold request.
 - Single 300k-token contexts fit comfortably; the practical ceiling on a
   128GB worker is ~550–650k tokens of live KV.
