@@ -16,6 +16,7 @@ from model_gateway import (  # noqa: E402
     DEFAULT_MODEL_ID,
     _normalize_session_title,
     _normalize_session_title_sse,
+    _normalize_zcode_goal_verifier_json,
     _responses_model_prefers_reasoning_heartbeat,
     _sse_keepalive_comment,
     backend_for_model,
@@ -173,6 +174,131 @@ def check_opencode_title_sidecar_is_short_streaming_and_single():
     assert "Analyze User Input" not in qwen_normalized, qwen_normalized
     assert '"model": "Minimax-M3-No-Think"' in qwen_normalized, qwen_normalized
     assert "Download Gemma weights local inference server" in qwen_normalized, qwen_normalized
+
+
+def check_zcode_goal_verifier_is_short_no_think_and_preserves_context():
+    verifier = (
+        "Verify whether the active session goal is actually complete.\n\n"
+        "This is a verification request only. Do not continue implementation "
+        "work, do not write files, and do not call tools.\n"
+        "Return only a JSON object with this exact shape:\n"
+        '{"passed": boolean, "reason": string, "nextAction": string}'
+    )
+    messages = [
+        {
+            "role": "system",
+            "content": "Generate a concise title for this coding session.",
+        },
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Build and test the notes app."},
+        {"role": "assistant", "content": "All tests pass."},
+        {"role": "user", "content": verifier},
+    ]
+    body, model, changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3",
+            "messages": messages,
+            "max_tokens": 64000,
+            "stream": False,
+        }).encode("utf-8")
+    )
+    payload = json.loads(body)
+    assert changed is True, payload
+    assert model == "Minimax-M3-No-Think", payload
+    assert payload["model"] == "Minimax-M3-No-Think", payload
+    assert payload["thinking_mode"] == "disabled", payload
+    assert payload["temperature"] == 0, payload
+    assert payload["max_tokens"] == 256, payload
+    assert payload["_metadata_request"] == "zcode_goal_verification", payload
+    assert payload["messages"] == messages, payload
+    assert payload["stream"] is False, payload
+
+    # Ordinary completion questions and real tool requests are not metadata.
+    ordinary = json.dumps({
+        "model": "Minimax-M3",
+        "messages": [{"role": "user", "content": "Is the work complete?"}],
+    }).encode("utf-8")
+    ordinary_body, ordinary_model, ordinary_changed = normalize_openai_json_body(ordinary)
+    assert ordinary_changed is False, ordinary_body
+    assert ordinary_model == "Minimax-M3", ordinary_model
+
+    historical_title = json.dumps({
+        "model": "Minimax-M3",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Generate a concise title for this coding session.",
+            },
+            {"role": "user", "content": "Build the notes app."},
+            {"role": "assistant", "content": "The notes app is ready."},
+            {"role": "user", "content": "Summarize the implementation."},
+        ],
+    }).encode("utf-8")
+    normalized_history, history_model, history_changed = normalize_openai_json_body(
+        historical_title
+    )
+    assert history_changed is False, normalized_history
+    assert history_model == "Minimax-M3", history_model
+
+    tool_body, tool_model, tool_changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3",
+            "messages": messages,
+            "tools": [{
+                "type": "function",
+                "function": {"name": "Read", "parameters": {"type": "object"}},
+            }],
+        }).encode("utf-8")
+    )
+    assert tool_changed is False, tool_body
+    assert tool_model == "Minimax-M3", tool_model
+
+    omlx_body = json.dumps({
+        "model": "DeepSeek-V4-Flash-4bit",
+        "messages": messages,
+        "max_tokens": 64000,
+    }).encode("utf-8")
+    normalized_omlx, omlx_model, omlx_changed = normalize_openai_json_body(omlx_body)
+    assert omlx_changed is False, normalized_omlx
+    assert omlx_model == "DeepSeek-V4-Flash-4bit", omlx_model
+
+    valid_response = json.dumps({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": (
+                    'Preamble. {"passed":true,"reason":"All 90 tests pass.",'
+                    '"nextAction":""} Trailing prose.'
+                ),
+                "reasoning_content": "hidden",
+            },
+            "finish_reason": "length",
+        }],
+    }).encode("utf-8")
+    normalized_valid = json.loads(_normalize_zcode_goal_verifier_json(valid_response))
+    valid_choice = normalized_valid["choices"][0]
+    valid_verdict = json.loads(valid_choice["message"]["content"])
+    assert valid_verdict == {
+        "passed": True,
+        "reason": "All 90 tests pass.",
+        "nextAction": "",
+    }, valid_verdict
+    assert "reasoning_content" not in valid_choice["message"], valid_choice
+    assert valid_choice["finish_reason"] == "stop", valid_choice
+
+    malformed_response = json.dumps({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": '{"passed": false, "reason": "missing next action"}',
+            },
+            "finish_reason": "stop",
+        }],
+    }).encode("utf-8")
+    normalized_bad = json.loads(_normalize_zcode_goal_verifier_json(malformed_response))
+    bad_verdict = json.loads(normalized_bad["choices"][0]["message"]["content"])
+    assert bad_verdict["passed"] is False, bad_verdict
+    assert set(bad_verdict) == {"passed", "reason", "nextAction"}, bad_verdict
 
 
 def check_unknown_models_cannot_trigger_an_omlx_switch():
@@ -415,6 +541,7 @@ def main():
     check_m3_case_and_path_aliases_are_canonicalized()
     check_zcode_title_sidecar_is_short_and_visible()
     check_opencode_title_sidecar_is_short_streaming_and_single()
+    check_zcode_goal_verifier_is_short_no_think_and_preserves_context()
     check_unknown_models_cannot_trigger_an_omlx_switch()
     check_responses_heartbeat_model_selection()
     check_thinking_heartbeat_keeps_reasoning_separate()

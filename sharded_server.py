@@ -55,6 +55,8 @@ from contextlib import asynccontextmanager, contextmanager
 
 import mlx.core as mx
 
+import m3_multimodal_cache as _mm_cache
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [rank ?] %(levelname)s %(message)s")
 logger = logging.getLogger("sharded_server")
@@ -1311,6 +1313,12 @@ PROMPT_CACHE_THINKING_ENABLED = PROMPT_CACHE_THINKING_MODE != "off"
 PROMPT_CACHE_DIRECT_SUFFIX_IDS = os.environ.get(
     "MLX_M3_PROMPT_CACHE_DIRECT_SUFFIX_IDS", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Exact image-bearing KV reuse. The feature stays opt-in until its two-rank
+# acceptance ladder passes; when disabled, image requests retain Beta 5's
+# proven full-prefill behavior.
+IMAGE_PROMPT_CACHE_ENABLED = os.environ.get(
+    "MLX_M3_IMAGE_PROMPT_CACHE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 PROMPT_CACHE_MIN_REUSE = int(os.environ.get("MLX_M3_PROMPT_CACHE_MIN_REUSE", "32"))
 PROMPT_CACHE_TTL_SECONDS = int(os.environ.get("MLX_M3_PROMPT_CACHE_TTL_SECONDS", "10800"))
 PROMPT_CACHE_MAX_TOKENS = int(os.environ.get("MLX_M3_PROMPT_CACHE_MAX_TOKENS", "0"))
@@ -2101,6 +2109,8 @@ _prompt_cache_holder = {
     "prompt": None,
     "session_id": None,
     "session_source": None,
+    "multimodal_fingerprint": None,
+    "multimodal_descriptor": None,
     "max_kv_size": MAX_KV_SIZE,
     "last_event": None,   # most recent cache decision/update for health/debug
     "last_prepare_event": None,
@@ -2206,6 +2216,10 @@ def _prompt_cache_stash_current_unlocked(reason="stash"):
         "last_exact_generated_ids": bool(holder.get("last_exact_generated_ids")),
         "session_id": holder.get("session_id"),
         "session_source": holder.get("session_source"),
+        "multimodal_fingerprint": holder.get("multimodal_fingerprint"),
+        "multimodal_descriptor": copy.deepcopy(
+            holder.get("multimodal_descriptor")
+        ),
         "created_at": holder.get("created_at"),
         "last_access_at": round(time.time(), 3),
         "stashed_at": round(time.time(), 3),
@@ -2234,14 +2248,27 @@ def _prompt_cache_stash_current_unlocked(reason="stash"):
     return True
 
 
-def _prompt_cache_restore_resident_unlocked(session_id=None, session_source=None):
+def _prompt_cache_restore_resident_unlocked(
+    session_id=None,
+    session_source=None,
+    multimodal_fingerprint=None,
+):
     """Swap in a previously stashed live KV slot for the requested session."""
     if PROMPT_CACHE_RESIDENT_SLOTS <= 1 or not session_id:
         return None
     key = _prompt_cache_session_key(session_id, session_source)
-    slot = _prompt_cache_resident_slots.pop(key, None)
+    slot = _prompt_cache_resident_slots.get(key)
     if not slot:
         return None
+    if (slot.get("multimodal_fingerprint") or None) != (
+        multimodal_fingerprint or None
+    ):
+        logger.warning(
+            "prompt-cache resident slot fingerprint mismatch for %s; cold fallback",
+            key,
+        )
+        return None
+    slot = _prompt_cache_resident_slots.pop(key)
     current_key = _prompt_cache_current_session_key_unlocked()
     if current_key != key:
         _prompt_cache_stash_current_unlocked(reason=f"restore:{key}")
@@ -2254,6 +2281,12 @@ def _prompt_cache_restore_resident_unlocked(session_id=None, session_source=None
     _prompt_cache_holder["last_exact_generated_ids"] = bool(slot.get("last_exact_generated_ids"))
     _prompt_cache_holder["session_id"] = slot.get("session_id")
     _prompt_cache_holder["session_source"] = slot.get("session_source")
+    _prompt_cache_holder["multimodal_fingerprint"] = slot.get(
+        "multimodal_fingerprint"
+    )
+    _prompt_cache_holder["multimodal_descriptor"] = copy.deepcopy(
+        slot.get("multimodal_descriptor")
+    )
     _prompt_cache_holder["created_at"] = slot.get("created_at")
     _prompt_cache_holder["last_access_at"] = round(time.time(), 3)
     logger.info(
@@ -2552,6 +2585,7 @@ def _prompt_cache_ssd_file_fingerprint():
         os.path.join(root, "m3_batch_cancel.py"),
         os.path.join(root, "m3_pipeline_patch.py"),
         os.path.join(root, "m3_eagle3.py"),
+        os.path.join(root, "m3_multimodal_cache.py"),
         os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "language.py"),
         os.path.join(root, "MSA Support", "mlx_vlm", "models", "minimax_m3_vl", "msa.py"),
     ]
@@ -3349,6 +3383,10 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
             "session_key_label": _prompt_cache_ssd_session_label(session_key),
             "session_id": session_id,
             "session_source": session_source,
+            "multimodal_fingerprint": holder.get("multimodal_fingerprint"),
+            "multimodal_descriptor": copy.deepcopy(
+                holder.get("multimodal_descriptor")
+            ),
             "model_id": MODEL_ID,
             "model": MODEL,
             "runtime": runtime,
@@ -3477,7 +3515,8 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
                                               session_id, session_source,
                                               allow_partial_restore=True,
                                               allow_thinking_boundary_restore=False,
-                                              append_reserve_tokens=0):
+                                              append_reserve_tokens=0,
+                                              multimodal_fingerprint=None):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None, None, None, "disabled"
     if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
@@ -3502,6 +3541,10 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
             return None, None, None, "schema_mismatch"
         if not meta.get("complete"):
             return None, None, None, "incomplete_artifact"
+        stored_multimodal_fingerprint = meta.get("multimodal_fingerprint") or None
+        requested_multimodal_fingerprint = multimodal_fingerprint or None
+        if stored_multimodal_fingerprint != requested_multimodal_fingerprint:
+            return None, None, None, "multimodal_fingerprint_mismatch"
         artifact_rank = meta.get("rank")
         if artifact_rank is None:
             artifact_rank = -1
@@ -3658,7 +3701,8 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
                                            session_id=None, session_source=None,
                                            allow_partial_restore=True,
                                            allow_thinking_boundary_restore=False,
-                                           append_reserve_tokens=0):
+                                           append_reserve_tokens=0,
+                                           multimodal_fingerprint=None):
     if not PROMPT_CACHE_SSD_ENABLED:
         return None
     if not PROMPT_CACHE_SSD_RESTORE_ENABLED:
@@ -3669,6 +3713,7 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         allow_partial_restore=allow_partial_restore,
         allow_thinking_boundary_restore=allow_thinking_boundary_restore,
         append_reserve_tokens=append_reserve_tokens,
+        multimodal_fingerprint=multimodal_fingerprint,
     )
     rank, world = _prompt_cache_ssd_current_rank_world()
     local_ok = 1 if cache is not None and stored_ids and meta else 0
@@ -3712,6 +3757,12 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
     _prompt_cache_holder["last_exact_generated_ids"] = False
     _prompt_cache_holder["session_id"] = session_id
     _prompt_cache_holder["session_source"] = session_source
+    _prompt_cache_holder["multimodal_fingerprint"] = (
+        meta.get("multimodal_fingerprint") or None
+    )
+    _prompt_cache_holder["multimodal_descriptor"] = copy.deepcopy(
+        meta.get("multimodal_descriptor")
+    )
     _prompt_cache_holder["created_at"] = meta.get("saved_at") or round(time.time(), 3)
     _prompt_cache_holder["last_access_at"] = round(time.time(), 3)
     _prompt_cache_ssd_state.update({
@@ -3804,7 +3855,8 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
                                              reason="miss",
                                              allow_partial_restore=True,
                                              allow_thinking_boundary_restore=False,
-                                             append_reserve_tokens=0):
+                                             append_reserve_tokens=0,
+                                             multimodal_fingerprint=None):
     """Try durable restore only when RAM/live reuse has already missed.
 
     This helper intentionally does not inspect local artifact existence before
@@ -3823,6 +3875,7 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
         allow_partial_restore=allow_partial_restore,
         allow_thinking_boundary_restore=allow_thinking_boundary_restore,
         append_reserve_tokens=append_reserve_tokens,
+        multimodal_fingerprint=multimodal_fingerprint,
     )
 
 
@@ -4091,6 +4144,8 @@ def _prompt_cache_session_map_status_unlocked():
                 "key": key,
                 "session_id": slot.get("session_id"),
                 "session_source": slot.get("session_source"),
+                "multimodal": bool(slot.get("multimodal_fingerprint")),
+                "multimodal_fingerprint": slot.get("multimodal_fingerprint"),
                 "cache_len": int(slot.get("cache_len") or 0),
                 "key_tokens": len(slot.get("token_ids") or []),
                 "stashed_at": slot.get("stashed_at"),
@@ -4127,6 +4182,8 @@ def _clear_prompt_cache_key_state_unlocked(holder):
     holder["prompt"] = None
     holder["session_id"] = None
     holder["session_source"] = None
+    holder["multimodal_fingerprint"] = None
+    holder["multimodal_descriptor"] = None
 
 
 def _drop_prompt_cache_unlocked(reason="reset", clear_manifest=False,
@@ -4545,6 +4602,248 @@ def _tokenize_prompt(processor, prompt):
         return None
 
 
+def _image_source_manifest(image_path):
+    if image_path is None:
+        return None
+    return _mm_cache.source_manifest(image_path)
+
+
+def _prepare_multimodal_cache_context(
+    model,
+    processor,
+    prompt,
+    image,
+    *,
+    expected_source_manifest=None,
+    gen_params=None,
+):
+    """Prepare the exact expanded MiniMax image prompt without running vision."""
+    from mlx_vlm.utils import prepare_inputs
+
+    if image is None:
+        return None, False, "image_materialization_missing"
+    source = _image_source_manifest(image)
+    expected_hash = (expected_source_manifest or {}).get("hash")
+    source_matches = not expected_hash or expected_hash == source.get("hash")
+    if not source_matches:
+        return None, False, "source_manifest_mismatch"
+
+    params = gen_params or {}
+    processor_kwargs = {}
+    if params.get("max_long_side_pixel") is not None:
+        processor_kwargs["max_long_side_pixel"] = params["max_long_side_pixel"]
+    add_special_tokens = not (
+        getattr(model.config, "model_type", None)
+        in {"gemma3", "gemma3n", "gemma4", "gemma4_unified"}
+        and getattr(processor, "chat_template", None) is not None
+    )
+    with _tokenizer_runtime_lock:
+        inputs = prepare_inputs(
+            processor,
+            images=image,
+            prompts=prompt,
+            image_token_index=getattr(model.config, "image_token_index", None),
+            resize_shape=params.get("resize_shape"),
+            add_special_tokens=add_special_tokens,
+            padding=True,
+            padding_side="left",
+            **processor_kwargs,
+        )
+    input_ids = inputs.get("input_ids")
+    pixel_values = inputs.get("pixel_values")
+    if input_ids is None or pixel_values is None:
+        return None, True, "processor_missing_multimodal_inputs"
+    token_ids = [int(token) for token in input_ids.flatten().tolist()]
+    media_ids = _mm_cache.media_token_ids(model.config)
+    data_kwargs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in {"input_ids", "pixel_values", "attention_mask"}
+    }
+    image_grid_thw = data_kwargs.get("image_grid_thw")
+    processor_fp = _mm_cache.processor_fingerprint(processor, model.config)
+    descriptor = _mm_cache.build_descriptor(
+        source=source,
+        processor=processor_fp,
+        token_ids=token_ids,
+        media_ids=media_ids,
+        image_grid_thw=image_grid_thw,
+        pixel_values_shape=getattr(pixel_values, "shape", None),
+        pixel_values_dtype=str(getattr(pixel_values, "dtype", "")) or None,
+    )
+    if descriptor.get("image_count", 0) <= 0:
+        return None, True, "empty_image_manifest"
+    if descriptor.get("media_token_count", 0) <= 0:
+        return None, True, "expanded_prompt_has_no_image_tokens"
+    return {
+        "input_ids": input_ids,
+        "pixel_values": pixel_values,
+        "mask": inputs.get("attention_mask"),
+        "data_kwargs": data_kwargs,
+        "token_ids": token_ids,
+        "descriptor": descriptor,
+        "fingerprint": descriptor["fingerprint"],
+        "minimum_safe_reuse": int(
+            descriptor.get("media_safe_prefix_min") or 0
+        ),
+        "media_token_ids": tuple(descriptor.get("media_token_ids") or ()),
+    }, True, None
+
+
+def _prepare_multimodal_cache_context_synced(
+    model,
+    processor,
+    prompt,
+    image,
+    rank,
+    *,
+    expected_source_manifest=None,
+    gen_params=None,
+):
+    """Return a multimodal plan only when every rank produced the same plan."""
+    context = None
+    source_matches = True
+    error = None
+    try:
+        context, source_matches, error = _prepare_multimodal_cache_context(
+            model,
+            processor,
+            prompt,
+            image,
+            expected_source_manifest=expected_source_manifest,
+            gen_params=gen_params,
+        )
+    except Exception as exc:
+        error = str(exc)
+        logger.warning(
+            "rank %s: multimodal cache preparation failed; using cold image path: %s",
+            rank,
+            exc,
+        )
+
+    vector = (1 if source_matches else 0,) + _mm_cache.consensus_vector(context)
+    try:
+        group = mx.distributed.init()
+        world = int(group.size())
+        if world <= 1:
+            if not source_matches:
+                raise RuntimeError("multimodal image bytes changed during materialization")
+            return context
+        mine = mx.array(vector, dtype=mx.int64)
+        total = mx.distributed.all_sum(mine)
+        mx.eval(total)
+        totals = [int(value) for value in total.tolist()]
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"multimodal plan consensus failed: {exc}") from exc
+
+    if totals[0] != world:
+        raise RuntimeError(
+            "multimodal image bytes differ across ranks; request rejected before inference"
+        )
+    prepared_ranks = totals[1]
+    if prepared_ranks == 0:
+        logger.warning(
+            "rank %s: all ranks declined multimodal cache preparation (%s); "
+            "using the proven cold image path",
+            rank,
+            error or "unsupported",
+        )
+        return None
+    if prepared_ranks != world:
+        raise RuntimeError(
+            "multimodal preprocessing succeeded on only part of the cluster"
+        )
+    for index, local_value in enumerate(vector[2:], start=2):
+        if totals[index] != int(local_value) * world:
+            raise RuntimeError(
+                "multimodal expanded-token plan differs across ranks"
+            )
+    return context
+
+
+def _multimodal_session_identity(session_id, context):
+    if not context:
+        return session_id
+    return _mm_cache.cache_session_id(session_id, context["fingerprint"])
+
+
+def _apply_multimodal_generation_inputs(
+    gen_kwargs,
+    context,
+    cached_prompt_cache,
+    cached_suffix_ids,
+):
+    """Attach either a cold visual prefill or a media-safe text suffix."""
+    if not context:
+        return 0
+    token_ids = context["token_ids"]
+    suffix_ids = list(cached_suffix_ids or [])
+    reuse_tokens = len(token_ids) - len(suffix_ids) if suffix_ids else 0
+    cache_hit = bool(
+        cached_prompt_cache is not None
+        and suffix_ids
+        and 0 < reuse_tokens < len(token_ids)
+    )
+    if cache_hit and not _mm_cache.prefix_is_media_safe(
+        token_ids,
+        reuse_tokens,
+        context["media_token_ids"],
+    ):
+        raise RuntimeError(
+            "multimodal cache plan attempted to reuse a prefix before the media boundary"
+        )
+    if cache_hit:
+        gen_kwargs["input_ids"] = mx.array([suffix_ids], dtype=mx.int32)
+        gen_kwargs["mask"] = None
+        # The image is already represented in the reused language KV. Release
+        # preprocessing tensors before decode instead of retaining a duplicate
+        # pixel buffer for the whole response.
+        context["input_ids"] = None
+        context["pixel_values"] = None
+        context["mask"] = None
+        context["data_kwargs"] = {}
+    else:
+        gen_kwargs["input_ids"] = context["input_ids"]
+        gen_kwargs["pixel_values"] = context["pixel_values"]
+        gen_kwargs["mask"] = context["mask"]
+        gen_kwargs.update(context["data_kwargs"])
+        reuse_tokens = 0
+    context["physical_reuse_tokens"] = reuse_tokens
+    context["physical_cache_hit"] = bool(cache_hit)
+    return reuse_tokens
+
+
+def _annotate_multimodal_prompt_cache_event(context, session_id):
+    if not context:
+        return
+    descriptor = copy.deepcopy(context["descriptor"])
+    with _prompt_cache_lock:
+        holder = _prompt_cache_holder
+        if holder.get("session_id") == session_id:
+            holder["multimodal_fingerprint"] = context["fingerprint"]
+            holder["multimodal_descriptor"] = descriptor
+        event = holder.get("last_prepare_event")
+        if isinstance(event, dict):
+            event.update({
+                "multimodal": True,
+                "image_count": descriptor.get("image_count"),
+                "image_fingerprint": descriptor.get("fingerprint_short"),
+                "expanded_prompt_tokens": descriptor.get(
+                    "expanded_prompt_tokens"
+                ),
+                "media_token_count": descriptor.get("media_token_count"),
+                "media_safe_prefix_min": descriptor.get(
+                    "media_safe_prefix_min"
+                ),
+                "physical_cache_hit": bool(context.get("physical_cache_hit")),
+                "physical_reuse_tokens": int(
+                    context.get("physical_reuse_tokens") or 0
+                ),
+            })
+
+
 def _get_or_build_prompt_cache(model):
     """Return the reusable prompt cache, building it fresh if needed."""
     with _prompt_cache_lock:
@@ -4675,6 +4974,13 @@ def _prompt_cache_status():
             "session_protect_bypass_max_tokens": PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS,
             "session_id": _prompt_cache_holder.get("session_id"),
             "session_source": _prompt_cache_holder.get("session_source"),
+            "image_prompt_cache_enabled": IMAGE_PROMPT_CACHE_ENABLED,
+            "multimodal_fingerprint": _prompt_cache_holder.get(
+                "multimodal_fingerprint"
+            ),
+            "multimodal_descriptor": copy.deepcopy(
+                _prompt_cache_holder.get("multimodal_descriptor")
+            ),
             "key_tokens": len(_prompt_cache_holder.get("token_ids") or []),
             "cache_len": int(_prompt_cache_holder.get("cache_len") or 0),
             **capacity_status,
@@ -5078,7 +5384,9 @@ def _prewarm_plan_consensus(my_skip, prompt_to_send, cached_prompt_cache):
 def _prepare_cached_prompt(model, processor, prompt, token_ids,
                            session_id=None, session_source=None,
                            thinking_mode="adaptive",
-                           append_reserve_tokens=0):
+                           append_reserve_tokens=0,
+                           multimodal_fingerprint=None,
+                           minimum_safe_reuse=0):
     """Compute (suffix_prompt, prompt_cache) for prefix-aware generation.
 
     Returns (prompt_to_send, prompt_cache_or_None). If a long prefix is reused,
@@ -5107,7 +5415,9 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
         # safe exception is an append-only continuation where the stored cache
         # differs solely by MiniMax's trailing <mm:think> generation marker.
         thinking_enabled = _enable_thinking_for_generation(thinking_mode)
-        allow_partial_ssd_restore = not thinking_enabled
+        allow_partial_ssd_restore = bool(
+            not thinking_enabled and not multimodal_fingerprint
+        )
         allow_thinking_boundary_restore = (
             thinking_enabled and PROMPT_CACHE_SSD_THINKING_BOUNDARY_RESTORE
         )
@@ -5121,6 +5431,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 restored_slot = _prompt_cache_restore_resident_unlocked(
                     session_id=session_id,
                     session_source=session_source,
+                    multimodal_fingerprint=multimodal_fingerprint,
                 )
             elif not _is_auto_cache_session_source(session_source):
                 # A one-slot runtime cannot retain two live KV trees. Persist
@@ -5160,6 +5471,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 allow_partial_restore=allow_partial_ssd_restore,
                 allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
+                multimodal_fingerprint=multimodal_fingerprint,
             )
             if restored_ssd:
                 cached_ids = holder["token_ids"]
@@ -5184,6 +5496,37 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     **_prompt_cache_match_fields(len(token_ids), 0),
                 )
                 return prompt, holder["cache"]
+
+        cached_multimodal_fingerprint = holder.get("multimodal_fingerprint") or None
+        requested_multimodal_fingerprint = multimodal_fingerprint or None
+        if cached_multimodal_fingerprint != requested_multimodal_fingerprint:
+            logger.warning(
+                "prompt-cache: multimodal fingerprint mismatch; rebuilding cold "
+                "(cached=%s requested=%s)",
+                (cached_multimodal_fingerprint or "text")[:16],
+                (requested_multimodal_fingerprint or "text")[:16],
+            )
+            _prompt_cache_stash_current_unlocked(
+                reason=f"multimodal_mismatch:{session_id or '__default__'}"
+            )
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "multimodal_fingerprint_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                session_id=session_id,
+                session_source=session_source,
+                cached_multimodal_fingerprint=cached_multimodal_fingerprint,
+                multimodal_fingerprint=requested_multimodal_fingerprint,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+            )
+            return prompt, holder["cache"]
 
         # Common prefix between the stored INPUT ids and the new prompt ids.
         L = _common_prefix_len(cached_ids, token_ids)
@@ -5227,6 +5570,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
             #   2. otherwise stash to a resident slot, try SSD restore
             #   3. only then rebuild fresh
             if (
+                not multimodal_fingerprint
+                and
                 protected_cache_tokens >= PROMPT_CACHE_SESSION_PROTECT_MIN_TOKENS
                 and len(token_ids) <= PROMPT_CACHE_SESSION_PROTECT_BYPASS_MAX_TOKENS
             ):
@@ -5273,6 +5618,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     allow_partial_restore=allow_partial_ssd_restore,
                     allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                     append_reserve_tokens=append_reserve_tokens,
+                    multimodal_fingerprint=multimodal_fingerprint,
                 )
                 if restored_ssd:
                     return _prepare_cached_prompt(
@@ -5284,6 +5630,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                         session_source=session_source,
                         thinking_mode=thinking_mode,
                         append_reserve_tokens=append_reserve_tokens,
+                        multimodal_fingerprint=multimodal_fingerprint,
+                        minimum_safe_reuse=minimum_safe_reuse,
                     )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -5360,6 +5708,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 allow_partial_restore=allow_partial_ssd_restore,
                 allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
+                multimodal_fingerprint=multimodal_fingerprint,
             )
             if restored_ssd:
                 return _prepare_cached_prompt(
@@ -5371,6 +5720,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_source=session_source,
                     thinking_mode=thinking_mode,
                     append_reserve_tokens=append_reserve_tokens,
+                    multimodal_fingerprint=multimodal_fingerprint,
+                    minimum_safe_reuse=minimum_safe_reuse,
                 )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -5518,6 +5869,37 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
             )
             return prompt, holder["cache"]
 
+        if minimum_safe_reuse > 0 and 0 < reuse < minimum_safe_reuse:
+            logger.info(
+                "prompt-cache: multimodal prefix ends before the media boundary "
+                "(%d < %d); full prefill",
+                reuse,
+                minimum_safe_reuse,
+            )
+            _prompt_cache_stash_current_unlocked(
+                reason=f"media_boundary:{session_id or '__default__'}"
+            )
+            holder["cache"] = None
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+            _clear_prompt_cache_key_state_unlocked(holder)
+            holder["session_id"] = session_id
+            holder["session_source"] = session_source
+            holder["last_suffix_ids"] = list(token_ids)
+            _set_prompt_cache_event(
+                "multimodal_media_boundary_rebuild",
+                prompt_tokens=len(token_ids),
+                reuse_tokens=0,
+                suffix_tokens=len(token_ids),
+                unsafe_reuse_tokens=reuse,
+                minimum_safe_reuse=minimum_safe_reuse,
+                session_id=session_id,
+                session_source=session_source,
+                multimodal_fingerprint=multimodal_fingerprint,
+                **_prompt_cache_match_fields(len(token_ids), 0),
+                **reuse_diag,
+            )
+            return prompt, holder["cache"]
+
         if reuse < PROMPT_CACHE_MIN_REUSE:
             restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
                 model,
@@ -5529,6 +5911,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 allow_partial_restore=allow_partial_ssd_restore,
                 allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                 append_reserve_tokens=append_reserve_tokens,
+                multimodal_fingerprint=multimodal_fingerprint,
             )
             if restored_ssd:
                 return _prepare_cached_prompt(
@@ -5540,6 +5923,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     session_source=session_source,
                     thinking_mode=thinking_mode,
                     append_reserve_tokens=append_reserve_tokens,
+                    multimodal_fingerprint=multimodal_fingerprint,
+                    minimum_safe_reuse=minimum_safe_reuse,
                 )
             # Not enough overlap to bother: reset and process full prompt.
             _prompt_cache_stash_current_unlocked(reason=f"replace:{session_id or '__default__'}")
@@ -5633,6 +6018,32 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
         if not suffix_ids and reuse > 0:
             # Generation needs at least one input token. Back the cache up one
             # token and send that final token through the normal prefill path.
+            if minimum_safe_reuse > 0 and reuse - 1 < minimum_safe_reuse:
+                logger.info(
+                    "prompt-cache: exact multimodal hit cannot backtrack past "
+                    "the media boundary; full prefill"
+                )
+                _prompt_cache_stash_current_unlocked(
+                    reason=f"media_exact_backtrack:{session_id or '__default__'}"
+                )
+                holder["cache"] = None
+                holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                _clear_prompt_cache_key_state_unlocked(holder)
+                holder["session_id"] = session_id
+                holder["session_source"] = session_source
+                holder["last_suffix_ids"] = list(token_ids)
+                _set_prompt_cache_event(
+                    "multimodal_exact_backtrack_rebuild",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    suffix_tokens=len(token_ids),
+                    minimum_safe_reuse=minimum_safe_reuse,
+                    session_id=session_id,
+                    session_source=session_source,
+                    multimodal_fingerprint=multimodal_fingerprint,
+                    **_prompt_cache_match_fields(len(token_ids), 0),
+                )
+                return prompt, holder["cache"]
             if not _trim_prompt_cache_in_place(cache, 1):
                 logger.warning("prompt-cache exact-hit backtrack failed; full prefill")
                 _prompt_cache_stash_current_unlocked(reason=f"exact_hit_backtrack_failed:{session_id or '__default__'}")
@@ -5669,6 +6080,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
             and reuse > PROMPT_CACHE_MIN_REUSE
         ):
             bucketed_reuse = (reuse // bucket_tokens) * bucket_tokens
+            if minimum_safe_reuse > 0:
+                bucketed_reuse = max(bucketed_reuse, minimum_safe_reuse)
             if bucketed_reuse < PROMPT_CACHE_MIN_REUSE:
                 bucketed_reuse = reuse
             if bucketed_reuse < reuse:
@@ -5719,7 +6132,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
             # amount so the prefill runs as a healthier batch while still
             # reusing the overwhelming majority of the prompt.
             backtrack = min(
-                reuse,
+                max(0, reuse - minimum_safe_reuse),
                 max(0, min_suffix_tokens - len(suffix_ids)),
             )
             if backtrack > 0:
@@ -5911,17 +6324,41 @@ def _prompt_cache_allowed_for_request(thinking_mode, token_ids):
     return True
 
 
-def _prompt_cache_allowed_for_generation(thinking_mode, token_ids, image):
-    """Keep text KV reuse away from image-bearing VLM generations.
+def _prompt_cache_allowed_for_generation(
+    thinking_mode,
+    token_ids,
+    image,
+    multimodal_fingerprint=None,
+):
+    """Allow image KV reuse only with an exact expanded multimodal plan.
 
-    MLX-VLM expands image placeholders into feature tokens during prefill. A
-    text-prefix cache can trim those placeholders while the caller still
-    supplies image features, yielding ``Image features and Image tokens do not
-    match`` on a retry or follow-up. Until multimodal cache metadata tracks
-    those feature positions explicitly, a full image-bearing prefill is the
-    only shape-safe path. Text-only sessions keep their normal RAM/SSD reuse.
+    The feature gate preserves Beta 5's full-prefill path unless both direct
+    suffix IDs and an exact image/preprocessor fingerprint are available.
     """
-    if image is not None:
+    if image is not None and not (
+        IMAGE_PROMPT_CACHE_ENABLED
+        and PROMPT_CACHE_DIRECT_SUFFIX_IDS
+        and multimodal_fingerprint
+    ):
+        if PROMPT_CACHE_ENABLED:
+            with _prompt_cache_lock:
+                _set_prompt_cache_event(
+                    "image_cache_bypass",
+                    prompt_tokens=len(token_ids or []),
+                    reuse_tokens=0,
+                    suffix_tokens=len(token_ids or []),
+                    reason=(
+                        "feature_disabled"
+                        if not IMAGE_PROMPT_CACHE_ENABLED
+                        else "direct_suffix_ids_disabled"
+                        if not PROMPT_CACHE_DIRECT_SUFFIX_IDS
+                        else "multimodal_plan_unavailable"
+                    ),
+                    multimodal=True,
+                    physical_cache_hit=False,
+                    physical_reuse_tokens=0,
+                    **_prompt_cache_match_fields(len(token_ids or []), 0),
+                )
         return False
     return _prompt_cache_allowed_for_request(thinking_mode, token_ids)
 
@@ -5951,6 +6388,8 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
                                           include_generated_ids=True,
                                           session_id=None,
                                           session_source=None,
+                                          multimodal_fingerprint=None,
+                                          multimodal_descriptor=None,
                                           prompt=None,
                                           model=None,
                                           processor=None,
@@ -6038,6 +6477,12 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
         _prompt_cache_holder["last_exact_generated_ids"] = exact_generated_ids
         _prompt_cache_holder["session_id"] = effective_session_id
         _prompt_cache_holder["session_source"] = effective_session_source
+        _prompt_cache_holder["multimodal_fingerprint"] = (
+            multimodal_fingerprint or None
+        )
+        _prompt_cache_holder["multimodal_descriptor"] = copy.deepcopy(
+            multimodal_descriptor
+        )
         _set_prompt_cache_event(
             "updated",
             phase="update",
@@ -6047,6 +6492,8 @@ def _update_prompt_cache_after_generation(token_ids, generated_token_ids=None,
             cache_len=_prompt_cache_holder["cache_len"],
             session_id=effective_session_id,
             session_source=effective_session_source,
+            multimodal=bool(multimodal_fingerprint),
+            multimodal_fingerprint=multimodal_fingerprint,
             exact_generated_ids=exact_generated_ids,
             generated_reuse_allowed=bool(generated_reuse_allowed),
             generated_key_tokens=len(generated_key_ids),
@@ -7248,6 +7695,8 @@ def _generation_defaults_status():
         "prompt_cache_thinking_enabled": PROMPT_CACHE_THINKING_ENABLED,
         "prompt_cache_thinking_mode": PROMPT_CACHE_THINKING_MODE,
         "prompt_cache_direct_suffix_ids": PROMPT_CACHE_DIRECT_SUFFIX_IDS,
+        "image_prompt_cache_enabled": IMAGE_PROMPT_CACHE_ENABLED,
+        "image_prompt_cache_schema": _mm_cache.SCHEMA_VERSION,
         "prompt_cache_min_suffix_tokens": PROMPT_CACHE_MIN_SUFFIX_TOKENS,
         "effective_prompt_cache_min_suffix_tokens": runtime_tuning.get(
             "prompt_cache_min_suffix_tokens"
@@ -9960,6 +10409,32 @@ def _tool_text_requests_action(user_text):
     if not isinstance(user_text, str) or not user_text.strip():
         return False
     normalized = re.sub(r"\s+", " ", user_text.strip()).lower()
+    # A completed tool turn is commonly followed by instructions such as
+    # "reply DONE and do not call another tool".  Treating the negated
+    # ``call ... tool`` phrase as affirmative intent forces an unnecessary
+    # retry; at long context that retry can look like a decode wedge while it
+    # silently re-prefills the entire conversation.  Remove only explicit
+    # negated tool clauses, then evaluate any remaining affirmative action.
+    # This preserves requests such as "do not call X; use Y instead" because
+    # the positive Y clause remains after normalization.
+    negative_tool_patterns = (
+        r"\b(?:do\s+not|don't|dont|never)\s+"
+        r"(?:need\s+to\s+)?(?:use|call|invoke)\s+"
+        r"(?:(?:the|an?|any|another|more|additional|available)\s+)*"
+        r"(?:[a-z0-9_.:-]+\s+)?(?:function|tool)s?\b",
+        r"\bwithout\s+(?:using|calling|invoking)\s+"
+        r"(?:(?:the|an?|any|another|more|additional|available)\s+)*"
+        r"(?:[a-z0-9_.:-]+\s+)?(?:function|tool)s?\b",
+        r"\bno\s+(?:more\s+|additional\s+)?(?:function|tool)s?\s+"
+        r"(?:(?:is|are)\s+)?(?:needed|required|necessary)\b",
+        r"\b(?:function|tool)s?\s+(?:(?:is|are)\s+)?"
+        r"(?:not\s+needed|not\s+required|unnecessary)\b",
+    )
+    for pattern in negative_tool_patterns:
+        normalized = re.sub(pattern, " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if not normalized:
+        return False
     if re.search(
         r"\b(?:use|call|invoke)\s+(?:the\s+)?(?:available\s+)?"
         r"(?:[a-z0-9_.:-]+\s+)?(?:function|tool)\b",
@@ -12396,7 +12871,9 @@ def _render_tool_retry_prompt(model, processor, processed_messages, tools,
         return None
     from mlx_vlm.prompt_utils import apply_chat_template
 
-    retry_messages = _tool_retry_messages(processed_messages, recovery_hint)
+    retry_messages = _model_facing_messages_with_media(
+        _tool_retry_messages(processed_messages, recovery_hint)
+    )
     template_kwargs = _thinking_template_kwargs(
         model.config,
         enable_thinking=(retry_thinking_mode == "enabled"),
@@ -12833,18 +13310,46 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         _clear_prefill_stop_file("rank 0 tool retry")
         _bcast(retry_request, rank)
         try:
-            full_output = run_generation(
-                model, processor, retry_prompt, retry_max_tokens, rank,
-                image=image_path, thinking_mode=retry_thinking_mode,
-                gen_params=retry_params, progress_cb=progress_cb,
-                token_ids=retry_token_ids,
-                session_id=session_id, session_source=session_source,
-                reset_incomplete_thinking_on_limit=False,
-                tool_module=tool_module, tools=tools,
-                require_tool_call=require_call,
-                action_tool_task=action_tool_task,
-                no_call_token_budget=retry_no_call_budget,
-            )
+            retry_kwargs = {
+                "image": image_path,
+                "thinking_mode": retry_thinking_mode,
+                "gen_params": retry_params,
+                "token_ids": retry_token_ids,
+                "session_id": session_id,
+                "session_source": session_source,
+                "expected_image_manifest": retry_request.get(
+                    "image_source_manifest"
+                ),
+                "image_request_expected": bool(
+                    retry_request.get("image_request_expected")
+                ),
+                "reset_incomplete_thinking_on_limit": False,
+                "tool_module": tool_module,
+                "tools": tools,
+                "require_tool_call": require_call,
+                "action_tool_task": action_tool_task,
+                "no_call_token_budget": retry_no_call_budget,
+            }
+            if retry_request.get("mirror_stream_consumer"):
+                full_output = _collect_generation_stream(
+                    model,
+                    processor,
+                    retry_prompt,
+                    retry_max_tokens,
+                    rank,
+                    progress_cb=progress_cb,
+                    **retry_kwargs,
+                )
+            else:
+                full_output = run_generation(
+                    model,
+                    processor,
+                    retry_prompt,
+                    retry_max_tokens,
+                    rank,
+                    progress_cb=progress_cb,
+                    **retry_kwargs,
+                )
         except Exception as e:
             logger.error(
                 "[rank 0] %s %s tool retry %d failed: %s",
@@ -16102,6 +16607,8 @@ def _disarm_constrained_tools():
 def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    thinking_mode="adaptive", gen_params=None, progress_cb=None,
                    token_ids=None, session_id=None, session_source=None,
+                   expected_image_manifest=None,
+                   image_request_expected=False,
                    prefill_progress_cb=None,
                    reset_incomplete_thinking_on_limit=True,
                    tool_module=None, tools=None,
@@ -16133,6 +16640,36 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     _FORCE_EOS["active"] = False
     _refresh_generation_stream()
 
+    multimodal_context = None
+    image_request_expected = bool(
+        image_request_expected or image is not None or expected_image_manifest
+    )
+    if image_request_expected and IMAGE_PROMPT_CACHE_ENABLED:
+        multimodal_context = _prepare_multimodal_cache_context_synced(
+            model,
+            processor,
+            prompt,
+            image,
+            rank,
+            expected_source_manifest=expected_image_manifest,
+            gen_params=gen_params,
+        )
+        if multimodal_context:
+            if (
+                HARD_MAX_INPUT_TOKENS > 0
+                and len(multimodal_context["token_ids"]) > HARD_MAX_INPUT_TOKENS
+            ):
+                raise RuntimeError(
+                    "expanded multimodal prompt exceeds the safe cluster input "
+                    f"limit ({len(multimodal_context['token_ids'])} > "
+                    f"{HARD_MAX_INPUT_TOKENS})"
+                )
+            token_ids = multimodal_context["token_ids"]
+            session_id = _multimodal_session_identity(
+                session_id,
+                multimodal_context,
+            )
+
     # Cross-request prompt cache: compute suffix + reused cache (both ranks).
     prompt_to_send = prompt
     cached_prompt_cache = None
@@ -16143,6 +16680,9 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         thinking_mode,
         token_ids,
         image,
+        multimodal_fingerprint=(
+            multimodal_context["fingerprint"] if multimodal_context else None
+        ),
     )
     if cache_allowed:
         _expire_idle_prompt_cache()
@@ -16155,11 +16695,18 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 session_source=session_source,
                 thinking_mode=thinking_mode,
                 append_reserve_tokens=max_tokens,
+                multimodal_fingerprint=(
+                    multimodal_context["fingerprint"]
+                    if multimodal_context else None
+                ),
+                minimum_safe_reuse=(
+                    multimodal_context["minimum_safe_reuse"]
+                    if multimodal_context else 0
+                ),
             )
             if (
                 PROMPT_CACHE_DIRECT_SUFFIX_IDS
                 and cached_prompt_cache is not None
-                and image is None
             ):
                 cached_suffix_ids = _prompt_cache_last_suffix_ids()
         except Exception:
@@ -16181,13 +16728,24 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     gen_kwargs.update(_kv_quant_kwargs())
     if cached_prompt_cache is not None:
         gen_kwargs["prompt_cache"] = cached_prompt_cache
-    if cached_prompt_cache is not None and cached_suffix_ids:
-        gen_kwargs["input_ids"] = mx.array([cached_suffix_ids], dtype=mx.int32)
-        gen_kwargs["mask"] = None
-    if image is not None:
-        gen_kwargs["image"] = image
     if gen_params:
         gen_kwargs.update(gen_params)
+    if multimodal_context is not None:
+        _apply_multimodal_generation_inputs(
+            gen_kwargs,
+            multimodal_context,
+            cached_prompt_cache,
+            cached_suffix_ids,
+        )
+        _annotate_multimodal_prompt_cache_event(multimodal_context, session_id)
+    else:
+        if cached_prompt_cache is not None and cached_suffix_ids:
+            gen_kwargs["input_ids"] = mx.array(
+                [cached_suffix_ids], dtype=mx.int32
+            )
+            gen_kwargs["mask"] = None
+        if image is not None:
+            gen_kwargs["image"] = image
     if prefill_progress_cb is not None or SAFE_DECODE_STOP:
         def _prefill_progress(processed_tokens, total_tokens):
             if prefill_progress_cb is not None:
@@ -16439,8 +16997,11 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
-                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
-                        and not _FORCE_EOS["active"] and n % 8 == 0):
+                # API/client cancellation also applies to native VLM requests.
+                # Image requests carry pixel_values and intentionally bypass the
+                # text-only batch path, but rank 0's sampled-token synchronizer
+                # still broadcasts a forced EOS safely to every rank.
+                if (rank == 0 and not _FORCE_EOS["active"] and n % 8 == 0):
                     _sp = _read_prefill_stop_file()
                     if (
                         _sp
@@ -16577,6 +17138,14 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 include_generated_ids=(cache_mode == "full"),
                 session_id=session_id,
                 session_source=session_source,
+                multimodal_fingerprint=(
+                    multimodal_context["fingerprint"]
+                    if multimodal_context else None
+                ),
+                multimodal_descriptor=(
+                    multimodal_context["descriptor"]
+                    if multimodal_context else None
+                ),
                 prompt=prompt,
                 model=model,
                 processor=processor,
@@ -16609,11 +17178,14 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                           thinking_mode="adaptive", enable_thinking=True,
                           gen_params=None, token_ids=None,
                           session_id=None, session_source=None,
+                          expected_image_manifest=None,
+                          image_request_expected=False,
                           prefill_progress_cb=None,
                           reset_incomplete_thinking_on_limit=True,
                           tool_module=None, tools=None,
                           require_tool_call=False,
-                          action_tool_task=False):
+                          action_tool_task=False,
+                          no_call_token_budget=None):
     """Streaming generation. Yields delta dicts with keys from
     {"reasoning", "content"} in OpenAI delta format.
 
@@ -16634,6 +17206,36 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     _FORCE_EOS["active"] = False
     _refresh_generation_stream()
 
+    multimodal_context = None
+    image_request_expected = bool(
+        image_request_expected or image is not None or expected_image_manifest
+    )
+    if image_request_expected and IMAGE_PROMPT_CACHE_ENABLED:
+        multimodal_context = _prepare_multimodal_cache_context_synced(
+            model,
+            processor,
+            prompt,
+            image,
+            rank,
+            expected_source_manifest=expected_image_manifest,
+            gen_params=gen_params,
+        )
+        if multimodal_context:
+            if (
+                HARD_MAX_INPUT_TOKENS > 0
+                and len(multimodal_context["token_ids"]) > HARD_MAX_INPUT_TOKENS
+            ):
+                raise RuntimeError(
+                    "expanded multimodal prompt exceeds the safe cluster input "
+                    f"limit ({len(multimodal_context['token_ids'])} > "
+                    f"{HARD_MAX_INPUT_TOKENS})"
+                )
+            token_ids = multimodal_context["token_ids"]
+            session_id = _multimodal_session_identity(
+                session_id,
+                multimodal_context,
+            )
+
     # Cross-request prompt cache: compute suffix + reused cache (both ranks).
     prompt_to_send = prompt
     cached_prompt_cache = None
@@ -16644,6 +17246,9 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         thinking_mode,
         token_ids,
         image,
+        multimodal_fingerprint=(
+            multimodal_context["fingerprint"] if multimodal_context else None
+        ),
     )
     timing = {
         "cache_prepare_started_at": None,
@@ -16665,11 +17270,18 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 session_source=session_source,
                 thinking_mode=thinking_mode,
                 append_reserve_tokens=max_tokens,
+                multimodal_fingerprint=(
+                    multimodal_context["fingerprint"]
+                    if multimodal_context else None
+                ),
+                minimum_safe_reuse=(
+                    multimodal_context["minimum_safe_reuse"]
+                    if multimodal_context else 0
+                ),
             )
             if (
                 PROMPT_CACHE_DIRECT_SUFFIX_IDS
                 and cached_prompt_cache is not None
-                and image is None
             ):
                 cached_suffix_ids = _prompt_cache_last_suffix_ids()
             prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
@@ -16692,13 +17304,24 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     gen_kwargs.update(_kv_quant_kwargs())
     if cached_prompt_cache is not None:
         gen_kwargs["prompt_cache"] = cached_prompt_cache
-    if cached_prompt_cache is not None and cached_suffix_ids:
-        gen_kwargs["input_ids"] = mx.array([cached_suffix_ids], dtype=mx.int32)
-        gen_kwargs["mask"] = None
-    if image is not None:
-        gen_kwargs["image"] = image
     if gen_params:
         gen_kwargs.update(gen_params)
+    if multimodal_context is not None:
+        _apply_multimodal_generation_inputs(
+            gen_kwargs,
+            multimodal_context,
+            cached_prompt_cache,
+            cached_suffix_ids,
+        )
+        _annotate_multimodal_prompt_cache_event(multimodal_context, session_id)
+    else:
+        if cached_prompt_cache is not None and cached_suffix_ids:
+            gen_kwargs["input_ids"] = mx.array(
+                [cached_suffix_ids], dtype=mx.int32
+            )
+            gen_kwargs["mask"] = None
+        if image is not None:
+            gen_kwargs["image"] = image
     if prefill_progress_cb is not None or SAFE_DECODE_STOP:
         def _prefill_progress(processed_tokens, total_tokens):
             if prefill_progress_cb is not None:
@@ -16731,13 +17354,16 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
         if tools else THINKING_RUNAWAY_TOKEN_BUDGET
     )
-    no_call_budget = (
-        TOOL_NO_CALL_TOKEN_BUDGET
-        if require_tool_call
-        else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
-        if action_tool_task
-        else TOOL_NO_CALL_TOKEN_BUDGET
-    )
+    if no_call_token_budget is not None:
+        no_call_budget = max(0, int(no_call_token_budget))
+    else:
+        no_call_budget = (
+            TOOL_NO_CALL_TOKEN_BUDGET
+            if require_tool_call
+            else TOOL_ACTION_NO_CALL_TOKEN_BUDGET
+            if action_tool_task
+            else TOOL_NO_CALL_TOKEN_BUDGET
+        )
     write_scaffold_threshold = _tool_write_early_stop_chars()
     request_decode_reuse_state = _begin_request_decode_topk_reuse(tools, rank)
     _arm_constrained_tools(processor, tools, rank)
@@ -16955,8 +17581,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     )
                     _FORCE_EOS["active"] = True
                     stopped = True
-                if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
-                        and not _FORCE_EOS["active"] and n % 8 == 0):
+                # Keep coordinated stop available on the upstream VLM path as
+                # well as the text-only batch path. The EOS token is injected
+                # before rank 0's existing sampled-token synchronization.
+                if (rank == 0 and not _FORCE_EOS["active"] and n % 8 == 0):
                     _sp = _read_prefill_stop_file()
                     if (
                         _sp
@@ -17213,6 +17841,14 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     include_generated_ids=(cache_mode == "full"),
                     session_id=session_id,
                     session_source=session_source,
+                    multimodal_fingerprint=(
+                        multimodal_context["fingerprint"]
+                        if multimodal_context else None
+                    ),
+                    multimodal_descriptor=(
+                        multimodal_context["descriptor"]
+                        if multimodal_context else None
+                    ),
                     prompt=prompt,
                     model=model,
                     processor=processor,
@@ -17239,6 +17875,100 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         _restore_request_decode_topk_reuse(request_decode_reuse_state, rank)
         if cache_marked_in_use:
             _mark_prompt_cache_in_use(False)
+
+
+def _collect_generation_stream(model, processor, prompt, max_tokens, rank, *,
+                               image=None, thinking_mode="adaptive",
+                               gen_params=None, token_ids=None,
+                               session_id=None, session_source=None,
+                               expected_image_manifest=None,
+                               image_request_expected=False,
+                               prefill_progress_cb=None,
+                               reset_incomplete_thinking_on_limit=True,
+                               tool_module=None, tools=None,
+                               require_tool_call=False,
+                               action_tool_task=False,
+                               no_call_token_budget=None,
+                               progress_cb=None):
+    """Drain the stream generator while preserving a non-stream HTTP result.
+
+    Multimodal requests use this on rank 0 whenever the client asks for a
+    non-stream response. Rank 1 drains the same generator directly. Keeping
+    both distributed consumers on one implementation avoids a cache-history
+    dependent split between the upstream stream and non-stream finalizers.
+    """
+    routed_reasoning = []
+    routed_content = []
+    raw_parts = []
+    generation_tokens = 0
+    routed_chars = 0
+    raw_chars = 0
+    for stream_chunk in run_generation_stream(
+        model,
+        processor,
+        prompt,
+        max_tokens,
+        rank,
+        image=image,
+        thinking_mode=thinking_mode,
+        enable_thinking=_enable_thinking_for_generation(thinking_mode),
+        gen_params=gen_params,
+        token_ids=token_ids,
+        session_id=session_id,
+        session_source=session_source,
+        expected_image_manifest=expected_image_manifest,
+        image_request_expected=image_request_expected,
+        reset_incomplete_thinking_on_limit=(
+            reset_incomplete_thinking_on_limit
+        ),
+        prefill_progress_cb=prefill_progress_cb,
+        tool_module=tool_module,
+        tools=tools,
+        require_tool_call=require_tool_call,
+        action_tool_task=action_tool_task,
+        no_call_token_budget=no_call_token_budget,
+    ):
+        stream_chunk = dict(stream_chunk or {})
+        metrics = {
+            "prompt_tps": stream_chunk.pop("_prompt_tps", None),
+            "prompt_tokens": stream_chunk.pop("_prompt_tokens", None),
+            "cached_tokens": stream_chunk.pop("_cached_tokens", None),
+            "prompt_cache_prepare": stream_chunk.pop(
+                "_prompt_cache_prepare", None
+            ),
+        }
+        generation_tokens = max(
+            generation_tokens,
+            int(stream_chunk.pop("_generation_tokens", None) or 0),
+        )
+        raw = stream_chunk.pop("_raw", None)
+        if raw:
+            raw_parts.append(raw)
+            raw_chars += len(raw)
+        reasoning_piece = stream_chunk.get("reasoning") or ""
+        content_piece = stream_chunk.get("content") or ""
+        if reasoning_piece:
+            routed_reasoning.append(reasoning_piece)
+        if content_piece:
+            routed_content.append(content_piece)
+        routed_chars += len(reasoning_piece) + len(content_piece)
+        if progress_cb is not None:
+            progress_cb(
+                generation_tokens,
+                max(routed_chars, raw_chars),
+                metrics,
+            )
+
+    raw_text = "".join(raw_parts)
+    # The native tool parser needs the exact MiniMax markup, not only the
+    # OpenAI-routed content stream. No transformation is applied here.
+    if tools and raw_text:
+        return raw_text
+    reasoning_text = "".join(routed_reasoning)
+    content_text = "".join(routed_content)
+    if reasoning_text:
+        return f"<mm:think>{reasoning_text}</mm:think>{content_text}"
+    return content_text or raw_text
 
 
 def _materialize_image(image_source):
@@ -17274,6 +18004,31 @@ def _materialize_image(image_source):
     return tf.name
 
 
+def _cleanup_materialized_images(image_path):
+    """Remove request-local image copies after every distributed consumer."""
+    if not image_path:
+        return
+    import tempfile
+
+    paths = image_path if isinstance(image_path, list) else [image_path]
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    for path in paths:
+        if not isinstance(path, (str, os.PathLike)):
+            continue
+        resolved = os.path.realpath(os.fspath(path))
+        try:
+            if os.path.commonpath([temp_root, resolved]) != temp_root:
+                continue
+        except ValueError:
+            continue
+        try:
+            os.unlink(resolved)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.debug("temporary image cleanup failed for %s: %s", resolved, exc)
+
+
 def _extract_image_source(part):
     """Extract an image URL/path/data URI from OpenAI chat/response content."""
     if not isinstance(part, dict):
@@ -17285,6 +18040,54 @@ def _extract_image_source(part):
         if isinstance(value, str) and value:
             return value
     return None
+
+
+_MODEL_FACING_MEDIA_CONTENT = "_thundermlx_model_facing_media_content"
+
+
+def _image_prompt_marker(processor):
+    """Return MiniMax's processor-native image placeholder."""
+    for owner in (processor, getattr(processor, "image_processor", None)):
+        marker = getattr(owner, "image_token", None)
+        if isinstance(marker, str) and marker:
+            return marker
+    # MiniMax-M3 VL's 0.6.5 processor constant. The fallback keeps request
+    # construction deterministic if an older processor omits the public attr.
+    return "]<]image[>["
+
+
+def _join_model_facing_content_parts(parts, image_marker):
+    """Mirror MiniMax's native IMAGE_FIRST message formatter exactly.
+
+    mlx-vlm declares ``minimax_m3_vl`` as ``LIST_WITH_IMAGE_FIRST``.  The
+    cache path must retain that model-facing contract even when a client sends
+    OpenAI content parts as text-then-image (the common ZCode shape).  Image
+    source ordering remains unchanged because ``images`` is materialized in
+    the same traversal order; only the marker placement within the message is
+    normalized to the upstream processor contract.
+    """
+    image_count = sum(1 for kind, _value in parts if kind == "image")
+    text_parts = [
+        str(value)
+        for kind, value in parts
+        if kind == "text" and value
+    ]
+    return (image_marker * image_count) + "\n".join(text_parts)
+
+
+def _model_facing_messages_with_media(processed_messages):
+    """Swap private anchored media content into a clean template message copy."""
+    result = []
+    for message in processed_messages or []:
+        if not isinstance(message, dict):
+            result.append(message)
+            continue
+        item = dict(message)
+        anchored = item.pop(_MODEL_FACING_MEDIA_CONTENT, None)
+        if isinstance(anchored, str):
+            item["content"] = anchored
+        result.append(item)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -17971,10 +18774,13 @@ def run_http_server(model, processor, rank):
         shape = summary.get("request_shape") or {}
         prepare = summary.get("prompt_cache_prepare") or {}
         processed_prompt_tokens = int(summary.get("prompt_tokens") or 0)
-        full_prompt_tokens = int(
-            shape.get("full_prompt_tokens")
-            or prepare.get("prompt_tokens")
-            or processed_prompt_tokens
+        # Multimodal preprocessing expands one image marker into the physical
+        # visual-token span after request_shape was recorded. Use the largest
+        # authoritative count so image reuse cannot report efficiency >100%.
+        full_prompt_tokens = max(
+            int(shape.get("full_prompt_tokens") or 0),
+            int(prepare.get("prompt_tokens") or 0),
+            processed_prompt_tokens,
         )
         reuse_tokens = int(prepare.get("reuse_tokens") or 0)
         avoided_tokens = max(0, full_prompt_tokens - processed_prompt_tokens, reuse_tokens)
@@ -19258,6 +20064,11 @@ def run_http_server(model, processor, rank):
         # structure and, worse, used to disable add_generation_prompt via a
         # positional-argument mixup below.
         processed_messages, images = [], []
+        anchored_image_marker = (
+            _image_prompt_marker(processor)
+            if IMAGE_PROMPT_CACHE_ENABLED
+            else None
+        )
         client_preserves_reasoning = _client_preserves_assistant_reasoning(msgs)
         for m in msgs:
             role = m.get("role", "user")
@@ -19265,17 +20076,34 @@ def run_http_server(model, processor, rank):
             content = m.get("content", "")
             if isinstance(content, list):
                 text_parts = []
+                model_content_parts = []
                 for part in content:
                     if isinstance(part, dict):
                         if part.get("type") in ("text", "input_text"):
-                            text_parts.append(part.get("text", "") or part.get("content", ""))
+                            text_value = (
+                                part.get("text", "")
+                                or part.get("content", "")
+                            )
+                            text_parts.append(text_value)
+                            model_content_parts.append(("text", text_value))
                         else:
                             image_source = _extract_image_source(part)
                             if image_source:
                                 images.append(image_source)
+                                model_content_parts.append(("image", image_source))
                 content_text = "\n".join(p for p in text_parts if p)
+                model_content_text = (
+                    _join_model_facing_content_parts(
+                        model_content_parts,
+                        anchored_image_marker,
+                    )
+                    if anchored_image_marker
+                    and any(kind == "image" for kind, _ in model_content_parts)
+                    else None
+                )
             else:
                 content_text = content
+                model_content_text = None
             if role == "assistant":
                 content_text = _sanitize_inbound_tool_call_content(m, content_text)
                 msg["content"] = _assistant_content_for_template(
@@ -19292,6 +20120,13 @@ def run_http_server(model, processor, rank):
                     msg["reasoning_content"] = " "
             else:
                 msg["content"] = _sanitize_inbound_message_content(role, content_text)
+                if model_content_text is not None:
+                    msg[_MODEL_FACING_MEDIA_CONTENT] = (
+                        _sanitize_inbound_message_content(
+                            role,
+                            model_content_text,
+                        )
+                    )
             if "tool_calls" in m:
                 msg["tool_calls"] = _normalize_tool_calls(m["tool_calls"])
             for key in ("tool_call_id", "name"):
@@ -19436,13 +20271,22 @@ def run_http_server(model, processor, rank):
             if tools:
                 tk["tools"] = _model_facing_tool_schemas(tools)
             def _render_prompt_with_lock():
+                render_messages = (
+                    _model_facing_messages_with_media(processed_messages)
+                    if IMAGE_PROMPT_CACHE_ENABLED and images
+                    else processed_messages
+                )
                 with _tokenizer_runtime_lock:
                     return apply_chat_template(
                         processor,
                         model.config,
-                        processed_messages,
+                        render_messages,
                         add_generation_prompt=True,
-                        num_images=len(images),
+                        num_images=(
+                            0
+                            if IMAGE_PROMPT_CACHE_ENABLED and images
+                            else len(images)
+                        ),
                         **tk,
                     )
 
@@ -19462,6 +20306,7 @@ def run_http_server(model, processor, rank):
         # instead of mirroring a text-only request.
         image_sources = images or None
         image_path = None
+        image_source_manifest = None
         if image_sources:
             if (
                 requested_max_tokens is None
@@ -19493,6 +20338,8 @@ def run_http_server(model, processor, rank):
                 image_path = [p for p in image_path if p]
                 if len(image_path) == 1:
                     image_path = image_path[0]
+                if image_path and IMAGE_PROMPT_CACHE_ENABLED:
+                    image_source_manifest = _image_source_manifest(image_path)
             except Exception as e:
                 logger.warning(f"image load failed: {e}")
 
@@ -19628,11 +20475,20 @@ def run_http_server(model, processor, rank):
             and not image_sources
         )
         _m3e3.REQUEST_ACTIVE["value"] = _eagle3_on
+        # The upstream non-stream consumer is not reliable after repeated
+        # multimodal cache transitions: an otherwise valid image/tool request
+        # can stop advancing inside stream_generate while both ranks retain
+        # their Metal allocations.  Keep one distributed execution shape for
+        # every image request.  HTTP non-streaming is preserved by collecting
+        # rank 0's stream deltas before returning the response.
+        mirror_stream_consumer = bool(not stream and image_sources)
         rank_request = {"stop_nonce": uuid.uuid4().hex,
                         "prompt": prompt, "max_tokens": max_tokens,
                         "thinking_mode": thinking_mode,
                         "gen_params": gen_params,
                         "image_sources": image_sources,
+                        "image_request_expected": bool(image_sources),
+                        "image_source_manifest": image_source_manifest,
                         "token_ids": request_token_ids,
                         "session_id": cache_session_id,
                         "session_source": cache_session_source,
@@ -19645,6 +20501,12 @@ def run_http_server(model, processor, rank):
                             "tool_choice", request.get("function_call")),
                         "require_tool_call": require_tool_call,
                         "action_tool_task": action_tool_task,
+                        # Keep the two distributed consumers identical for
+                        # every non-stream image request.
+                        # Mixing run_generation_stream() on rank 0 with
+                        # run_generation() on rank 1 can diverge during the
+                        # final detokenizer/cache flush and wedge a collective.
+                        "mirror_stream_consumer": mirror_stream_consumer,
                         # Tool-bearing requests are buffered and parsed after
                         # decode, so reaching max_tokens can leave no visible
                         # content even when the stable tool/template prefix is
@@ -19751,6 +20613,8 @@ def run_http_server(model, processor, rank):
                             token_ids=request_token_ids,
                             session_id=cache_session_id,
                             session_source=cache_session_source,
+                            expected_image_manifest=image_source_manifest,
+                            image_request_expected=bool(image_sources),
                             reset_incomplete_thinking_on_limit=not bool(tools),
                             prefill_progress_cb=_prefill_progress,
                             tool_module=tool_module,
@@ -20499,6 +21363,7 @@ def run_http_server(model, processor, rank):
                         # the slot releases.
                         if op_channel_held:
                             _RANK0_OP_MUTEX.release()
+                        _cleanup_materialized_images(image_path)
                         if CLEAR_CACHE_AFTER_REQUEST or (
                             producer_error is not None and CLEAR_CACHE_AFTER_ERROR
                         ):
@@ -20660,6 +21525,10 @@ def run_http_server(model, processor, rank):
                             prompt_tps=float(metrics.get("prompt_tps") or active.get("prompt_tps") or 0.0),
                             prompt_tokens=int(metrics.get("prompt_tokens") or active.get("prompt_tokens") or 0),
                             cached_tokens=int(metrics.get("cached_tokens") or active.get("cached_tokens") or 0),
+                            prompt_cache_prepare=(
+                                metrics.get("prompt_cache_prepare")
+                                or active.get("prompt_cache_prepare")
+                            ),
                         )
                     def _prefill_progress(processed_tokens, total_tokens):
                         total_tokens = int(total_tokens or 0)
@@ -20681,20 +21550,53 @@ def run_http_server(model, processor, rank):
                                 time.time() - active["started"], 3
                             ),
                         )
-                    result["text"] = run_generation(
-                        model, processor, prompt, max_tokens, rank,
-                        image=image_path, thinking_mode=thinking_mode,
-                        gen_params=gen_params, progress_cb=_progress,
-                        token_ids=request_token_ids,
-                        session_id=cache_session_id,
-                        session_source=cache_session_source,
-                        reset_incomplete_thinking_on_limit=not bool(tools),
-                        prefill_progress_cb=_prefill_progress,
-                        tool_module=tool_module,
-                        tools=tools,
-                        require_tool_call=require_tool_call,
-                        action_tool_task=action_tool_task,
-                    )
+                    if mirror_stream_consumer:
+                        logger.info(
+                            "[rank 0] non-stream image request %s using "
+                            "symmetric stream consumer (thinking=%s, tools=%s)",
+                            req_id,
+                            thinking_mode,
+                            bool(tools),
+                        )
+                        result["text"] = _collect_generation_stream(
+                            model,
+                            processor,
+                            prompt,
+                            max_tokens,
+                            rank,
+                            image=image_path,
+                            thinking_mode=thinking_mode,
+                            gen_params=gen_params,
+                            token_ids=request_token_ids,
+                            session_id=cache_session_id,
+                            session_source=cache_session_source,
+                            expected_image_manifest=image_source_manifest,
+                            image_request_expected=bool(image_sources),
+                            reset_incomplete_thinking_on_limit=not bool(tools),
+                            prefill_progress_cb=_prefill_progress,
+                            tool_module=tool_module,
+                            tools=tools,
+                            require_tool_call=require_tool_call,
+                            action_tool_task=action_tool_task,
+                            progress_cb=_progress,
+                        )
+                    else:
+                        result["text"] = run_generation(
+                            model, processor, prompt, max_tokens, rank,
+                            image=image_path, thinking_mode=thinking_mode,
+                            gen_params=gen_params, progress_cb=_progress,
+                            token_ids=request_token_ids,
+                            session_id=cache_session_id,
+                            session_source=cache_session_source,
+                            expected_image_manifest=image_source_manifest,
+                            image_request_expected=bool(image_sources),
+                            reset_incomplete_thinking_on_limit=not bool(tools),
+                            prefill_progress_cb=_prefill_progress,
+                            tool_module=tool_module,
+                            tools=tools,
+                            require_tool_call=require_tool_call,
+                            action_tool_task=action_tool_task,
+                        )
                     if tools and not _user_stop_requested(req_id):
                         result["text"] = _ensure_usable_tool_turn(
                             model, processor, rank,
@@ -20781,6 +21683,7 @@ def run_http_server(model, processor, rank):
                     # slot releases.
                     if op_channel_held:
                         _RANK0_OP_MUTEX.release()
+                    _cleanup_materialized_images(image_path)
                     if CLEAR_CACHE_AFTER_REQUEST or (
                         job_error is not None and CLEAR_CACHE_AFTER_ERROR
                     ):
@@ -21188,26 +22091,60 @@ def run_mirror(model, processor, rank):
             except Exception as e:
                 logger.warning(f"rank 1: image load failed: {e}")
         try:
-            run_generation(model, processor, req["prompt"], req["max_tokens"], rank,
-                           image=image_path, thinking_mode=thinking_mode,
-                           gen_params=req.get("gen_params"),
-                           token_ids=req.get("token_ids"),
-                           session_id=req.get("session_id"),
-                           session_source=req.get("session_source"),
-                           reset_incomplete_thinking_on_limit=bool(
-                               req.get("reset_incomplete_thinking_on_limit", True)
-                           ),
-                           tool_module=mirror_tool_module,
-                           tools=mirror_tools,
-                           require_tool_call=bool(
-                               req.get("require_tool_call", False)
-                           ),
-                           action_tool_task=bool(
-                               req.get("action_tool_task", False)
-                           ),
-                           no_call_token_budget=req.get(
-                               "no_call_token_budget"
-                           ))
+            generation_kwargs = {
+                "image": image_path,
+                "thinking_mode": thinking_mode,
+                "gen_params": req.get("gen_params"),
+                "token_ids": req.get("token_ids"),
+                "session_id": req.get("session_id"),
+                "session_source": req.get("session_source"),
+                "expected_image_manifest": req.get("image_source_manifest"),
+                "image_request_expected": bool(
+                    req.get("image_request_expected")
+                    or req.get("image_sources")
+                ),
+                "reset_incomplete_thinking_on_limit": bool(
+                    req.get("reset_incomplete_thinking_on_limit", True)
+                ),
+                "tool_module": mirror_tool_module,
+                "tools": mirror_tools,
+                "require_tool_call": bool(
+                    req.get("require_tool_call", False)
+                ),
+                "action_tool_task": bool(
+                    req.get("action_tool_task", False)
+                ),
+            }
+            if req.get("mirror_stream_consumer"):
+                logger.info(
+                    "rank 1: using symmetric stream consumer for non-stream "
+                    "image request (thinking=%s, tools=%s)",
+                    thinking_mode,
+                    bool(mirror_tools),
+                )
+                for _ in run_generation_stream(
+                    model,
+                    processor,
+                    req["prompt"],
+                    req["max_tokens"],
+                    rank,
+                    enable_thinking=_enable_thinking_for_generation(
+                        thinking_mode
+                    ),
+                    no_call_token_budget=req.get("no_call_token_budget"),
+                    **generation_kwargs,
+                ):
+                    pass
+            else:
+                run_generation(
+                    model,
+                    processor,
+                    req["prompt"],
+                    req["max_tokens"],
+                    rank,
+                    no_call_token_budget=req.get("no_call_token_budget"),
+                    **generation_kwargs,
+                )
             if CLEAR_CACHE_AFTER_REQUEST:
                 _clear_transient_mlx_memory("rank 1 request complete")
             else:
@@ -21225,6 +22162,8 @@ def run_mirror(model, processor, rank):
             logger.info("rank 1: recovered from error, waiting for next request")
             # CRITICAL: do NOT exit — keep the loop alive so the cluster
             # survives errors instead of dying and orphaning memory.
+        finally:
+            _cleanup_materialized_images(image_path)
 
 
 # ---- distributed object broadcast (modeled on mlx_lm/server.py) ----

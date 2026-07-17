@@ -654,6 +654,44 @@ def main():
     assert _tool_text_requests_action(
         "Set a goal to create a fun small HTML game in this workspace."
     )
+    assert not _tool_text_requests_action(
+        "The color report succeeded. Reply with only DONE and do not call "
+        "another tool."
+    )
+    assert _tool_text_requests_action(
+        "Do not call get_weather; use the get_time tool instead."
+    )
+    completed_tool_messages = [
+        {"role": "user", "content": "Inspect the image and report its colors."},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_colors",
+                "type": "function",
+                "function": {
+                    "name": "report_colors",
+                    "arguments": '{"left":"red","right":"blue"}',
+                },
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_colors",
+            "content": "colors recorded",
+        },
+        {
+            "role": "user",
+            "content": (
+                "The color report succeeded. Reply with only DONE and do not "
+                "call another tool."
+            ),
+        },
+    ]
+    assert not server._tool_request_requires_call(
+        completed_tool_messages,
+        {"tool_choice": "auto"},
+    )
     test_native_claude_style_write_call_with_camel_schema()
     test_native_claude_style_write_call_maps_to_snake_schema()
     test_large_native_write_roundtrips_without_bounding()

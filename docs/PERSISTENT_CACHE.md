@@ -19,11 +19,18 @@ the same 100k-350k+ token context when the prompt prefix still matches.
 
 ### Multimodal requests and retries
 
-Image-bearing requests currently bypass prompt/KV reuse. MLX-VLM expands image
-placeholders into processor-dependent feature tokens, so reusing text KV without
-also validating the image bytes, processor fingerprint, expanded feature
-positions, cache shape, model, split, and rank metadata can desynchronize the
-two ranks. A mismatch therefore falls back to normal cold prefill.
+Image-bearing requests bypass prompt/KV reuse by default. When
+`MLX_M3_IMAGE_PROMPT_CACHE=1` is acceptance-enabled, ThunderMLX preprocesses the
+request on both ranks and keys reuse by the ordered image-byte hashes, processor
+fingerprint, expanded media-token layout, cache shape, model, split, and rank
+metadata. Reuse is permitted only after the final media token and only when the
+remaining suffix is text-only. Any mismatch or rank disagreement falls back to
+normal cold prefill before model collectives begin.
+
+Complete multimodal cache states can use the same local-per-rank SSD durability
+tier as text sessions. Raw image bytes and local image paths are not persisted;
+the artifact stores the validated fingerprint/shape contract, token ids, and KV
+tensors. Exact runtime metadata must still match after restart.
 
 Exact non-stream HTTP retries are still coalesced safely: identical request
 bodies share one active generation and may replay its completed response for a
@@ -53,6 +60,12 @@ reboot.
 
 ## Env Flags
 
+- `MLX_M3_IMAGE_PROMPT_CACHE=0`: acceptance-gated exact multimodal KV reuse.
+  When enabled, the server hashes ordered image bytes, processor/config state,
+  and expanded media-token layout on both ranks. Reuse is allowed only when the
+  shared prefix ends after every media token and leaves a text-only suffix.
+  Any mismatch or partial-rank preparation falls back cold or rejects before
+  model collectives. This requires `MLX_M3_PROMPT_CACHE_DIRECT_SUFFIX_IDS=1`.
 - `MLX_M3_PROMPT_CACHE_SSD=0`: opt-in master switch.
 - `MLX_M3_PROMPT_CACHE_SSD_RESTORE=0`: separate restore gate. Enable only after
   save-only artifacts are validated across both ranks.
@@ -221,6 +234,21 @@ For validation, use dashboard **Clear RAM Cache** or
 
 Repeatable validation lives in `probes/m3_persistent_cache_probe.py`:
 
+Multimodal promotion additionally requires this gate set:
+
+```bash
+python3 probes/m3_multimodal_cache_smoke.py
+python3 probes/m3_multimodal_server_policy_smoke.py
+python3 probes/m3_multimodal_processor_smoke.py --image /path/to/image.jpg
+python3 probes/m3_multimodal_cache_live_probe.py --base http://127.0.0.1:8080
+python3 probes/m3_multimodal_cancel_probe.py --base http://127.0.0.1:8080
+python3 probes/m3_multimodal_ssd_probe.py --phase roundtrip --records 700
+```
+
+To prove process durability rather than only RAM reset, run the SSD probe's
+`build` phase, stop and restart both ranks without changing server code, then
+run its `restore` phase against the same session id and state file.
+
 - `--phase build` then `--phase restore` with the same `--session-id` validates
   true stop/start or reboot durability.
 - `--target-tokens 30000`, `100000`, and `250000` cover the required size
@@ -275,9 +303,10 @@ Repeatable validation lives in `probes/m3_persistent_cache_probe.py`:
 - The final safety patch changed the runtime fingerprint, so older durable
   artifacts may safely miss with a runtime mismatch. Rebuild/save under the
   current fingerprint when you need a specific long session to restore from SSD.
-- `--cancel-after-restore` runs a stop smoke after restore when the controlled
-  environment has synchronized in-flight stop enabled; production fast defaults
-  keep those stop flags off and the probe reports a safe skip.
+- `--cancel-after-restore` runs a stop smoke after restore when the deployment
+  has synchronized in-flight stop enabled. The reference profile enables the
+  nonce-coordinated safe stop; portable defaults may leave it gated until the
+  cancellation probes pass on that hardware.
 
 ## Dead Ends To Avoid
 
