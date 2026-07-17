@@ -1682,8 +1682,8 @@ THINKING_RUNAWAY_TOKEN_BUDGET = int(
 # progress toward a call. End that attempt so the existing no-thinking retry
 # can emit the tool call without spending the full prose-thinking budget.
 TOOL_THINKING_RUNAWAY_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0")
-    or "0"
+    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "12288")
+    or "12288"
 )
 # Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
 # the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
@@ -10409,14 +10409,8 @@ def _tool_text_requests_action(user_text):
     if not isinstance(user_text, str) or not user_text.strip():
         return False
     normalized = re.sub(r"\s+", " ", user_text.strip()).lower()
-    # A completed tool turn is commonly followed by instructions such as
-    # "reply DONE and do not call another tool".  Treating the negated
-    # ``call ... tool`` phrase as affirmative intent forces an unnecessary
-    # retry; at long context that retry can look like a decode wedge while it
-    # silently re-prefills the entire conversation.  Remove only explicit
-    # negated tool clauses, then evaluate any remaining affirmative action.
-    # This preserves requests such as "do not call X; use Y instead" because
-    # the positive Y clause remains after normalization.
+    # Legacy compatibility mode uses this heuristic to decide whether prose
+    # can satisfy an auto-tool turn. Native mlx-vlm requests do not consult it.
     negative_tool_patterns = (
         r"\b(?:do\s+not|don't|dont|never)\s+"
         r"(?:need\s+to\s+)?(?:use|call|invoke)\s+"
@@ -13037,28 +13031,30 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
     as a final answer and end a long-running goal. Each retry re-broadcasts a
     normal generation request, so rank 1 mirrors it like any client retry.
     """
-    # Explicit OpenAI forcing and clear first-turn action requests both need
-    # a real call. A prose draft is not successful execution. The inference
-    # helper deliberately stops inferring once a tool result exists, so a
-    # normal final answer remains possible after the work is complete.
-    require_call = _tool_request_requires_call(
-        processed_messages,
-        rank_request or {},
-    )
-    native_marker_retry = bool(
+    # Native mlx-vlm follows OpenAI semantics: only explicit required/named
+    # tool_choice forces a call. Auto mode may return either a valid call or a
+    # visible final answer. The legacy text classifier is deliberately kept
+    # out of this path; it cannot reliably infer intent from agent continuations
+    # such as "these errors ...". We still inspect every native tool turn once
+    # it finishes so malformed markers or reasoning-only output receive one
+    # bounded retry, while valid prose passes through unchanged.
+    if TOOL_COMPAT_OVERLAY:
+        require_call = _tool_request_requires_call(
+            processed_messages,
+            rank_request or {},
+        )
+    else:
+        require_call = bool(
+            _tool_choice_required_name(rank_request or {})[0]
+        )
+    native_unusable_retry = bool(
         not TOOL_COMPAT_OVERLAY
         and NATIVE_TOOL_ACTION_RETRY_ATTEMPTS > 0
-        and _looks_like_raw_tool_fragment(full_output or "", tool_module)
-    )
-    native_action_retry = bool(
-        not TOOL_COMPAT_OVERLAY
-        and NATIVE_TOOL_ACTION_RETRY_ATTEMPTS > 0
-        and (action_tool_task or require_call or native_marker_retry)
     )
     if not (
         tools
         and tool_module is not None
-        and (TOOL_COMPAT_OVERLAY or native_action_retry)
+        and (TOOL_COMPAT_OVERLAY or native_unusable_retry)
     ):
         return full_output
     if TOOL_UNUSABLE_RETRY_ATTEMPTS <= 0:
@@ -13125,7 +13121,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         len(token_ids or []),
     )
     retry_attempts = TOOL_UNUSABLE_RETRY_ATTEMPTS
-    if native_action_retry:
+    if native_unusable_retry:
         retry_attempts = min(
             retry_attempts,
             NATIVE_TOOL_ACTION_RETRY_ATTEMPTS,
@@ -13283,7 +13279,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 full_output,
                 len(retry_token_ids or []),
             )
-            if native_action_retry and not retry_ram_reset_done
+            if native_unusable_retry and not retry_ram_reset_done
             else None
         )
         if retry_ram_reset_reason:
@@ -20144,16 +20140,26 @@ def run_http_server(model, processor, rank):
             tools,
             tool_loop_diag=tool_loop_diag,
         )
+        explicit_tool_choice = bool(_tool_choice_required_name(request)[0])
         require_tool_call = bool(
             tools
-            and _tool_request_requires_call(processed_messages, request)
+            and (
+                explicit_tool_choice
+                or (
+                    TOOL_COMPAT_OVERLAY
+                    and _tool_request_requires_call(processed_messages, request)
+                )
+            )
         )
         action_tool_task = bool(
             tools
             and (
-                _tool_choice_required_name(request)[0]
-                or _tool_text_requests_action(
-                    _last_user_instruction_text(processed_messages)
+                explicit_tool_choice
+                or (
+                    TOOL_COMPAT_OVERLAY
+                    and _tool_text_requests_action(
+                        _last_user_instruction_text(processed_messages)
+                    )
                 )
             )
         )

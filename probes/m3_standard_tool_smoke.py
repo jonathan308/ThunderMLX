@@ -23,7 +23,7 @@ os.environ.setdefault("MLX_M3_TOOL_COMPAT_OVERLAY", "0")
 os.environ.setdefault("MLX_M3_TOOL_SYSTEM_HINT", "0")
 os.environ.setdefault("MLX_M3_TOOL_STREAM_BUFFER_ALL", "0")
 os.environ.setdefault("MLX_M3_TOOL_STREAM_CONTENT", "1")
-os.environ.setdefault("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0")
+os.environ.setdefault("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "12288")
 os.environ.setdefault("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "0")
 os.environ.setdefault("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "0")
 
@@ -237,7 +237,7 @@ def test_native_responses_style_to_attribute_recovers_exact_schema_name():
     }, fn
 
 
-def test_native_action_reasoning_only_turn_gets_one_native_retry():
+def test_native_reasoning_only_turn_gets_one_retry_without_classifier():
     tools = [{
         "type": "function",
         "function": {
@@ -289,7 +289,7 @@ def test_native_action_reasoning_only_turn_gets_one_native_retry():
             processed_messages=messages,
             req_id="native-retry-smoke",
             stream=True,
-            action_tool_task=True,
+            action_tool_task=False,
         )
     assert output == recovered, output
     assert generate.call_count == 1, generate.call_count
@@ -297,6 +297,52 @@ def test_native_action_reasoning_only_turn_gets_one_native_retry():
     retry_request = broadcast.call_args.args[0]
     assert retry_request["thinking_mode"] == "enabled", retry_request
     assert retry_request["no_call_token_budget"] > 0, retry_request
+
+
+def test_native_visible_final_does_not_force_tool_or_retry():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"],
+            },
+        },
+    }]
+    final = (
+        "<mm:think>The checks are complete.</mm:think>"
+        "The project builds successfully."
+    )
+    with patch.object(server, "run_generation") as generate:
+        output = server._ensure_usable_tool_turn(
+            object(),
+            object(),
+            0,
+            full_output=final,
+            rank_request={"tool_choice": "auto"},
+            prompt="prompt",
+            max_tokens=512,
+            thinking_mode="enabled",
+            gen_params={"temperature": 0.0},
+            image_path=None,
+            token_ids=[1, 2, 3],
+            session_id="native-final-smoke",
+            session_source="test",
+            tool_module=minimax_m3,
+            tools=tools,
+            processed_messages=[{
+                "role": "user",
+                "content": "Did the project build successfully?",
+            }],
+            req_id="native-final-smoke",
+            stream=True,
+            action_tool_task=False,
+        )
+    assert output == final, output
+    generate.assert_not_called()
 
 
 def test_native_incomplete_call_after_tool_result_gets_one_retry():
@@ -645,7 +691,7 @@ def main():
     assert TOOL_SYSTEM_HINT_ENABLED is False
     assert TOOL_STREAM_BUFFER_ALL is False
     assert TOOL_STREAM_CONTENT is True
-    assert TOOL_THINKING_RUNAWAY_TOKEN_BUDGET == 0
+    assert TOOL_THINKING_RUNAWAY_TOKEN_BUDGET == 12288
     assert TOOL_NO_CALL_TOKEN_BUDGET == 0
     assert TOOL_ACTION_NO_CALL_TOKEN_BUDGET == 0
     assert NATIVE_TOOL_ACTION_RETRY_ATTEMPTS == 1
@@ -697,7 +743,8 @@ def main():
     test_large_native_write_roundtrips_without_bounding()
     test_native_paths_and_duplicate_calls_are_preserved()
     test_native_responses_style_to_attribute_recovers_exact_schema_name()
-    test_native_action_reasoning_only_turn_gets_one_native_retry()
+    test_native_reasoning_only_turn_gets_one_retry_without_classifier()
+    test_native_visible_final_does_not_force_tool_or_retry()
     test_native_incomplete_call_after_tool_result_gets_one_retry()
     test_corrupt_long_native_retry_releases_only_live_ram_kv()
     test_tool_decode_reuse_override_is_request_scoped()
