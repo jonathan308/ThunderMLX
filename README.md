@@ -312,6 +312,7 @@ MLX_M3_DEFAULT_TEMPERATURE=0.2
 MLX_M3_MAX_CONCURRENT_REQUESTS=1
 MLX_M3_PROMPT_CACHE=1
 MLX_M3_PROMPT_CACHE_THINKING_MODE=visible
+MLX_M3_IMAGE_PROMPT_CACHE=0
 MLX_M3_PROMPT_CACHE_RESIDENT_SLOTS=2
 MLX_M3_PROMPT_CACHE_RESIDENT_MAX_TOTAL_TOKENS=750000
 ```
@@ -333,6 +334,16 @@ MLX_M3_PROMPT_CACHE_SSD_AUTO_SAVE_MIN_DELTA_TOKENS=8192
 
 See [docs/PERSISTENT_CACHE.md](docs/PERSISTENT_CACHE.md) for cache behavior,
 privacy notes, pruning, and restore validation.
+
+Image-bearing prompt/KV reuse is a separate acceptance-gated feature. With
+`MLX_M3_IMAGE_PROMPT_CACHE=1`, ThunderMLX keys an image session by the ordered
+SHA-256 hashes of the exact image bytes, the loaded processor contract, and the
+expanded media-token layout. A cache prefix is reusable only after the final
+media token, so the uncached suffix is text-only. Changed bytes, image order,
+processor/runtime metadata, token layout, or rank disagreement always produces
+a coordinated cold fallback; raw image bytes are never written to cache
+metadata. Keep this flag off on new hardware until
+`probes/m3_multimodal_cache_smoke.py` and the live two-rank image ladder pass.
 
 ## Custom Runtime And Kernel Work
 

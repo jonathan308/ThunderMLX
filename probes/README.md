@@ -130,5 +130,19 @@ Common probes:
 - `m3_image_smoke.py`: OpenAI multimodal `image_url` VLM smoke. It sends an
   in-memory red/blue PNG data URI, verifies the response mentions both colors,
   and fails if the server failure count increases.
+- `m3_multimodal_cache_smoke.py` and
+  `m3_multimodal_server_policy_smoke.py`: path-independent image fingerprint
+  and safe cache-reuse policy checks that do not load model weights.
+- `m3_multimodal_processor_smoke.py --image /path/to/image.jpg`: loads the
+  installed MiniMax processor (not model weights) and proves the anchored
+  image span stays inside a follow-up turn's common token prefix.
+- `m3_multimodal_cache_live_probe.py`: live two-rank gate for same-image hot
+  reuse, changed/removed/reordered-image invalidation, compacted history, both
+  thinking modes, and streaming plus non-streaming responses.
+- `m3_multimodal_ssd_probe.py`: 10k-class image session save/RAM-reset/restore
+  gate. Its `build` and `restore` phases also support a true process restart.
+- `m3_multimodal_cancel_probe.py`: stops one image request during cold prefill
+  and another during decode, then requires clean rank/cache idle and a healthy
+  post-cancel image response.
 
 Use the dashboard Operations tab for the safest probe entry points.

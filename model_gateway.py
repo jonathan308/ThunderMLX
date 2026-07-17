@@ -119,6 +119,13 @@ ZCODE_SESSION_TITLE_SYSTEM_PROMPT = (
     "metadata, not an action: do not perform it, discuss tools, mention access "
     "limitations, or apologize."
 )
+ZCODE_GOAL_VERIFY_PREFIX = "Verify whether the active session goal is actually complete."
+ZCODE_GOAL_VERIFY_MARKER = '{"passed": boolean, "reason": string, "nextAction": string}'
+ZCODE_GOAL_VERIFY_NO_THINK = env_bool("M3_GATEWAY_ZCODE_GOAL_VERIFY_NO_THINK", True)
+ZCODE_GOAL_VERIFY_MAX_TOKENS = max(
+    64,
+    int(os.environ.get("M3_GATEWAY_ZCODE_GOAL_VERIFY_MAX_TOKENS", "256") or "256"),
+)
 
 
 def _title_message_text(message: Any) -> str:
@@ -141,6 +148,46 @@ def _title_message_text(message: Any) -> str:
 def _is_session_title_prompt(text: str) -> bool:
     normalized = str(text or "").strip()
     return any(normalized.startswith(prompt) for prompt in SESSION_TITLE_PROMPTS)
+
+
+def _is_session_title_request(messages: Any) -> bool:
+    """Match a standalone client title sidecar, never stale chat history."""
+    if not isinstance(messages, list) or not 1 <= len(messages) <= 4:
+        return False
+    if any(
+        not isinstance(message, dict)
+        or message.get("role") not in {"system", "user"}
+        for message in messages
+    ):
+        return False
+    return any(_is_session_title_prompt(_title_message_text(message)) for message in messages)
+
+
+def _is_zcode_goal_verification_request(messages: Any) -> bool:
+    """Identify ZCode's private, no-tool goal completion verifier.
+
+    ZCode appends a fixed verification instruction after a goal reports its
+    final summary. It expects one compact JSON object. Letting a selected
+    thinking model inherit the normal 32k output ceiling can spend the entire
+    response inside MiniMax reasoning markers and return no JSON, causing the
+    client to retry the same verifier every five minutes.
+
+    Keep this deliberately exact: ordinary requests that merely ask whether
+    work is complete must retain the user's selected thinking behavior.
+    """
+    if not isinstance(messages, list):
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        text = _title_message_text(message)
+        return (
+            text.startswith(ZCODE_GOAL_VERIFY_PREFIX)
+            and ZCODE_GOAL_VERIFY_MARKER in text
+            and "This is a verification request only." in text
+            and "Do not continue implementation work" in text
+        )
+    return False
 
 
 def _session_title_subject(messages: Any) -> str:
@@ -301,6 +348,59 @@ def _normalize_session_title_json(raw: bytes, payload: Any) -> bytes:
     message.pop("reasoning_content", None)
     return json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
+
+def _first_json_object(text: str) -> dict[str, Any] | None:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", str(text or "")):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _zcode_goal_verdict(text: str) -> dict[str, Any]:
+    """Return ZCode's exact verifier schema, failing closed on bad output."""
+    value = _first_json_object(text)
+    valid = (
+        isinstance(value, dict)
+        and isinstance(value.get("passed"), bool)
+        and isinstance(value.get("reason"), str)
+        and isinstance(value.get("nextAction"), str)
+    )
+    if not valid:
+        return {
+            "passed": False,
+            "reason": "The verifier returned non-conforming output, so completion was not assumed.",
+            "nextAction": "Continue with the smallest unfinished goal item and verify again.",
+        }
+    reason = re.sub(r"\s+", " ", value["reason"]).strip()[:1000]
+    next_action = re.sub(r"\s+", " ", value["nextAction"]).strip()[:1000]
+    return {
+        "passed": value["passed"],
+        "reason": reason or "The transcript contains sufficient completion evidence.",
+        "nextAction": next_action,
+    }
+
+
+def _normalize_zcode_goal_verifier_json(raw: bytes) -> bytes:
+    try:
+        response = json.loads(raw.decode("utf-8"))
+        choice = response["choices"][0]
+        message = choice["message"]
+    except (KeyError, IndexError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return raw
+    if not isinstance(choice, dict) or not isinstance(message, dict):
+        return raw
+    verdict = _zcode_goal_verdict(message.get("content") or "")
+    message["content"] = json.dumps(verdict, ensure_ascii=False, separators=(",", ":"))
+    message.pop("reasoning_content", None)
+    choice["finish_reason"] = "stop"
+    return json.dumps(response, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
 APP = FastAPI(title="ThunderMLX Model Gateway")
 SWITCH_LOCK = asyncio.Lock()
 STATE: dict[str, Any] = {
@@ -448,18 +548,24 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
         changed = True
     messages = payload.get("messages")
     is_session_title = (
-        isinstance(messages, list)
-        and any(_is_session_title_prompt(_title_message_text(message)) for message in messages)
+        _is_session_title_request(messages)
         and not payload.get("tools")
         and not payload.get("functions")
+    )
+    is_zcode_goal_verification = (
+        ZCODE_GOAL_VERIFY_NO_THINK
+        and bool(canonical_m3_model_id(model))
+        and not bool(payload.get("stream"))
+        and not payload.get("tools")
+        and not payload.get("functions")
+        and _is_zcode_goal_verification_request(messages)
     )
     if is_session_title:
         # Agent clients send this auxiliary request beside the real turn. Keep
         # it short so it cannot spend a thinking budget, return multiple title
         # options, or occupy the single-flight model for minutes.
-        if canonical_m3_model_id(model):
-            payload["model"] = "Minimax-M3-No-Think"
-            model = "Minimax-M3-No-Think"
+        payload["model"] = "Minimax-M3-No-Think"
+        model = "Minimax-M3-No-Think"
         payload["thinking_mode"] = "disabled"
         subject = _session_title_subject(messages)
         payload["messages"] = [
@@ -485,6 +591,25 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
         ):
             payload["max_tokens"] = ZCODE_SESSION_TITLE_MAX_TOKENS
             payload.pop("max_completion_tokens", None)
+        changed = True
+    elif is_zcode_goal_verification:
+        # This is an internal control-plane request, not the user's response.
+        # Preserve the full conversation for ZCode's artifact checks while
+        # forcing a short content-producing decode. The regular chat/tool path
+        # remains fully native and keeps the selected thinking mode.
+        payload["model"] = "Minimax-M3-No-Think"
+        model = "Minimax-M3-No-Think"
+        payload["thinking_mode"] = "disabled"
+        payload["temperature"] = 0
+        requested_max = payload.get("max_tokens", payload.get("max_completion_tokens"))
+        try:
+            requested_max = int(requested_max) if requested_max is not None else None
+        except (TypeError, ValueError):
+            requested_max = None
+        if requested_max is None or requested_max > ZCODE_GOAL_VERIFY_MAX_TOKENS:
+            payload["max_tokens"] = ZCODE_GOAL_VERIFY_MAX_TOKENS
+            payload.pop("max_completion_tokens", None)
+        payload["_metadata_request"] = "zcode_goal_verification"
         changed = True
     if not changed:
         return body, model, False
@@ -2707,6 +2832,10 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
     except Exception:
         payload = None
     title_request = _is_normalized_session_title_payload(payload)
+    zcode_goal_verifier = bool(
+        isinstance(payload, dict)
+        and payload.get("_metadata_request") == "zcode_goal_verification"
+    )
 
     if backend == "m3":
         STATE["last_m3_traffic"] = time.time()
@@ -2762,6 +2891,8 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
         content = response.content
         if title_request and response.status_code < 400:
             content = _normalize_session_title_json(content, payload)
+        elif zcode_goal_verifier and response.status_code < 400:
+            content = _normalize_zcode_goal_verifier_json(content)
         return Response(
             content=content,
             status_code=response.status_code,
