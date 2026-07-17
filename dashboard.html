@@ -1764,7 +1764,11 @@ function renderMachine(prefix, label, m, capGb){
 
 /* ============ main poll ============ */
 let lastOkPoll = 0;
+let refreshInFlight = false;
 async function refresh(){
+  if(refreshInFlight) return;
+  refreshInFlight = true;
+  try{
   let d;
   try{
     d = await (await fetch("/api/status", {cache:"no-store"})).json();
@@ -1955,6 +1959,9 @@ async function refresh(){
 
   /* settings */
   renderSettings(s);
+  }finally{
+    refreshInFlight = false;
+  }
 }
 
 /* stale banner */

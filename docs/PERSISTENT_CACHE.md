@@ -17,6 +17,19 @@ the same 100k-350k+ token context when the prompt prefix still matches.
   a model cache after TTL expiry, stop/start, or reboot. SSD artifacts are the
   durable KV tier.
 
+### Multimodal requests and retries
+
+Image-bearing requests currently bypass prompt/KV reuse. MLX-VLM expands image
+placeholders into processor-dependent feature tokens, so reusing text KV without
+also validating the image bytes, processor fingerprint, expanded feature
+positions, cache shape, model, split, and rank metadata can desynchronize the
+two ranks. A mismatch therefore falls back to normal cold prefill.
+
+Exact non-stream HTTP retries are still coalesced safely: identical request
+bodies share one active generation and may replay its completed response for a
+short grace period. This prevents a client timeout or reconnect from serially
+re-running the same large multimodal compaction without weakening the KV guard.
+
 ## Durable Cache Behavior
 
 The opt-in SSD tier stores per-rank prompt cache shards and links them from the
