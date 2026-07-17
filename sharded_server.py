@@ -111,6 +111,18 @@ VISIBLE_MODEL_IDS = (
 HOST = os.environ.get("MLX_M3_HOST", "0.0.0.0")
 PORT = int(os.environ.get("MLX_M3_PORT", "8080"))
 REQUEST_HISTORY_MAX = int(os.environ.get("MLX_M3_REQUEST_HISTORY_MAX", "32") or "32")
+GENERATION_LOCK_HANDOFF_GRACE_SECONDS = max(
+    0.1,
+    float(os.environ.get("MLX_M3_GENERATION_LOCK_HANDOFF_GRACE_SECONDS", "5") or "5"),
+)
+GENERATION_LOCK_REQUEST_OWNER_GRACE_SECONDS = max(
+    GENERATION_LOCK_HANDOFF_GRACE_SECONDS,
+    float(os.environ.get("MLX_M3_GENERATION_LOCK_REQUEST_OWNER_GRACE_SECONDS", "30") or "30"),
+)
+GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS = max(
+    GENERATION_LOCK_REQUEST_OWNER_GRACE_SECONDS,
+    float(os.environ.get("MLX_M3_GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS", "120") or "120"),
+)
 PREFILL_STEP_SIZE = int(os.environ.get("MLX_M3_PREFILL_STEP_SIZE", "128"))
 MLX_MAX_OPS_PER_BUFFER = int(os.environ.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
 MLX_MAX_MB_PER_BUFFER = int(os.environ.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
@@ -138,10 +150,58 @@ if KV_QUANT_SCHEME not in {"uniform", "turboquant"}:
         KV_QUANT_SCHEME,
     )
     KV_QUANT_SCHEME = "uniform"
+
+
+def _should_recover_generation_lock(
+    *,
+    lock_locked,
+    active_present,
+    releasing_present,
+    owner_kind,
+    owner_age,
+    transition_age,
+):
+    """Return true only when an ownerless generation lock is genuinely stale."""
+    if not lock_locked or active_present or releasing_present:
+        return False
+    if owner_kind in {"keepwarm", "control"}:
+        return owner_age is not None and (
+            owner_age >= GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS
+        )
+    if owner_kind == "request":
+        return owner_age is not None and (
+            owner_age >= GENERATION_LOCK_REQUEST_OWNER_GRACE_SECONDS
+        )
+    if owner_kind is None:
+        return transition_age is not None and (
+            transition_age >= GENERATION_LOCK_HANDOFF_GRACE_SECONDS
+        )
+    return True
 QUANTIZED_KV_START = int(os.environ.get("MLX_M3_QUANTIZED_KV_START", "5000") or "5000")
 DEFAULT_MAX_TOKENS = int(os.environ.get("MLX_M3_DEFAULT_MAX_TOKENS", "4096"))
 NONSTREAM_DEFAULT_MAX_TOKENS = int(
     os.environ.get("MLX_M3_NONSTREAM_DEFAULT_MAX_TOKENS", "512") or "512"
+)
+NONSTREAM_COALESCE_ENABLED = os.environ.get(
+    "MLX_M3_NONSTREAM_COALESCE", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+NONSTREAM_COALESCE_GRACE_SECONDS = max(
+    0.0,
+    float(
+        os.environ.get("MLX_M3_NONSTREAM_COALESCE_GRACE_SECONDS", "30")
+        or "30"
+    ),
+)
+NONSTREAM_DISCONNECT_GRACE_SECONDS = max(
+    0.0,
+    float(
+        os.environ.get("MLX_M3_NONSTREAM_DISCONNECT_GRACE_SECONDS", "3")
+        or "3"
+    ),
+)
+NONSTREAM_COALESCE_MAX_ENTRIES = max(
+    1,
+    int(os.environ.get("MLX_M3_NONSTREAM_COALESCE_MAX_ENTRIES", "16") or "16"),
 )
 TITLE_DEFAULT_MAX_TOKENS = max(
     1,
@@ -154,6 +214,181 @@ DEFAULT_TEMPERATURE = float(os.environ.get("MLX_M3_DEFAULT_TEMPERATURE", "0") or
 DEFAULT_TOP_P = float(os.environ.get("MLX_M3_DEFAULT_TOP_P", "1.0") or "1.0")
 DEFAULT_TOP_K = int(os.environ.get("MLX_M3_DEFAULT_TOP_K", "0") or "0")
 DEFAULT_MIN_P = float(os.environ.get("MLX_M3_DEFAULT_MIN_P", "0.0") or "0.0")
+
+
+def _nonstream_request_fingerprint(payload):
+    """Hash the exact client request before server-side normalization."""
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(b"chat.completions\0" + encoded).hexdigest()
+
+
+class _NonstreamRequestCoalescer:
+    """Share one non-stream generation across exact client retries."""
+
+    def __init__(
+        self,
+        *,
+        enabled=True,
+        replay_grace_seconds=30.0,
+        disconnect_grace_seconds=3.0,
+        max_entries=16,
+    ):
+        self.enabled = bool(enabled)
+        self.replay_grace_seconds = max(0.0, float(replay_grace_seconds))
+        self.disconnect_grace_seconds = max(
+            0.0, float(disconnect_grace_seconds)
+        )
+        self.max_entries = max(1, int(max_entries))
+        self._lock = threading.Lock()
+        self._entries = OrderedDict()
+        self._joined_total = 0
+        self._replayed_total = 0
+
+    def _purge_locked(self, now):
+        for key, entry in list(self._entries.items()):
+            if not entry.get("done"):
+                continue
+            completed_at = float(entry.get("completed_at") or 0.0)
+            if (
+                not entry.get("success")
+                or now - completed_at > self.replay_grace_seconds
+            ):
+                self._entries.pop(key, None)
+        while len(self._entries) >= self.max_entries:
+            removable = next(
+                (
+                    key
+                    for key, entry in self._entries.items()
+                    if entry.get("done")
+                ),
+                None,
+            )
+            if removable is None:
+                break
+            self._entries.pop(removable, None)
+
+    def claim(self, key, request_id, *, now=None):
+        if not self.enabled or not key:
+            return None, True, False
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            self._purge_locked(now)
+            entry = self._entries.get(key)
+            if entry is not None:
+                entry["clients"][request_id] = True
+                if not entry.get("done"):
+                    entry["all_disconnected_at"] = None
+                entry["joined"] += 1
+                self._joined_total += 1
+                replayed = bool(entry.get("done"))
+                if replayed:
+                    entry["replayed"] += 1
+                    self._replayed_total += 1
+                return entry, False, replayed
+            entry = {
+                "key": key,
+                "owner_request_id": request_id,
+                "created_at": now,
+                "completed_at": None,
+                "event": threading.Event(),
+                "done": False,
+                "success": False,
+                "status_code": None,
+                "payload": None,
+                "clients": {request_id: True},
+                "all_disconnected_at": None,
+                "joined": 0,
+                "replayed": 0,
+            }
+            self._entries[key] = entry
+            return entry, True, False
+
+    def disconnect(self, entry, request_id, *, now=None):
+        if entry is None:
+            return 0
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            clients = entry.get("clients") or {}
+            if clients.get(request_id):
+                clients[request_id] = False
+            connected = sum(1 for value in clients.values() if value)
+            if not entry.get("done") and connected == 0:
+                if entry.get("all_disconnected_at") is None:
+                    entry["all_disconnected_at"] = now
+            return connected
+
+    def connected_clients(self, entry):
+        if entry is None:
+            return 0
+        with self._lock:
+            return sum(
+                1 for value in (entry.get("clients") or {}).values() if value
+            )
+
+    def should_cancel(self, entry, *, now=None):
+        if entry is None:
+            return True
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            if entry.get("done"):
+                return False
+            disconnected_at = entry.get("all_disconnected_at")
+            return bool(
+                disconnected_at is not None
+                and now - float(disconnected_at)
+                >= self.disconnect_grace_seconds
+            )
+
+    def complete(self, entry, payload, *, status_code=200, now=None):
+        if entry is None:
+            return
+        now = time.time() if now is None else float(now)
+        status_code = int(status_code)
+        with self._lock:
+            if entry.get("done"):
+                return
+            entry["done"] = True
+            entry["success"] = 200 <= status_code < 300
+            entry["status_code"] = status_code
+            entry["payload"] = copy.deepcopy(payload)
+            entry["completed_at"] = now
+            if not entry["success"]:
+                current = self._entries.get(entry.get("key"))
+                if current is entry:
+                    self._entries.pop(entry.get("key"), None)
+            entry["event"].set()
+
+    def response(self, entry):
+        if entry is None:
+            return None
+        with self._lock:
+            if not entry.get("done"):
+                return None
+            return (
+                int(entry.get("status_code") or 500),
+                copy.deepcopy(entry.get("payload")),
+            )
+
+    def status(self, *, now=None):
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            self._purge_locked(now)
+            entries = list(self._entries.values())
+            return {
+                "enabled": self.enabled,
+                "active": sum(1 for entry in entries if not entry.get("done")),
+                "replayable": sum(1 for entry in entries if entry.get("done")),
+                "joined_total": self._joined_total,
+                "replayed_total": self._replayed_total,
+                "replay_grace_seconds": self.replay_grace_seconds,
+                "disconnect_grace_seconds": self.disconnect_grace_seconds,
+            }
 TOOL_DEFAULT_TEMPERATURE = float(
     os.environ.get("MLX_M3_TOOL_DEFAULT_TEMPERATURE", "0") or "0"
 )
@@ -17254,20 +17489,37 @@ def run_http_server(model, processor, rank):
     )
 
     generation_lock = threading.Lock()
-    generation_lock_owner = {"kind": None, "started_at": None, "reason": None}
+    generation_lock_owner = {
+        "kind": None,
+        "started_at": None,
+        "reason": None,
+        "changed_at": time.time(),
+    }
 
     def set_generation_lock_owner(kind, reason=None):
         with state_lock:
+            now = time.time()
             generation_lock_owner["kind"] = kind
-            generation_lock_owner["started_at"] = time.time() if kind else None
+            generation_lock_owner["started_at"] = now if kind else None
             generation_lock_owner["reason"] = reason
+            generation_lock_owner["changed_at"] = now
 
-    def clear_generation_lock_owner(kind=None):
+    def clear_generation_lock_owner(kind=None, reason=None, changed_at=None):
         with state_lock:
-            if kind is None or generation_lock_owner.get("kind") == kind:
-                generation_lock_owner["kind"] = None
-                generation_lock_owner["started_at"] = None
-                generation_lock_owner["reason"] = None
+            if kind is not None and generation_lock_owner.get("kind") != kind:
+                return False
+            if reason is not None and generation_lock_owner.get("reason") != reason:
+                return False
+            if (
+                changed_at is not None
+                and generation_lock_owner.get("changed_at") != changed_at
+            ):
+                return False
+            generation_lock_owner["kind"] = None
+            generation_lock_owner["started_at"] = None
+            generation_lock_owner["reason"] = None
+            generation_lock_owner["changed_at"] = time.time()
+            return True
     state_lock = threading.Lock()
     request_state = {
         "queued": 0,
@@ -17295,6 +17547,12 @@ def run_http_server(model, processor, rank):
             "logical_total": 0,
         },
     }
+    nonstream_coalescer = _NonstreamRequestCoalescer(
+        enabled=NONSTREAM_COALESCE_ENABLED,
+        replay_grace_seconds=NONSTREAM_COALESCE_GRACE_SECONDS,
+        disconnect_grace_seconds=NONSTREAM_DISCONNECT_GRACE_SECONDS,
+        max_entries=NONSTREAM_COALESCE_MAX_ENTRIES,
+    )
 
     # Lifetime token counters survive restarts: overlay the last persisted
     # snapshot at boot and rewrite it (atomically) after every release.
@@ -17892,28 +18150,39 @@ def run_http_server(model, processor, rank):
         with state_lock:
             owner = dict(generation_lock_owner)
             owner_kind = owner.get("kind")
+            now = time.time()
             owner_age = (
-                time.time() - float(owner.get("started_at") or 0.0)
+                now - float(owner.get("started_at") or 0.0)
                 if owner.get("started_at") else None
             )
-            stale = (
-                request_state.get("active") is None
-                and request_state.get("releasing") is None
-                and generation_lock.locked()
-                and not (
-                    owner_kind in {"keepwarm", "control"}
-                    and (owner_age is None or owner_age < 120.0)
-                )
+            transition_age = (
+                now - float(owner.get("changed_at") or 0.0)
+                if owner.get("changed_at") else None
             )
-            if stale:
-                request_state["last_error"] = (
-                    f"recovered stale generation lock: {reason}"
-                )
+            stale = _should_recover_generation_lock(
+                lock_locked=generation_lock.locked(),
+                active_present=request_state.get("active") is not None,
+                releasing_present=request_state.get("releasing") is not None,
+                owner_kind=owner_kind,
+                owner_age=owner_age,
+                transition_age=transition_age,
+            )
         if not stale:
+            return False
+        # Clear only the owner snapshot we inspected. A waiter may acquire the
+        # lock between recovery checks; never erase or release that newer turn.
+        if not clear_generation_lock_owner(
+            owner_kind,
+            owner.get("reason"),
+            owner.get("changed_at"),
+        ):
             return False
         try:
             generation_lock.release()
-            clear_generation_lock_owner()
+            with state_lock:
+                request_state["last_error"] = (
+                    f"recovered stale generation lock: {reason}"
+                )
             logger.warning("recovered stale generation lock (%s)", reason)
             return True
         except RuntimeError:
@@ -18050,7 +18319,15 @@ def run_http_server(model, processor, rank):
                 )
                 return
             active["_released"] = True
-            request_state["releasing"] = req_id
+            owns_active_slot = request_state.get("active") is active
+            if owns_active_slot:
+                request_state["releasing"] = req_id
+        if not owns_active_slot:
+            logger.warning(
+                "[rank 0] stale release for %s did not own the published "
+                "active slot; preserving the newer request",
+                req_id,
+            )
         shutdown_after_release = False
         total_elapsed = time.time() - active["started"]
         generation_elapsed = float(
@@ -18137,7 +18414,8 @@ def run_http_server(model, processor, rank):
                     lifetime[key] = int(lifetime.get(key) or 0) + int(value or 0)
                 request_state["completed"] += 1
                 request_state["last_error"] = None
-                request_state["active"] = None
+                if request_state.get("active") is active:
+                    request_state["active"] = None
                 request_state["last_request"] = last_summary
                 if tokens >= 32:
                     request_state["last_meaningful_request"] = last_summary
@@ -18156,7 +18434,8 @@ def run_http_server(model, processor, rank):
                     lifetime[key] = int(lifetime.get(key) or 0) + int(value or 0)
                 request_state["failed"] += 1
                 request_state["last_error"] = f"{type(error).__name__}: {error}"
-                request_state["active"] = None
+                if request_state.get("active") is active:
+                    request_state["active"] = None
                 request_state["last_request"] = last_summary
                 if tokens >= 32:
                     request_state["last_meaningful_request"] = last_summary
@@ -18179,18 +18458,24 @@ def run_http_server(model, processor, rank):
             req_id, elapsed, first_token_s, last_summary["prompt_tps"], tokens,
             tps, decode_tps,
         )
-        try:
-            clear_generation_lock_owner("request")
-            generation_lock.release()
-        except RuntimeError:
+        owner_cleared = clear_generation_lock_owner("request", req_id)
+        if owner_cleared:
+            try:
+                generation_lock.release()
+            except RuntimeError:
+                logger.warning(
+                    "[rank 0] generation lock was already released for request %s",
+                    req_id,
+                )
+        else:
             logger.warning(
-                "[rank 0] generation lock was already released for request %s",
+                "[rank 0] request %s did not release a generation lock owned "
+                "by another request",
                 req_id,
             )
-        finally:
-            with state_lock:
-                if request_state.get("releasing") == req_id:
-                    request_state["releasing"] = None
+        with state_lock:
+            if request_state.get("releasing") == req_id:
+                request_state["releasing"] = None
         if error is None and tokens > 0:
             schedule_post_response_keepwarm(req_id)
         if shutdown_after_release:
@@ -18259,6 +18544,7 @@ def run_http_server(model, processor, rank):
                 "max_concurrent_requests": MAX_CONCURRENT_REQUESTS,
                 "effective_max_concurrent_requests": EFFECTIVE_MAX_CONCURRENT_REQUESTS,
                 "stream_mode": STREAM_MODE,
+                "nonstream_coalescing": nonstream_coalescer.status(),
                 "generation_defaults": _generation_defaults_status(),
                 "kernel_stats": _kernel_stats_status(),
                 "metal_warmup": _metal_warmup_status(),
@@ -18845,6 +19131,11 @@ def run_http_server(model, processor, rank):
         max_tokens = int(max_tokens or DEFAULT_MAX_TOKENS)
         thinking_mode = _resolve_thinking_mode(request)
         stream = bool(request.get("stream", False))
+        nonstream_request_key = (
+            _nonstream_request_fingerprint(request)
+            if NONSTREAM_COALESCE_ENABLED and not stream
+            else None
+        )
         response_model = _response_model_id(request.get("model"))
         cache_session_id, cache_session_source = _request_cache_session(request)
         tools = _tools_from_request(request)
@@ -19063,6 +19354,77 @@ def run_http_server(model, processor, rank):
             max_tokens, thinking_mode, response_model,
         )
 
+        nonstream_req_id = None
+        coalesce_entry = None
+        if not stream:
+            nonstream_req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+            coalesce_entry, coalesce_owner, coalesce_replay = (
+                nonstream_coalescer.claim(
+                    nonstream_request_key,
+                    nonstream_req_id,
+                )
+            )
+            if not coalesce_owner:
+                owner_id = coalesce_entry.get("owner_request_id")
+                logger.info(
+                    "[rank 0] non-stream %s joined exact retry owner=%s key=%s "
+                    "(completed_replay=%s)",
+                    nonstream_req_id,
+                    owner_id,
+                    (nonstream_request_key or "")[:12],
+                    coalesce_replay,
+                )
+                while not coalesce_entry["event"].is_set():
+                    if (
+                        http_request is not None
+                        and await http_request.is_disconnected()
+                    ):
+                        connected = nonstream_coalescer.disconnect(
+                            coalesce_entry, nonstream_req_id
+                        )
+                        logger.info(
+                            "[rank 0] coalesced non-stream retry %s disconnected "
+                            "while owner=%s continued (connected_clients=%s)",
+                            nonstream_req_id,
+                            owner_id,
+                            connected,
+                        )
+                        return JSONResponse(
+                            status_code=499,
+                            content={"error": {
+                                "message": (
+                                    "Client disconnected while waiting for the "
+                                    "original request"
+                                ),
+                                "type": "client_disconnected",
+                            }},
+                        )
+                    await asyncio.sleep(0.25)
+                coalesced_response = nonstream_coalescer.response(coalesce_entry)
+                if coalesced_response is None:
+                    return JSONResponse(
+                        status_code=503,
+                        content={"error": {
+                            "message": (
+                                "Original request ended without a reusable response"
+                            ),
+                            "type": "coalesced_request_unavailable",
+                        }},
+                    )
+                response_status, response_payload = coalesced_response
+                logger.info(
+                    "[rank 0] non-stream %s replaying owner=%s response status=%s",
+                    nonstream_req_id,
+                    owner_id,
+                    response_status,
+                )
+                if 200 <= response_status < 300:
+                    return response_payload
+                return JSONResponse(
+                    status_code=response_status,
+                    content=response_payload,
+                )
+
         # Build prompt with M3's chat template + requested thinking_mode
         from mlx_vlm.prompt_utils import apply_chat_template
         try:
@@ -19162,11 +19524,26 @@ def run_http_server(model, processor, rank):
         # Tokenize the rendered prompt so both ranks share the same cache key
         # (rank 0 broadcasts token_ids to rank 1 via _bcast). Used for cross-
         # request prompt caching when MLX_M3_PROMPT_CACHE=1.
-        request_token_ids = (
-            await asyncio.to_thread(_tokenize_prompt, processor, prompt)
-            if _should_tokenize_prompt_for_cache(thinking_mode)
-            else None
-        )
+        try:
+            request_token_ids = (
+                await asyncio.to_thread(_tokenize_prompt, processor, prompt)
+                if _should_tokenize_prompt_for_cache(thinking_mode)
+                else None
+            )
+        except Exception as e:
+            logger.error("prompt tokenization failed: %s", e)
+            error_payload = {
+                "error": {
+                    "message": f"Prompt tokenization failed: {e}",
+                    "type": "generation_error",
+                }
+            }
+            nonstream_coalescer.complete(
+                coalesce_entry,
+                error_payload,
+                status_code=500,
+            )
+            return JSONResponse(status_code=500, content=error_payload)
         if request_token_ids is not None:
             logger.info(
                 "prompt-cache: tokenized prompt -> %d tokens", len(request_token_ids)
@@ -19180,22 +19557,25 @@ def run_http_server(model, processor, rank):
                     len(request_token_ids),
                     HARD_MAX_INPUT_TOKENS,
                 )
-                return JSONResponse(
+                error_payload = {
+                    "error": {
+                        "message": (
+                            "This request has "
+                            f"{len(request_token_ids)} input tokens, above "
+                            f"the cluster's safe limit of {HARD_MAX_INPUT_TOKENS}. "
+                            "Compact the conversation and retry."
+                        ),
+                        "type": "invalid_request_error",
+                        "param": "messages",
+                        "code": "context_length_exceeded",
+                    }
+                }
+                nonstream_coalescer.complete(
+                    coalesce_entry,
+                    error_payload,
                     status_code=400,
-                    content={
-                        "error": {
-                            "message": (
-                                "This request has "
-                                f"{len(request_token_ids)} input tokens, above "
-                                f"the cluster's safe limit of {HARD_MAX_INPUT_TOKENS}. "
-                                "Compact the conversation and retry."
-                            ),
-                            "type": "invalid_request_error",
-                            "param": "messages",
-                            "code": "context_length_exceeded",
-                        }
-                    },
                 )
+                return JSONResponse(status_code=400, content=error_payload)
         elif PROMPT_CACHE_ENABLED and _enable_thinking_for_generation(thinking_mode):
             with _prompt_cache_lock:
                 _set_prompt_cache_event(
@@ -19237,10 +19617,10 @@ def run_http_server(model, processor, rank):
         request_shape["require_tool_call"] = require_tool_call
         request_shape["action_tool_task"] = action_tool_task
 
-        # Clear any prior in-flight stop flag at the start of a new request.
-        _clear_stop_request()
-        _clear_prefill_stop_file("rank 0 new request")
-
+        # Do not clear stop state while preparing. An exact retry can reach
+        # this point while its owner is still generating; clearing here would
+        # erase the owner's cancellation. Each generation worker clears stop
+        # state only after it owns the distributed slot.
         import m3_eagle3 as _m3e3
         _eagle3_on = bool(
             _m3e3.enabled()
@@ -20239,7 +20619,7 @@ def run_http_server(model, processor, rank):
             )
 
         # Non-streaming path
-        req_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+        req_id = nonstream_req_id or f"chatcmpl-{uuid.uuid4().hex[:8]}"
         try:
             active = await acquire_generation_slot(
                 req_id, stream=False, max_tokens=max_tokens,
@@ -20419,12 +20799,38 @@ def run_http_server(model, processor, rank):
             # exclusive slot while the client's retries queued behind it).
             # Poll the connection while the job runs and arm the SAME safe
             # coordinated stop the stream path uses on disconnect.
+            disconnect_seen = False
             disconnect_stopped = False
-            while not await asyncio.to_thread(done_event.wait, 2.0):
-                if (not disconnect_stopped
-                        and http_request is not None
-                        and STOP_ON_CLIENT_DISCONNECT and SAFE_DECODE_STOP
-                        and await http_request.is_disconnected()):
+            while not await asyncio.to_thread(done_event.wait, 1.0):
+                if (
+                    not disconnect_seen
+                    and http_request is not None
+                    and STOP_ON_CLIENT_DISCONNECT
+                    and SAFE_DECODE_STOP
+                    and await http_request.is_disconnected()
+                ):
+                    disconnect_seen = True
+                    connected = nonstream_coalescer.disconnect(
+                        coalesce_entry, req_id
+                    )
+                    update_generation_slot(
+                        active,
+                        client_connected=connected > 0,
+                        coalesced_connected_clients=connected,
+                    )
+                    logger.warning(
+                        "[rank 0] non-stream owner client disconnected for %s; "
+                        "waiting %.1fs for an exact retry "
+                        "(connected_clients=%s)",
+                        req_id,
+                        NONSTREAM_DISCONNECT_GRACE_SECONDS,
+                        connected,
+                    )
+                if (
+                    disconnect_seen
+                    and not disconnect_stopped
+                    and nonstream_coalescer.should_cancel(coalesce_entry)
+                ):
                     disconnect_stopped = True
                     stop_state = _request_inflight_stop(
                         "client_disconnect",
@@ -20438,7 +20844,7 @@ def run_http_server(model, processor, rank):
                         cancel_reason="client_disconnect", **stop_state,
                     )
                     logger.warning(
-                        "[rank 0] non-stream client disconnected; distributed "
+                        "[rank 0] all clients left non-stream request; distributed "
                         "stop requested for %s at next token boundary",
                         req_id,
                     )
@@ -20591,20 +20997,50 @@ def run_http_server(model, processor, rank):
             if tool_calls:
                 message["tool_calls"] = tool_calls
                 message["content"] = None
-            return {"id": req_id,
+            response_payload = {"id": req_id,
                 "object": "chat.completion", "created": int(time.time()),
                 "choices": [
                 {"index": 0, "message": message,
                  "finish_reason": "tool_calls" if tool_calls else "stop"}],
                 "model": response_model}
+            if _user_stop_requested(req_id):
+                cancelled_payload = {"error": {
+                    "message": "Original request was cancelled",
+                    "type": "request_cancelled",
+                }}
+                nonstream_coalescer.complete(
+                    coalesce_entry,
+                    cancelled_payload,
+                    status_code=499,
+                )
+                return JSONResponse(
+                    status_code=499,
+                    content=cancelled_payload,
+                )
+            nonstream_coalescer.complete(
+                coalesce_entry,
+                response_payload,
+                status_code=200,
+            )
+            return response_payload
         except Exception as e:
             logger.error(f"[rank 0] generation FAILED, releasing memory: {e}")
             mx.clear_cache()
             gc.collect()
+            error_payload = {
+                "error": {
+                    "message": f"Generation failed: {e}",
+                    "type": "generation_error",
+                }
+            }
+            nonstream_coalescer.complete(
+                coalesce_entry,
+                error_payload,
+                status_code=500,
+            )
             return JSONResponse(
                 status_code=500,
-                content={"error": {"message": f"Generation failed: {e}",
-                                   "type": "generation_error"}},
+                content=error_payload,
             )
 
     logger.info(f"Rank 0 serving OpenAI API on {HOST}:{PORT}")
