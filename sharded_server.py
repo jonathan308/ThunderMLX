@@ -736,6 +736,25 @@ TOOL_SYNTH_JUSTIFICATION = os.environ.get(
 RANK1_IDLE_SLEEP_SECONDS = max(
     0.0, float(os.environ.get("MLX_M3_RANK1_IDLE_SLEEP_SECONDS", "0.01") or "0.01")
 )
+# Rank 1 blocks inside the control-channel receive while the cluster is idle.
+# The patched JACCL progress guard cannot distinguish that healthy wait from a
+# lost completion, so periodically complete one tiny control transaction. This
+# keeps the real lost-completion timeout enabled without recycling an idle
+# cluster every JACCL_PROGRESS_TIMEOUT_MS interval.
+DISTRIBUTED_IDLE_HEARTBEAT_SECONDS = max(
+    0.0,
+    float(
+        os.environ.get("MLX_M3_DISTRIBUTED_IDLE_HEARTBEAT_SECONDS", "60")
+        or "0"
+    ),
+)
+_DISTRIBUTED_IDLE_HEARTBEAT_STATE = {
+    "enabled": DISTRIBUTED_IDLE_HEARTBEAT_SECONDS > 0,
+    "interval_seconds": DISTRIBUTED_IDLE_HEARTBEAT_SECONDS,
+    "count": 0,
+    "last_at": None,
+    "last_error": None,
+}
 DEFAULT_SEED = int(os.environ.get("MLX_M3_DEFAULT_SEED", "1"))
 TOOL_DEFAULT_SEED = int(os.environ.get("MLX_M3_TOOL_DEFAULT_SEED", str(DEFAULT_SEED)))
 DECODE_EVAL_EVERY = int(os.environ.get("MLX_M3_DECODE_EVAL_EVERY", "0"))
@@ -2325,6 +2344,8 @@ def _sanitize_prompt_cache_session_entry(key, entry):
         "ssd_cache_bytes",
         "ssd_key_tokens",
         "ssd_session_hash",
+        "date_context",
+        "date_context_at",
     }
     out = {"key": str(key)}
     for field in allowed:
@@ -2345,7 +2366,13 @@ def _sanitize_prompt_cache_session_entry(key, entry):
                 value = int(value)
             except Exception:
                 continue
-        elif field in {"first_seen_at", "last_at", "last_reuse_ratio", "ssd_saved_at"}:
+        elif field in {
+            "first_seen_at",
+            "last_at",
+            "last_reuse_ratio",
+            "ssd_saved_at",
+            "date_context_at",
+        }:
             try:
                 value = round(float(value), 6)
             except Exception:
@@ -3410,6 +3437,12 @@ def _prompt_cache_ssd_save_current_unlocked(model, processor, *, reason="update"
                 "note": "Token ids and KV tensors can still reveal prompt content; keep this directory local.",
             },
         }
+        # The injected date sits near the beginning of the rendered prompt.
+        # Persisting this server-generated value is required for an exact KV
+        # prefix after midnight or a process restart. It contains no user text.
+        date_context = _date_context_snapshot_for_session(session_id)
+        if date_context:
+            metadata["date_context"] = date_context
         _write_json_atomic(os.path.join(tmp_dir, "session.json"), metadata)
         os.makedirs(os.path.dirname(rank_dir), exist_ok=True)
         if os.path.isdir(rank_dir):
@@ -7613,6 +7646,9 @@ def _generation_defaults_status():
             NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS
         ),
         "inject_date_context": INJECT_DATE_CONTEXT,
+        "distributed_idle_heartbeat_seconds": (
+            DISTRIBUTED_IDLE_HEARTBEAT_SECONDS
+        ),
         "tool_no_call_token_budget": TOOL_NO_CALL_TOKEN_BUDGET,
         "tool_action_no_call_token_budget": (
             TOOL_ACTION_NO_CALL_TOKEN_BUDGET
@@ -8147,9 +8183,9 @@ _AUTHORITATIVE_DATE_CONTEXT_RE = re.compile(
 )
 
 
-def _current_date_context_text():
-    """Return a daily-stable local date context for model system prompts."""
-    now = time.localtime()
+def _date_context_text_for_timestamp(timestamp=None):
+    """Return the canonical local date context for an epoch timestamp."""
+    now = time.localtime(timestamp) if timestamp is not None else time.localtime()
     date_text = time.strftime("%Y-%m-%d (%A)", now)
     zone_name = time.strftime("%Z", now).strip()
     raw_offset = time.strftime("%z", now).strip()
@@ -8164,9 +8200,106 @@ def _current_date_context_text():
     )
 
 
+def _current_date_context_text():
+    """Return a daily-stable local date context for model system prompts."""
+    return _date_context_text_for_timestamp()
+
+
 _DATE_CONTEXT_SESSION_LOCK = threading.Lock()
 _DATE_CONTEXT_BY_SESSION = {}
 _DATE_CONTEXT_SESSION_MAX = 512
+
+
+def _date_context_snapshot_for_session(session_id):
+    key = str(session_id or "").strip()
+    if not key:
+        return None
+    with _DATE_CONTEXT_SESSION_LOCK:
+        item = _DATE_CONTEXT_BY_SESSION.get(key)
+        return str((item or {}).get("text") or "").strip() or None
+
+
+def _persisted_date_context_for_session(session_id):
+    """Load a cache-compatible date pin from metadata or an SSD artifact."""
+    key = str(session_id or "").strip()
+    if not key or not PROMPT_CACHE_SSD_ENABLED:
+        return None, None
+    now = time.time()
+    session_key = _prompt_cache_session_key(key)
+
+    # The session manifest is cheap and normally contains the exact value for
+    # checkpoints written by current builds.
+    with _prompt_cache_lock:
+        entry = dict(_prompt_cache_session_map.get(session_key) or {})
+    exact = str(entry.get("date_context") or "").strip()
+    saved_at = entry.get("ssd_saved_at") or entry.get("date_context_at")
+    try:
+        saved_at = float(saved_at) if saved_at is not None else None
+    except Exception:
+        saved_at = None
+    if exact and (
+        saved_at is None
+        or PROMPT_CACHE_SSD_TTL_SECONDS <= 0
+        or now - saved_at <= PROMPT_CACHE_SSD_TTL_SECONDS
+    ):
+        return exact, "session_manifest"
+
+    # Session-map entries are intentionally bounded and can be displaced by
+    # title/sidecar traffic. Read the deterministic rank-0 artifact directly.
+    try:
+        session_hash = _prompt_cache_ssd_session_hash(session_key)
+        meta_path = os.path.join(
+            _prompt_cache_ssd_rank_dir(session_hash, rank=0),
+            "session.json",
+        )
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, dict) or not meta.get("complete"):
+            return None, None
+        saved_at = float(meta.get("saved_at") or 0.0)
+        if (
+            saved_at > 0
+            and PROMPT_CACHE_SSD_TTL_SECONDS > 0
+            and now - saved_at > PROMPT_CACHE_SSD_TTL_SECONDS
+        ):
+            return None, None
+        exact = str(meta.get("date_context") or "").strip()
+        if exact:
+            return exact, "ssd_metadata"
+        if saved_at > 0:
+            # Backward compatibility for checkpoints created before the exact
+            # date string was recorded. Their save date reconstructs the same
+            # daily-stable server text in the local timezone.
+            return _date_context_text_for_timestamp(saved_at), "ssd_saved_at"
+    except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return None, None
+
+
+def _persist_date_context_for_session(session_id, text):
+    """Record server-generated date metadata without storing user prompt text."""
+    key = str(session_id or "").strip()
+    text = str(text or "").strip()
+    if not key or not text or not PROMPT_CACHE_SSD_ENABLED:
+        return
+    session_key = _prompt_cache_session_key(key)
+    with _prompt_cache_lock:
+        entry = _prompt_cache_session_map.get(session_key) or {
+            "session_id": key,
+            "first_seen_at": round(time.time(), 3),
+            "requests": 0,
+            "updates": 0,
+            "bypasses_preserved": 0,
+        }
+        if entry.get("date_context") == text:
+            return
+        entry["date_context"] = text
+        entry["date_context_at"] = round(time.time(), 3)
+        _prompt_cache_session_map[session_key] = entry
+        _prompt_cache_session_map.move_to_end(session_key)
+        while len(_prompt_cache_session_map) > PROMPT_CACHE_SESSION_MAP_MAX:
+            _prompt_cache_session_map.popitem(last=False)
+        _write_prompt_cache_session_manifest_unlocked()
 
 
 def _date_context_for_session(session_id, current_text=None):
@@ -8194,6 +8327,17 @@ def _date_context_for_session(session_id, current_text=None):
         if item:
             item["last_seen"] = now
             return item["text"]
+
+    persisted_text, persisted_source = _persisted_date_context_for_session(key)
+    if persisted_text:
+        text = persisted_text
+
+    with _DATE_CONTEXT_SESSION_LOCK:
+        # A concurrent sidecar may have populated this while metadata was read.
+        item = _DATE_CONTEXT_BY_SESSION.get(key)
+        if item:
+            item["last_seen"] = now
+            return item["text"]
         if len(_DATE_CONTEXT_BY_SESSION) >= _DATE_CONTEXT_SESSION_MAX:
             oldest = min(
                 _DATE_CONTEXT_BY_SESSION,
@@ -8203,7 +8347,14 @@ def _date_context_for_session(session_id, current_text=None):
             )
             _DATE_CONTEXT_BY_SESSION.pop(oldest, None)
         _DATE_CONTEXT_BY_SESSION[key] = {"text": text, "last_seen": now}
-        return text
+    _persist_date_context_for_session(key, text)
+    if persisted_source:
+        logger.info(
+            "date context restored for cache session %s (%s)",
+            key,
+            persisted_source,
+        )
+    return text
 
 
 def _add_date_system_context(processed_messages, *, session_id=None):
@@ -18442,6 +18593,79 @@ def run_http_server(model, processor, rank):
 
     threading.Thread(target=generation_worker, daemon=True).start()
 
+    def distributed_idle_heartbeat_worker():
+        interval = DISTRIBUTED_IDLE_HEARTBEAT_SECONDS
+        if interval <= 0:
+            return
+        logger.info(
+            "[rank 0] distributed idle heartbeat armed (interval=%.1fs)",
+            interval,
+        )
+        while True:
+            time.sleep(interval)
+            with state_lock:
+                shutting_down = bool(request_state.get("shutdown_requested"))
+                busy = (
+                    request_state.get("active") is not None
+                    or int(request_state.get("queued") or 0) > 0
+                )
+            if shutting_down:
+                return
+            if busy:
+                continue
+            acquired = generation_lock.acquire(blocking=False)
+            if not acquired:
+                continue
+            op_channel_acquired = False
+            set_generation_lock_owner("keepwarm", "distributed idle heartbeat")
+            try:
+                op_channel_acquired = _RANK0_OP_MUTEX.acquire(timeout=2)
+                if not op_channel_acquired:
+                    continue
+                with state_lock:
+                    busy = (
+                        request_state.get("active") is not None
+                        or int(request_state.get("queued") or 0) > 0
+                        or bool(request_state.get("shutdown_requested"))
+                    )
+                if busy:
+                    continue
+                _bcast({
+                    "op": "idle_heartbeat",
+                    "at": round(time.time(), 3),
+                }, rank)
+                count = int(
+                    _DISTRIBUTED_IDLE_HEARTBEAT_STATE.get("count") or 0
+                ) + 1
+                _DISTRIBUTED_IDLE_HEARTBEAT_STATE.update({
+                    "count": count,
+                    "last_at": round(time.time(), 3),
+                    "last_error": None,
+                })
+                if count == 1 or count % 10 == 0:
+                    logger.info(
+                        "[rank 0] distributed idle heartbeat completed "
+                        "(count=%d)",
+                        count,
+                    )
+            except Exception as e:
+                _DISTRIBUTED_IDLE_HEARTBEAT_STATE["last_error"] = str(e)
+                logger.warning("distributed idle heartbeat failed: %s", e)
+            finally:
+                if op_channel_acquired:
+                    _RANK0_OP_MUTEX.release()
+                clear_generation_lock_owner("keepwarm")
+                try:
+                    generation_lock.release()
+                except RuntimeError:
+                    pass
+
+    threading.Thread(
+        target=distributed_idle_heartbeat_worker,
+        name="distributed-idle-heartbeat",
+        daemon=True,
+    ).start()
+
     def submit_generation_job(job):
         generation_jobs.put(job)
 
@@ -19341,6 +19565,9 @@ def run_http_server(model, processor, rank):
                 "stream_mode": STREAM_MODE,
                 "nonstream_coalescing": nonstream_coalescer.status(),
                 "generation_defaults": _generation_defaults_status(),
+                "distributed_idle_heartbeat": dict(
+                    _DISTRIBUTED_IDLE_HEARTBEAT_STATE
+                ),
                 "kernel_stats": _kernel_stats_status(),
                 "metal_warmup": _metal_warmup_status(),
                 "request_queue_depth": snapshot["queued"],
@@ -22036,6 +22263,8 @@ def run_mirror(model, processor, rank):
                 reason=req.get("reason") or "rank 0 request",
             )
             logger.info("rank 1: metal warmup event: %s", event)
+            continue
+        if isinstance(req, dict) and req.get("op") == "idle_heartbeat":
             continue
         if isinstance(req, dict) and req.get("op") == "prewarm_prompt_cache":
             reason = req.get("reason") or "rank 0 prewarm"
