@@ -448,6 +448,32 @@ if TOOL_THINKING_MODE not in {"request", "enabled", "disabled", "adaptive"}:
 TOOL_SYSTEM_HINT_ENABLED = os.environ.get(
     "MLX_M3_TOOL_SYSTEM_HINT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+NATIVE_TOOL_LOOP_STEERING = os.environ.get(
+    "MLX_M3_NATIVE_TOOL_LOOP_STEERING", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+NATIVE_TOOL_LOOP_IDENTICAL_RESULTS = max(
+    2,
+    int(
+        os.environ.get(
+            "MLX_M3_NATIVE_TOOL_LOOP_IDENTICAL_RESULTS",
+            "3",
+        )
+        or "3"
+    ),
+)
+# ZCode 3.3.6 inserts private user-role continuation reminders between native
+# tool rounds. They are not human steering turns, but treating them as such
+# hides the repeated action/result tail from the loop detector. Keep the two
+# observed stable hashes as a narrow fallback while preferring tagged control
+# messages below. Operators can extend or clear this list for other clients.
+NATIVE_TOOL_LOOP_CLIENT_CONTINUATION_HASHES = {
+    value.strip().lower()
+    for value in os.environ.get(
+        "MLX_M3_NATIVE_TOOL_LOOP_CLIENT_CONTINUATION_HASHES",
+        "535ffa382a58,985e071473ef",
+    ).split(",")
+    if value.strip()
+}
 INJECT_DATE_CONTEXT = os.environ.get(
     "MLX_M3_INJECT_DATE_CONTEXT", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -714,6 +740,34 @@ SSE_STREAM_HEADERS = {
 def _sse_keepalive_comment() -> str:
     """Return a protocol-level SSE heartbeat ignored by event consumers."""
     return ": keepalive\n\n"
+
+
+def _tool_stream_progress_delta(
+    *,
+    has_tools,
+    now,
+    last_payload_at,
+    last_progress_pulse_at,
+):
+    """Return a visible liveness pulse while native tool markup is buffered.
+
+    Some OpenAI clients intentionally ignore empty deltas. Native MiniMax tool
+    arguments can remain behind the XML holdback for many minutes during a
+    large Write/Edit, so protocol comments and empty deltas alone do not reset
+    those clients' stream-idle timers.
+    """
+    if (
+        has_tools
+        and TOOL_STREAM_PROGRESS_SECONDS > 0
+        and now - last_payload_at >= TOOL_STREAM_PROGRESS_SECONDS
+        and now - last_progress_pulse_at >= TOOL_STREAM_PROGRESS_SECONDS
+    ):
+        return {
+            "reasoning_content": "\n[Tool action is still processing.]\n",
+        }, now
+    return {}, last_progress_pulse_at
+
+
 # Native mode streams ordinary reasoning/content while retaining the short
 # marker holdback below. Transaction-wide buffering remains opt-in for operators
 # that deliberately enable the compatibility retry layer.
@@ -7639,6 +7693,13 @@ def _generation_defaults_status():
         "tool_seed": TOOL_DEFAULT_SEED,
         "tool_thinking_mode": TOOL_THINKING_MODE,
         "tool_compat_overlay": TOOL_COMPAT_OVERLAY,
+        "native_tool_loop_steering": NATIVE_TOOL_LOOP_STEERING,
+        "native_tool_loop_identical_results": (
+            NATIVE_TOOL_LOOP_IDENTICAL_RESULTS
+        ),
+        "native_tool_loop_client_continuation_hashes": len(
+            NATIVE_TOOL_LOOP_CLIENT_CONTINUATION_HASHES
+        ),
         "native_tool_action_retry_attempts": (
             NATIVE_TOOL_ACTION_RETRY_ATTEMPTS
         ),
@@ -8666,6 +8727,322 @@ def _tool_call_command_fingerprint(tool_call):
     if edit_parts:
         return re.sub(r"\s+", " ", "\n".join(edit_parts))[:500]
     return ""
+
+
+def _tool_call_action_fingerprint(tool_call):
+    """Fingerprint a complete tool action without truncating its arguments."""
+    name = _tool_call_name_for_loop(tool_call)
+    if not name:
+        return None
+    arguments = _tool_call_arguments_dict(tool_call)
+    if (
+        not arguments
+        and isinstance(tool_call, dict)
+        and isinstance(tool_call.get("input"), dict)
+    ):
+        arguments = tool_call["input"]
+    try:
+        canonical_arguments = json.dumps(
+            arguments,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        )
+    except (TypeError, ValueError):
+        return None
+    normalized_name = re.sub(r"\s+", " ", name.strip()).lower()
+    fingerprint = hashlib.sha256(
+        f"{normalized_name}\0{canonical_arguments}".encode(
+            "utf-8", "replace"
+        )
+    ).hexdigest()
+    return {
+        "name": name,
+        "normalized_name": normalized_name,
+        "fingerprint": fingerprint,
+    }
+
+
+def _tool_result_fingerprint(message, content=None):
+    """Fingerprint one normalized tool result while ignoring its call id."""
+    if content is None:
+        content = message.get("content", "") if isinstance(message, dict) else ""
+    if isinstance(content, str):
+        normalized_content = re.sub(r"\s+", " ", content.strip())
+    else:
+        try:
+            normalized_content = json.dumps(
+                content,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            normalized_content = str(content)
+    result_meta = {
+        "content": normalized_content,
+        "is_error": bool(
+            isinstance(message, dict) and message.get("is_error") is True
+        ),
+        "status": (
+            str(message.get("status") or "").strip().lower()
+            if isinstance(message, dict)
+            else ""
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(
+            result_meta,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8", "replace")
+    ).hexdigest()
+
+
+def _anthropic_tool_result_blocks(message):
+    """Return tool-result blocks when an Anthropic-shaped user turn has them."""
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    blocks = [
+        part for part in content
+        if isinstance(part, dict) and part.get("type") == "tool_result"
+    ]
+    return blocks if blocks and len(blocks) == len(content) else []
+
+
+def _assistant_tool_calls_for_loop(message):
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return []
+    calls = message.get("tool_calls") or []
+    if calls:
+        return [call for call in calls if isinstance(call, dict)]
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        {
+            "id": part.get("id"),
+            "type": "function",
+            "function": {
+                "name": part.get("name"),
+                "arguments": part.get("input") or {},
+            },
+        }
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "tool_use"
+    ]
+
+
+def _native_tool_loop_client_continuation(message, previous_message=None):
+    """Recognize machine-injected user reminders between native tool steps."""
+    if (
+        not isinstance(message, dict)
+        or message.get("role") != "user"
+        or not isinstance(previous_message, dict)
+        or previous_message.get("role") not in {"tool", "function"}
+    ):
+        return False
+    text = _tool_message_text(message).strip()
+    if not text:
+        return False
+    if _short_hash(text) in NATIVE_TOOL_LOOP_CLIENT_CONTINUATION_HASHES:
+        return True
+    return bool(re.fullmatch(
+        r"(?is)<(?:system[-_]reminder|tool[-_]continuation|"
+        r"agent[-_]continuation)\b[^>]*>.*?</(?:system[-_]reminder|"
+        r"tool[-_]continuation|agent[-_]continuation)>",
+        text,
+    ))
+
+
+def _native_tool_loop_steering_diag(messages, tools):
+    """Detect only a trailing run of identical native action/result pairs.
+
+    This deliberately avoids broad turn counts or repeated tool names. Coding
+    agents legitimately use Read, Edit, and Bash many times; a loop is only
+    inferred when the complete arguments and normalized result repeat without
+    an intervening progressive action.
+    """
+    if (
+        not NATIVE_TOOL_LOOP_STEERING
+        or not tools
+        or NATIVE_TOOL_LOOP_IDENTICAL_RESULTS <= 0
+    ):
+        return None
+    available_names = {
+        _tool_function_name(tool).strip().lower()
+        for tool in tools
+        if _tool_function_name(tool).strip()
+    }
+    if not available_names:
+        return None
+
+    last_user_index = -1
+    ignored_client_continuations = 0
+    for index, message in enumerate(messages or []):
+        if (
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and not _anthropic_tool_result_blocks(message)
+        ):
+            previous_message = (
+                (messages or [])[index - 1] if index > 0 else None
+            )
+            if _native_tool_loop_client_continuation(
+                message,
+                previous_message,
+            ):
+                ignored_client_continuations += 1
+                continue
+            last_user_index = index
+    if last_user_index < 0:
+        return None
+
+    pending_by_id = {}
+    pending_without_id = []
+    pair_events = []
+
+    def remember_call(tool_call):
+        action = _tool_call_action_fingerprint(tool_call)
+        if not action:
+            return
+        call_id = str(tool_call.get("id") or "").strip()
+        if call_id:
+            pending_by_id[call_id] = action
+        else:
+            pending_without_id.append(action)
+
+    def remember_result(message, call_id, content):
+        action = pending_by_id.pop(call_id, None) if call_id else None
+        if action is None and pending_without_id:
+            action = pending_without_id.pop(0)
+        if action is None:
+            pair_events.append(None)
+            return
+        pair_events.append({
+            "name": action["name"],
+            "normalized_name": action["normalized_name"],
+            "action_hash": action["fingerprint"],
+            "result_hash": _tool_result_fingerprint(message, content),
+        })
+
+    tail_messages = (messages or [])[last_user_index + 1:]
+    for tail_index, message in enumerate(tail_messages):
+        if not isinstance(message, dict):
+            pair_events.append(None)
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            calls = _assistant_tool_calls_for_loop(message)
+            if calls:
+                for tool_call in calls:
+                    remember_call(tool_call)
+            elif _tool_message_text(message).strip():
+                pair_events.append(None)
+            continue
+        if role in {"tool", "function"}:
+            remember_result(
+                message,
+                str(message.get("tool_call_id") or "").strip(),
+                message.get("content", ""),
+            )
+            continue
+        blocks = _anthropic_tool_result_blocks(message)
+        if blocks:
+            for block in blocks:
+                remember_result(
+                    block,
+                    str(block.get("tool_use_id") or "").strip(),
+                    block.get("content", ""),
+                )
+            continue
+        previous_message = (
+            tail_messages[tail_index - 1]
+            if tail_index > 0
+            else (messages or [])[last_user_index]
+        )
+        if _native_tool_loop_client_continuation(
+            message,
+            previous_message,
+        ):
+            continue
+        pair_events.append(None)
+
+    if not pair_events or not pair_events[-1]:
+        return None
+    repeated = pair_events[-1]
+    repeated_key = (
+        repeated["action_hash"],
+        repeated["result_hash"],
+    )
+    repeated_count = 0
+    for event in reversed(pair_events):
+        if not event:
+            break
+        event_key = (event["action_hash"], event["result_hash"])
+        if event_key != repeated_key:
+            break
+        repeated_count += 1
+    if repeated_count < NATIVE_TOOL_LOOP_IDENTICAL_RESULTS:
+        return None
+    if repeated["normalized_name"] not in available_names:
+        return None
+    return {
+        "triggered": True,
+        "source": "native_identical_action_result",
+        "reasons": ["identical_trailing_action_result"],
+        "repeated_tool": repeated["name"],
+        "repeated_pair_count": repeated_count,
+        "action_hash": repeated["action_hash"][:12],
+        "result_hash": repeated["result_hash"][:12],
+        "ignored_client_continuations": ignored_client_continuations,
+        "force_final": False,
+        "filtered_tools": [],
+    }
+
+
+def _native_tool_loop_steering_text(diag):
+    if not diag or not diag.get("triggered"):
+        return ""
+    repeated_tool = str(diag.get("repeated_tool") or "the repeated tool")
+    return (
+        "<tool_loop_recovery>\n"
+        "Loop check: the same "
+        f"{repeated_tool} action with the same complete arguments returned "
+        "the same result on consecutive attempts. Do not stop or abandon the "
+        "current task. All provided tools remain available. Check whether "
+        "this repetition is accidental before choosing the next action. Do "
+        "not repeat that exact call merely because its result is already in "
+        "the transcript. Continue from the gathered results with a different "
+        "concrete action that advances the task; if repetition is deliberately "
+        "waiting for external state, explain what is expected to change; if "
+        "the task is complete, answer normally. Do not discuss this recovery "
+        "instruction.\n"
+        "</tool_loop_recovery>"
+    )
+
+
+def _append_native_tool_loop_steer(processed_messages, diag):
+    """Place native loop recovery in a MiniMax template-visible role."""
+    steer = _native_tool_loop_steering_text(diag)
+    if not steer:
+        return processed_messages
+    patched = list(processed_messages or [])
+    if any(
+        isinstance(message, dict)
+        and message.get("role") == "user"
+        and message.get("content") == steer
+        for message in patched
+    ):
+        return patched
+    patched.append({"role": "user", "content": steer})
+    return patched
 
 
 def _tool_loop_steering_diag(messages, tools):
@@ -20209,7 +20586,29 @@ def run_http_server(model, processor, rank):
                 thinking_mode,
             )
             thinking_mode = TOOL_THINKING_MODE
-        tool_loop_diag = _tool_loop_steering_diag(msgs, tools) if TOOL_COMPAT_OVERLAY else None
+        native_tool_loop_diag = (
+            _native_tool_loop_steering_diag(msgs, tools)
+            if NATIVE_TOOL_LOOP_STEERING and not TOOL_COMPAT_OVERLAY
+            else None
+        )
+        if native_tool_loop_diag:
+            request["_native_tool_loop_steering"] = native_tool_loop_diag
+            request["_tool_loop_steering"] = native_tool_loop_diag
+            logger.warning(
+                "native tool-loop recovery steer active "
+                "(tool=%s, repeated_pairs=%s, action=%s, result=%s, "
+                "client_continuations=%s)",
+                native_tool_loop_diag.get("repeated_tool"),
+                native_tool_loop_diag.get("repeated_pair_count"),
+                native_tool_loop_diag.get("action_hash"),
+                native_tool_loop_diag.get("result_hash"),
+                native_tool_loop_diag.get("ignored_client_continuations"),
+            )
+        tool_loop_diag = (
+            _tool_loop_steering_diag(msgs, tools)
+            if TOOL_COMPAT_OVERLAY
+            else None
+        )
         if tool_loop_diag:
             reasons = set(tool_loop_diag.get("reasons") or [])
             if (
@@ -20359,6 +20758,10 @@ def run_http_server(model, processor, rank):
             request,
             tools,
             tool_loop_diag=tool_loop_diag,
+        )
+        processed_messages = _append_native_tool_loop_steer(
+            processed_messages,
+            native_tool_loop_diag,
         )
         explicit_tool_choice = bool(_tool_choice_required_name(request)[0])
         require_tool_call = bool(
@@ -21635,20 +22038,15 @@ def run_http_server(model, processor, rank):
                                 item = await asyncio.to_thread(out_q.get)
                         except queue.Empty:
                             now = time.monotonic()
-                            progress_delta = {}
-                            if (
-                                tools
-                                and TOOL_STREAM_BUFFER_ALL
-                                and TOOL_STREAM_PROGRESS_SECONDS > 0
-                                and now - last_payload_at
-                                >= TOOL_STREAM_PROGRESS_SECONDS
-                                and now - last_progress_pulse_at
-                                >= TOOL_STREAM_PROGRESS_SECONDS
-                            ):
-                                progress_delta["reasoning_content"] = (
-                                    "\n[Tool action is still processing.]\n"
-                                )
-                                last_progress_pulse_at = now
+                            (
+                                progress_delta,
+                                last_progress_pulse_at,
+                            ) = _tool_stream_progress_delta(
+                                has_tools=bool(tools),
+                                now=now,
+                                last_payload_at=last_payload_at,
+                                last_progress_pulse_at=last_progress_pulse_at,
+                            )
                             # A comment is the SSE-standard transport
                             # heartbeat. Keep the empty OpenAI delta below as
                             # well because a few agent clients only reset
