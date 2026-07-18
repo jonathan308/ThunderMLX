@@ -75,6 +75,39 @@ def check_m3_case_and_path_aliases_are_canonicalized():
         assert backend_for_model(alias) == "m3", alias
 
 
+def check_models_hide_omlx_m3_directory_alias():
+    original_get_json = gateway.get_json
+
+    async def fake_get_json(url):
+        if url.endswith(":8080/v1/models"):
+            return {
+                "data": [
+                    {"id": "Minimax-M3"},
+                    {"id": "Minimax-M3-No-Think"},
+                    {"id": "M3-Web"},
+                ]
+            }
+        if url.endswith(":8000/v1/models"):
+            return {
+                "data": [
+                    {"id": "DeepSeek-V4-Flash-4bit"},
+                    {"id": "mlx-community--MiniMax-M3-4bit"},
+                ]
+            }
+        raise AssertionError(url)
+
+    gateway.get_json = fake_get_json
+    try:
+        payload = asyncio.run(gateway.models())
+    finally:
+        gateway.get_json = original_get_json
+
+    model_ids = [item["id"] for item in payload["data"]]
+    assert "Minimax-M3" in model_ids, model_ids
+    assert "DeepSeek-V4-Flash-4bit" in model_ids, model_ids
+    assert "mlx-community--MiniMax-M3-4bit" not in model_ids, model_ids
+
+
 def check_zcode_title_sidecar_is_short_and_visible():
     body, model, changed = normalize_openai_json_body(
         json.dumps({
@@ -539,6 +572,7 @@ def main():
     check_empty_model_defaults_to_m3_agent_model()
     check_explicit_omlx_model_is_preserved()
     check_m3_case_and_path_aliases_are_canonicalized()
+    check_models_hide_omlx_m3_directory_alias()
     check_zcode_title_sidecar_is_short_and_visible()
     check_opencode_title_sidecar_is_short_streaming_and_single()
     check_zcode_goal_verifier_is_short_no_think_and_preserves_context()
