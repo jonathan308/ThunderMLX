@@ -2232,6 +2232,7 @@ _metal_warmup_lock = _threading.RLock()
 _metal_warmup_last_event = None
 
 PROMPT_CACHE_SSD_SCHEMA_VERSION = 3
+PROMPT_CACHE_SSD_ABI_VERSION = 1
 PROMPT_CACHE_SSD_RECENT_ENTRIES = 12
 
 
@@ -2655,7 +2656,6 @@ def _prompt_cache_ssd_session_label(session_key):
 def _prompt_cache_ssd_file_fingerprint():
     root = os.path.dirname(os.path.abspath(__file__))
     files = [
-        os.path.join(root, "sharded_server.py"),
         os.path.join(root, "m3_batch_cancel.py"),
         os.path.join(root, "m3_pipeline_patch.py"),
         os.path.join(root, "m3_eagle3.py"),
@@ -2668,10 +2668,43 @@ def _prompt_cache_ssd_file_fingerprint():
         digest = _sha256_file(path)
         if digest:
             parts.append({"path": os.path.relpath(path, root), "sha256": digest})
-    return {
+    payload = {
+        "abi_version": PROMPT_CACHE_SSD_ABI_VERSION,
         "files": parts,
-        "hash": _sha256_text(parts),
     }
+    payload["hash"] = _sha256_text(payload)
+    return payload
+
+
+def _prompt_cache_ssd_normalize_runtime_fingerprint(value):
+    """Return the cache-ABI portion of a runtime fingerprint for comparison.
+
+    Schema-v3 initially hashed all of sharded_server.py. That made harmless API,
+    tool-parser, and telemetry edits invalidate every durable KV artifact. Cache
+    compatibility is instead governed by the schema/ABI plus the model/runtime,
+    cache classes, and implementation modules that define tensor layout.
+    """
+    payload = copy.deepcopy(value or {})
+    payload.pop("hash", None)
+    cache_impl = payload.get("cache_impl")
+    if not isinstance(cache_impl, dict):
+        return payload
+    cache_impl.pop("hash", None)
+    cache_impl["abi_version"] = int(
+        cache_impl.get("abi_version") or PROMPT_CACHE_SSD_ABI_VERSION
+    )
+    cache_impl["files"] = [
+        item
+        for item in (cache_impl.get("files") or [])
+        if isinstance(item, dict) and item.get("path") != "sharded_server.py"
+    ]
+    return payload
+
+
+def _prompt_cache_ssd_runtime_fingerprints_compatible(stored, current):
+    return _prompt_cache_ssd_normalize_runtime_fingerprint(
+        stored
+    ) == _prompt_cache_ssd_normalize_runtime_fingerprint(current)
 
 
 def _safe_version(package):
@@ -3716,8 +3749,13 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
             model.language_model, max_kv_size=MAX_KV_SIZE
         )
         runtime = _prompt_cache_ssd_runtime_fingerprint(model, processor, new_cache)
-        if runtime.get("hash") != meta.get("runtime_hash"):
+        stored_runtime = meta.get("runtime") or {}
+        if not _prompt_cache_ssd_runtime_fingerprints_compatible(
+            stored_runtime, runtime
+        ):
             return None, None, None, "runtime_hash_mismatch"
+        if runtime.get("hash") != meta.get("runtime_hash"):
+            meta["_runtime_fingerprint_migrated"] = True
         layers = meta.get("layers") or []
         if len(layers) != len(new_cache):
             return None, None, None, "layer_count_mismatch"
@@ -3765,6 +3803,9 @@ def _prompt_cache_ssd_load_candidate_unlocked(model, processor, token_ids,
         )
         meta["_restore_append_reserve_tokens"] = append_reserve_tokens
         meta["last_access_at"] = round(time.time(), 3)
+        if meta.get("_runtime_fingerprint_migrated"):
+            meta["runtime"] = runtime
+            meta["runtime_hash"] = runtime.get("hash")
         try:
             _write_json_atomic(
                 meta_path,
@@ -5466,7 +5507,8 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                            thinking_mode="adaptive",
                            append_reserve_tokens=0,
                            multimodal_fingerprint=None,
-                           minimum_safe_reuse=0):
+                           minimum_safe_reuse=0,
+                           _restored_ssd=None):
     """Compute (suffix_prompt, prompt_cache) for prefix-aware generation.
 
     Returns (prompt_to_send, prompt_cache_or_None). If a long prefix is reused,
@@ -5489,7 +5531,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
     with _prompt_cache_lock:
         holder = _prompt_cache_holder
         restored_slot = None
-        restored_ssd = None
+        restored_ssd = _restored_ssd
         # Thinking prompts include control tokens and hidden/visible routing
         # boundaries. General partial durable restores remain disabled. The one
         # safe exception is an append-only continuation where the stored cache
@@ -5590,8 +5632,35 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                 reason=f"multimodal_mismatch:{session_id or '__default__'}"
             )
             holder["cache"] = None
-            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
             _clear_prompt_cache_key_state_unlocked(holder)
+            gc.collect()
+            restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
+                model,
+                processor,
+                token_ids,
+                session_id=session_id,
+                session_source=session_source,
+                reason="multimodal_mismatch_after_stash",
+                allow_partial_restore=allow_partial_ssd_restore,
+                allow_thinking_boundary_restore=allow_thinking_boundary_restore,
+                append_reserve_tokens=append_reserve_tokens,
+                multimodal_fingerprint=multimodal_fingerprint,
+            )
+            if restored_ssd:
+                return _prepare_cached_prompt(
+                    model,
+                    processor,
+                    prompt,
+                    token_ids,
+                    session_id=session_id,
+                    session_source=session_source,
+                    thinking_mode=thinking_mode,
+                    append_reserve_tokens=append_reserve_tokens,
+                    multimodal_fingerprint=multimodal_fingerprint,
+                    minimum_safe_reuse=minimum_safe_reuse,
+                    _restored_ssd=restored_ssd,
+                )
+            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
             holder["session_id"] = session_id
             holder["session_source"] = session_source
             holder["last_suffix_ids"] = list(token_ids)
@@ -5712,6 +5781,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                         append_reserve_tokens=append_reserve_tokens,
                         multimodal_fingerprint=multimodal_fingerprint,
                         minimum_safe_reuse=minimum_safe_reuse,
+                        _restored_ssd=restored_ssd,
                     )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -5802,6 +5872,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     append_reserve_tokens=append_reserve_tokens,
                     multimodal_fingerprint=multimodal_fingerprint,
                     minimum_safe_reuse=minimum_safe_reuse,
+                    _restored_ssd=restored_ssd,
                 )
             holder["cache"] = None
             holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
@@ -6005,6 +6076,7 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
                     append_reserve_tokens=append_reserve_tokens,
                     multimodal_fingerprint=multimodal_fingerprint,
                     minimum_safe_reuse=minimum_safe_reuse,
+                    _restored_ssd=restored_ssd,
                 )
             # Not enough overlap to bother: reset and process full prompt.
             _prompt_cache_stash_current_unlocked(reason=f"replace:{session_id or '__default__'}")
