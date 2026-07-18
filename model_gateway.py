@@ -2955,6 +2955,12 @@ async def models():
             model_id = str(model.get("id") or "")
             if not model_id or model_id in seen:
                 continue
+            # oMLX discovers the on-disk MiniMax-M3 shard directory even
+            # though ThunderMLX owns that model. Do not advertise the stale
+            # directory spelling as a second backend model; aliases still
+            # canonicalize to the real cluster endpoint when requested.
+            if source == "omlx" and canonical_m3_model_id(model_id):
+                continue
             item = dict(model)
             item.setdefault("object", "model")
             item["owned_by"] = item.get("owned_by") or source
