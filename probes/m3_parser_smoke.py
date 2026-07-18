@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import sys
+import tempfile
 import time
 
 import mlx.core as mx
@@ -31,6 +32,8 @@ os.environ.setdefault("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "768")
 os.environ.setdefault("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_TARGET_CHARS", "4096")
+
+import sharded_server as server
 
 from sharded_server import (
     _BATCH_PATH_ACTIVE,
@@ -2011,6 +2014,82 @@ def check_daily_date_context_injection():
     preserved, injected = _add_date_system_context(supplied)
     assert injected is False, preserved
     assert preserved == supplied, preserved
+
+
+def check_date_context_survives_ssd_restart_and_midnight():
+    old_values = {
+        "PROMPT_CACHE_SSD_ENABLED": server.PROMPT_CACHE_SSD_ENABLED,
+        "PROMPT_CACHE_SSD_DIR": server.PROMPT_CACHE_SSD_DIR,
+        "PROMPT_CACHE_SSD_DIR_RANK0": server.PROMPT_CACHE_SSD_DIR_RANK0,
+        "PROMPT_CACHE_SSD_TTL_SECONDS": server.PROMPT_CACHE_SSD_TTL_SECONDS,
+        "PROMPT_CACHE_SESSION_MANIFEST_ENABLED": (
+            server.PROMPT_CACHE_SESSION_MANIFEST_ENABLED
+        ),
+    }
+    session_id = f"date-ssd-pin-{time.time_ns()}"
+    session_key = server._prompt_cache_session_key(session_id)
+    saved_at = time.time() - 86400
+    expected = server._date_context_text_for_timestamp(saved_at)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        try:
+            server.PROMPT_CACHE_SSD_ENABLED = True
+            server.PROMPT_CACHE_SSD_DIR = temp_dir
+            server.PROMPT_CACHE_SSD_DIR_RANK0 = ""
+            server.PROMPT_CACHE_SSD_TTL_SECONDS = 432000
+            # Keep this isolated probe from touching the user's live manifest.
+            server.PROMPT_CACHE_SESSION_MANIFEST_ENABLED = False
+
+            session_hash = server._prompt_cache_ssd_session_hash(session_key)
+            rank_dir = server._prompt_cache_ssd_rank_dir(session_hash, rank=0)
+            os.makedirs(rank_dir, exist_ok=True)
+            with open(
+                os.path.join(rank_dir, "session.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump({"complete": True, "saved_at": saved_at}, f)
+
+            # Simulate a fresh process after midnight: no RAM date pin and a
+            # different current date, but the prior SSD checkpoint is intact.
+            with server._DATE_CONTEXT_SESSION_LOCK:
+                server._DATE_CONTEXT_BY_SESSION.pop(session_id, None)
+            with server._prompt_cache_lock:
+                server._prompt_cache_session_map.pop(session_key, None)
+            restored = server._date_context_for_session(
+                session_id,
+                "Current date: 2040-12-31 (Monday).",
+            )
+            assert restored == expected, (restored, expected)
+
+            # New checkpoints persist the exact canonical text rather than
+            # relying on the backward-compatible saved_at reconstruction.
+            exact = "Current date: 2030-01-02 (Wednesday)."
+            with open(
+                os.path.join(rank_dir, "session.json"),
+                "w",
+                encoding="utf-8",
+            ) as f:
+                json.dump({
+                    "complete": True,
+                    "saved_at": time.time(),
+                    "date_context": exact,
+                }, f)
+            with server._DATE_CONTEXT_SESSION_LOCK:
+                server._DATE_CONTEXT_BY_SESSION.pop(session_id, None)
+            with server._prompt_cache_lock:
+                server._prompt_cache_session_map.pop(session_key, None)
+            restored = server._date_context_for_session(
+                session_id,
+                "Current date: 2040-12-31 (Monday).",
+            )
+            assert restored == exact, restored
+        finally:
+            with server._DATE_CONTEXT_SESSION_LOCK:
+                server._DATE_CONTEXT_BY_SESSION.pop(session_id, None)
+            with server._prompt_cache_lock:
+                server._prompt_cache_session_map.pop(session_key, None)
+            for name, value in old_values.items():
+                setattr(server, name, value)
 
 
 def check_thinking_tool_hint_covers_fresh_information():
@@ -5119,6 +5198,7 @@ def main():
     check_exec_command_justification_is_filled_when_supported()
     check_post_tool_hint_tells_model_to_answer()
     check_daily_date_context_injection()
+    check_date_context_survives_ssd_restart_and_midnight()
     check_thinking_tool_hint_covers_fresh_information()
     check_thinking_tool_hint_is_cache_stable_across_turn_intent()
     check_soft_tool_loop_steering_preserves_tools()

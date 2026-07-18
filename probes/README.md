@@ -33,8 +33,9 @@ during this gate.
   long-context lane remained about 3% faster than plain Steel MMA at 200k.
 - A midnight rollover changed the injected date near the prompt prefix and
   forced an 80k re-prefill. The release pins injected date text for the active
-  cache-session lifetime; new or idle-expired sessions still receive the
-  current date.
+  cache-session lifetime and persists that server-generated value with its SSD
+  checkpoint, so exact restores remain valid across midnight and process
+  restarts. New sessions still receive the current date.
 
 ## Exact structured-decode gate (2026-07-14)
 
