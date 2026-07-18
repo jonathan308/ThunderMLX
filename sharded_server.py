@@ -1667,68 +1667,17 @@ THINKING_RAW_SILENT_LIMIT = int(
     os.environ.get("MLX_M3_THINKING_RAW_SILENT_LIMIT", "64") or "64"
 )
 
-# Thinking-runaway guard (2026-07-09 hermes 486s/12.5k-token pure-think
-# runaway): a Think turn deep in a long conversation can loop inside
-# <mm:think> and never emit </mm:think>, decoding to the 32k ceiling with
-# zero visible content. When a turn is STILL in thinking past this many
-# generated tokens, arm the proven EOS-injection stop (same path /v1/stop
-# uses, batch-cancel certified). Only pure-think runaways trip it — once
-# thinking closes and the answer starts, the guard disengages, so legit
-# long answers are never clipped. 0 disables.
+# Optional hidden-reasoning cutoff. Keep this disabled by default: the model
+# cannot observe a server-side token boundary, and forcing EOS while the
+# distributed batch path is inside <mm:think> can interrupt a valid native
+# tool transition. Operators may opt in for diagnostics; production relies on
+# the request ceiling, explicit cancellation, and the distributed watchdog.
 THINKING_RUNAWAY_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "8192") or "8192"
+    os.environ.get("MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET", "0") or "0"
 )
-# A tool-bearing turn that remains inside <mm:think> this long is not making
-# progress toward a call. End that attempt so the existing no-thinking retry
-# can emit the tool call without spending the full prose-thinking budget.
 TOOL_THINKING_RUNAWAY_TOKEN_BUDGET = int(
-    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "12288")
-    or "12288"
+    os.environ.get("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0") or "0"
 )
-# At long context, valid native tool turns in the production traces finish
-# their hidden reasoning well below 2k tokens (20-request max: 1,866). Keep a
-# generous margin, but do not spend twelve minutes decoding a planning loop
-# before recovery. Short-context requests retain the full budget above.
-TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS = max(
-    0,
-    int(
-        os.environ.get(
-            "MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS",
-            "65536",
-        )
-        or "0"
-    ),
-)
-TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET = max(
-    0,
-    int(
-        os.environ.get(
-            "MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET",
-            "3072",
-        )
-        or "0"
-    ),
-)
-
-
-def _thinking_runaway_budget_for_request(tools, token_ids):
-    budget = (
-        TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
-        if tools else THINKING_RUNAWAY_TOKEN_BUDGET
-    )
-    if not tools or budget <= 0:
-        return max(0, int(budget or 0))
-    prompt_tokens = len(token_ids or [])
-    if (
-        TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS > 0
-        and prompt_tokens >= TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS
-        and TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET > 0
-    ):
-        return min(
-            int(budget),
-            TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET,
-        )
-    return int(budget)
 # Flavor-agnostic degenerate-repetition guard (2026-07-10 zcode copy-spiral:
 # the model locked onto `]<]minimax[>[ grep -n '...'` and re-emitted it
 # hundreds of times — a bare-marker+shell-command shape no tag/JSON detector
@@ -1818,12 +1767,7 @@ _STOP_NONCE = {"value": None}
 # swaps its next SAMPLED token for EOS inside the existing sampled-token
 # sync; both ranks receive EOS through the collective they already run and
 # end the generation identically, with zero new collectives.
-_FORCE_EOS = {
-    "active": False,
-    "eos_id": None,
-    "reason": None,
-    "token_index": None,
-}
+_FORCE_EOS = {"active": False, "eos_id": None}
 
 
 def _arm_rank0_semantic_eos(rank, reason, token_index):
@@ -1862,8 +1806,6 @@ def _arm_rank0_semantic_eos(rank, reason, token_index):
             token_index,
         )
         _FORCE_EOS["active"] = True
-        _FORCE_EOS["reason"] = str(reason or "semantic_stop")
-        _FORCE_EOS["token_index"] = int(token_index or 0)
     return True
 
 # Rank-0 op-channel mutex: _bcast frames each op as bare size+payload
@@ -6669,41 +6611,6 @@ def _reset_prompt_cache_on_all_ranks(rank, reason="reset", *, clear_memory=False
                             clear_resident=clear_resident)
 
 
-def _checkpoint_prompt_cache_ssd_on_all_ranks(rank, model, processor, reason):
-    """Persist the exact distributed input prefix before a recovery reset.
-
-    Long native-tool retries intentionally release RAM KV to avoid retaining
-    two large generation graphs on the 128GB rank. Saving the already-trimmed
-    input prefix first lets the retry restore that exact state instead of
-    reprocessing tens of thousands of otherwise-hot tokens.
-    """
-    if not PROMPT_CACHE_SSD_ENABLED:
-        return False
-    if rank == 0:
-        try:
-            _bcast({"op": "prompt_cache_ssd_save", "reason": reason}, rank)
-        except Exception as e:
-            logger.warning(
-                "prompt-cache SSD recovery checkpoint broadcast failed (%s): %s",
-                reason,
-                e,
-            )
-            return False
-    with _prompt_cache_lock:
-        _prompt_cache_make_ssd_checkpoint_unlocked(reason=reason)
-        saved = _prompt_cache_ssd_save_current_unlocked(
-            model,
-            processor,
-            reason=reason,
-        )
-    if not saved:
-        logger.warning(
-            "prompt-cache SSD recovery checkpoint was not saved (%s)",
-            reason,
-        )
-    return bool(saved)
-
-
 def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
                           reason="prewarm", session_id=None,
                           session_source=None,
@@ -7720,12 +7627,6 @@ def _generation_defaults_status():
         "tool_stream_progress_seconds": TOOL_STREAM_PROGRESS_SECONDS,
         "tool_thinking_runaway_token_budget": (
             TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
-        ),
-        "tool_thinking_runaway_long_context_tokens": (
-            TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS
-        ),
-        "tool_thinking_runaway_long_context_budget": (
-            TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET
         ),
         "tool_unusable_retry_attempts": TOOL_UNUSABLE_RETRY_ATTEMPTS,
         "tool_unusable_retry_max_tokens": TOOL_UNUSABLE_RETRY_MAX_TOKENS,
@@ -12843,49 +12744,6 @@ def _tool_retry_messages(processed_messages, recovery_hint):
     ]
 
 
-def _tool_runaway_recovery_hint(tools, *, action_intent=False):
-    advertised = [
-        _tool_function_name(tool)
-        for tool in (tools or [])
-        if _tool_function_name(tool)
-    ]
-    available = ", ".join(f"`{name}`" for name in advertised[:24])
-    if action_intent:
-        return (
-            "Tool-call recovery: the previous attempt remained in hidden "
-            "reasoning after promising a concrete action. Emit exactly one "
-            f"complete next tool call now using one of: {available}. Do not "
-            "continue planning or narrate the action."
-        )
-    return (
-        "Recovery: the previous attempt remained in hidden reasoning for too "
-        "long. Finish this turn concisely. Emit one complete advertised tool "
-        "call if an action is needed; otherwise provide the final answer. Do "
-        "not restart or repeat the plan."
-    )
-
-
-def _tool_runaway_promised_action(text):
-    """Inspect hidden reasoning only after the runaway guard has fired.
-
-    Normal native turns deliberately never classify private reasoning as a
-    required action. Once a synchronized runaway stop has already occurred,
-    however, an unfinished "let me write/run/read" promise is useful evidence
-    for bounding the single recovery retry before another planning loop.
-    """
-    source = str(text or "")
-    hidden = source
-    for marker in ("</mm:think>", "</think>"):
-        if marker in hidden:
-            hidden = hidden.rsplit(marker, 1)[0]
-    for marker in ("<mm:think>", "<think>"):
-        hidden = hidden.replace(marker, "")
-    return bool(
-        _tool_intent_without_call(hidden)
-        or _tool_intent_without_call(source)
-    )
-
-
 def _tool_retry_prefix_safety(original_token_ids, retry_token_ids, *,
                               min_context_tokens=8192,
                               min_reuse_ratio=0.50):
@@ -13156,8 +13014,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                              session_source, tool_module, tools,
                              processed_messages, req_id, stream,
                              should_abort=None, progress_cb=None,
-                             action_tool_task=False,
-                             semantic_stop_reason=None):
+                             action_tool_task=False):
     """Regenerate an unusable tool turn in place instead of falling back.
 
     MiniMax occasionally emits empty or malformed tool markup, especially in
@@ -13186,13 +13043,6 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
     native_unusable_retry = bool(
         not TOOL_COMPAT_OVERLAY
         and NATIVE_TOOL_ACTION_RETRY_ATTEMPTS > 0
-    )
-    runaway_recovery = str(semantic_stop_reason or "") in {
-        "thinking_runaway",
-        "tool_no_call",
-    }
-    runaway_action_recovery = bool(
-        runaway_recovery and _tool_runaway_promised_action(full_output)
     )
     if not (
         tools
@@ -13323,18 +13173,11 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             logged_no_think_recovery = True
         retry_prompt = prompt
         retry_token_ids = token_ids
-        recovery_hint = (
-            _tool_runaway_recovery_hint(
-                tools,
-                action_intent=runaway_action_recovery,
-            )
-            if runaway_recovery
-            else _tool_retry_recovery_hint(
-                full_output,
-                tool_module,
-                tools,
-                processed_messages,
-            )
+        recovery_hint = _tool_retry_recovery_hint(
+            full_output,
+            tool_module,
+            tools,
+            processed_messages,
         )
         if recovery_hint and not image_path:
             try:
@@ -13361,7 +13204,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 )
                 logger.warning(
                     "[rank 0] %s %s tool retry %d using targeted "
-                    "recovery guidance (%d prompt tokens, "
+                    "large-write recovery guidance (%d prompt tokens, "
                     "prefix=%d, reuse=%.4f)",
                     label,
                     req_id,
@@ -13407,14 +13250,9 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
         retry_request["thinking_mode"] = retry_thinking_mode
         retry_request["prompt"] = retry_prompt
         retry_request["token_ids"] = retry_token_ids
-        retry_action_tool_task = bool(
-            action_tool_task or runaway_action_recovery
-        )
-        retry_request["action_tool_task"] = retry_action_tool_task
-        retry_request["require_tool_call"] = require_call
         retry_no_call_budget = _tool_retry_no_call_budget(
             retry_thinking_mode,
-            action_tool_task=retry_action_tool_task,
+            action_tool_task=action_tool_task,
             require_call=require_call,
         )
         retry_request["no_call_token_budget"] = retry_no_call_budget
@@ -13426,7 +13264,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             attempt,
             retry_no_call_budget,
             retry_thinking_mode,
-            bool(retry_action_tool_task),
+            bool(action_tool_task),
             bool(require_call),
         )
         retry_ram_reset_reason = (
@@ -13438,27 +13276,6 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
             else None
         )
         if retry_ram_reset_reason:
-            if (
-                runaway_recovery
-                and retry_ram_reset_reason.startswith("long_context:")
-            ):
-                checkpoint_reason = (
-                    "native tool runaway recovery checkpoint:"
-                    f"{req_id}"
-                )
-                checkpoint_saved = _checkpoint_prompt_cache_ssd_on_all_ranks(
-                    rank,
-                    model,
-                    processor,
-                    checkpoint_reason,
-                )
-                logger.warning(
-                    "[rank 0] %s %s exact prefix checkpoint before retry "
-                    "reset: saved=%s",
-                    label,
-                    req_id,
-                    checkpoint_saved,
-                )
             logger.warning(
                 "[rank 0] %s %s tool retry %d releasing active distributed "
                 "RAM KV before recovery (%s); preserving SSD checkpoints",
@@ -13499,7 +13316,7 @@ def _ensure_usable_tool_turn(model, processor, rank, *, full_output,
                 "tool_module": tool_module,
                 "tools": tools,
                 "require_tool_call": require_call,
-                "action_tool_task": retry_action_tool_task,
+                "action_tool_task": action_tool_task,
                 "no_call_token_budget": retry_no_call_budget,
             }
             if retry_request.get("mirror_stream_consumer"):
@@ -16810,8 +16627,6 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     # /v1/stop poisoned every later non-stream request into an instant-EOS
     # empty reply ("generation complete: 0 chars", found 2026-07-07).
     _FORCE_EOS["active"] = False
-    _FORCE_EOS["reason"] = None
-    _FORCE_EOS["token_index"] = None
     _refresh_generation_stream()
 
     multimodal_context = None
@@ -16942,7 +16757,10 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     raw_tool_fragment_tokens = 0
     tool_detokenizer_silent_tokens = 0
     stopped = False
-    runaway_budget = _thinking_runaway_budget_for_request(tools, token_ids)
+    runaway_budget = (
+        TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+        if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+    )
     if no_call_token_budget is not None:
         no_call_budget = max(0, int(no_call_token_budget))
     else:
@@ -17065,12 +16883,8 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         n,
                         "; tool turn" if tools else "",
                     )
-                    if _arm_rank0_semantic_eos(
-                        rank,
-                        "thinking_runaway",
-                        n,
-                    ):
-                        stopped = True
+                    _FORCE_EOS["active"] = True
+                    stopped = True
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
                         and tools
@@ -17379,8 +17193,6 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     # /v1/stop poisoned every later non-stream request into an instant-EOS
     # empty reply ("generation complete: 0 chars", found 2026-07-07).
     _FORCE_EOS["active"] = False
-    _FORCE_EOS["reason"] = None
-    _FORCE_EOS["token_index"] = None
     _refresh_generation_stream()
 
     multimodal_context = None
@@ -17527,7 +17339,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     tool_detokenizer_silent_tokens = 0
     tool_complete_seen = False
     thinking_active = _enable_thinking_for_generation(thinking_mode)
-    runaway_budget = _thinking_runaway_budget_for_request(tools, token_ids)
+    runaway_budget = (
+        TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
+        if tools else THINKING_RUNAWAY_TOKEN_BUDGET
+    )
     if no_call_token_budget is not None:
         no_call_budget = max(0, int(no_call_token_budget))
     else:
@@ -17653,12 +17468,8 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         n,
                         "; tool turn" if tools else "",
                     )
-                    if _arm_rank0_semantic_eos(
-                        rank,
-                        "thinking_runaway",
-                        n,
-                    ):
-                        stopped = True
+                    _FORCE_EOS["active"] = True
+                    stopped = True
                 if (rank == 0 and _BATCH_PATH_ACTIVE["value"]
                         and not _FORCE_EOS["active"]
                         and tools
@@ -20742,7 +20553,6 @@ def run_http_server(model, processor, rank):
                     reasoning_chars = 0
                     content_chars = 0
                     generation_cancelled = False
-                    semantic_stop_reason = None
                     rank_request_broadcast = False
                     op_channel_held = False
                     tool_stream_pending = ""      # live tool-turn content awaiting holdback release
@@ -20763,8 +20573,6 @@ def run_http_server(model, processor, rank):
                         _clear_prefill_stop_file("rank 0 stream generation start")
                         _STOP_NONCE["value"] = rank_request.get("stop_nonce")
                         _FORCE_EOS["active"] = False
-                        _FORCE_EOS["reason"] = None
-                        _FORCE_EOS["token_index"] = None
                         request_start_keepwarm(req_id)
                         _bcast(rank_request, rank)
                         rank_request_broadcast = True
@@ -21058,7 +20866,6 @@ def run_http_server(model, processor, rank):
                                              "finish_reason": None}],
                             })
 
-                        semantic_stop_reason = _FORCE_EOS.get("reason")
                         # Generation complete. Parse tool calls from full output.
                         if generation_cancelled or _user_stop_requested(req_id):
                             # A cancelled distributed decode can leave one
@@ -21124,7 +20931,6 @@ def run_http_server(model, processor, rank):
                                 ),
                                 progress_cb=_retry_progress,
                                 action_tool_task=action_tool_task,
-                                semantic_stop_reason=semantic_stop_reason,
                             )
                         tool_calls, remaining_text = _parse_tool_calls(
                             full_output, tool_module, tools
@@ -21705,8 +21511,6 @@ def run_http_server(model, processor, rank):
                     _clear_prefill_stop_file("rank 0 non-stream generation start")
                     _STOP_NONCE["value"] = rank_request.get("stop_nonce")
                     _FORCE_EOS["active"] = False
-                    _FORCE_EOS["reason"] = None
-                    _FORCE_EOS["token_index"] = None
                     request_start_keepwarm(req_id)
                     _bcast(rank_request, rank)
                     rank_request_broadcast = True
@@ -21792,7 +21596,6 @@ def run_http_server(model, processor, rank):
                             require_tool_call=require_tool_call,
                             action_tool_task=action_tool_task,
                         )
-                    semantic_stop_reason = _FORCE_EOS.get("reason")
                     if tools and not _user_stop_requested(req_id):
                         result["text"] = _ensure_usable_tool_turn(
                             model, processor, rank,
@@ -21814,7 +21617,6 @@ def run_http_server(model, processor, rank):
                             should_abort=lambda: _user_stop_requested(req_id),
                             progress_cb=_progress,
                             action_tool_task=action_tool_task,
-                            semantic_stop_reason=semantic_stop_reason,
                         )
                 except Exception as e:
                     job_error = e
@@ -22271,8 +22073,6 @@ def run_mirror(model, processor, rank):
         _clear_prefill_stop_file("rank 1 new request")
         _STOP_NONCE["value"] = req.get("stop_nonce")
         _FORCE_EOS["active"] = False
-        _FORCE_EOS["reason"] = None
-        _FORCE_EOS["token_index"] = None
         import m3_eagle3 as _m3e3
         _m3e3.REQUEST_ACTIVE["value"] = bool(req.get("eagle3"))
 

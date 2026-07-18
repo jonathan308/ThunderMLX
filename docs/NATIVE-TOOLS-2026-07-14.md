@@ -13,7 +13,7 @@ return an ordinary tool error. It does not rewrite paths, invent required
 fields, truncate write payloads, suppress repeated mutations, or replace a
 client tool with a synthesized command.
 
-Four narrow reliability rules remain around the native path:
+Three narrow reliability rules remain around the native path:
 
 1. An unclosed outer `<tool_call>` is never exposed as a partial call. A closed
    inner invoke does not make an abandoned Write atomic.
@@ -25,10 +25,6 @@ Four narrow reliability rules remain around the native path:
    the server permits one cache-friendly continuation using the same model,
    template, tools, and thinking mode. Successful native turns never enter
    this path.
-4. A tool-bearing turn above 65,536 prompt tokens that remains entirely in
-   hidden reasoning is stopped after 3,072 generated tokens. Before the one
-   bounded recovery retry releases RAM KV, both ranks save the exact input
-   prefix to SSD so the retry can restore it without a full cold prefill.
 
 ## Root Cause
 
@@ -53,33 +49,23 @@ cache-clear paths remove both historical cache attribute names.
 Neither fix changes the pipeline split, JACCL/RDMA transport, model weights,
 prefill kernels, cache format, or ordinary chat decode profile.
 
-### Long-context recovery addendum, 2026-07-17
-
-A 146,778-token ZCode turn reproduced a separate model-level failure: cache
-reuse and both distributed ranks remained healthy, but MiniMax generated
-12,288 hidden-thinking tokens without visible content or a complete tool call.
-The old recovery then released the valid hot prefix before retrying, forcing a
-large rebuild and increasing memory pressure.
-
-The repaired transaction records why synchronized EOS was armed, trims back to
-the exact request prefix, checkpoints that prefix on both ranks, releases only
-live RAM KV, and starts one focused retry. If the stopped reasoning already
-promised a concrete action, that decision is carried into the mirrored retry;
-normal native turns and valid visible answers never enter this path.
-
 ## Production Defaults
 
 ```bash
 MLX_M3_TOOL_COMPAT_OVERLAY=0
 MLX_M3_NATIVE_TOOL_ACTION_RETRY_ATTEMPTS=1
-MLX_M3_NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS=65536
-MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET=12288
-MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS=65536
-MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET=3072
+MLX_M3_THINKING_RUNAWAY_TOKEN_BUDGET=0
+MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET=0
 MLX_M3_DECODE_TOPK_REUSE_TOKENS=48
 MLX_M3_TOOL_DECODE_TOPK_REUSE_TOKENS=0
 MLX_M3_TOOL_PARSE_DIAGNOSTICS=0
 ```
+
+Hidden-reasoning token cutoffs remain diagnostic opt-ins. The model cannot
+observe a server-side cutoff, and forcing EOS during distributed batched decode
+can interrupt an otherwise valid native tool transition. Production therefore
+lets the model finish thinking naturally and relies on the request ceiling,
+explicit client cancellation, and the distributed watchdog for bounded work.
 
 `MLX_M3_TOOL_PARSE_DIAGNOSTICS=1` is a privacy-sensitive local debugging mode.
 It may capture raw model output under ignored `ops/logs/` files and must not be
@@ -105,13 +91,6 @@ All tests used the reference two-rank `38,22` Thunderbolt/JACCL cluster.
   finished with 7/7 tests passing. Thinking repeated the workflow in an
   isolated project, added type hints through a focused edit, and finished with
   8/8 tests passing. Both artifacts were independently retested afterward.
-- A fresh thinking ZCode goal ran for 15m49s and created a 1,105-line Python
-  package through native Explore, TodoWrite, Write, Read, Edit, and Bash calls.
-  It completed several 120-273-line writes, repaired two test failures with
-  focused edits, and passed 42/42 tests. ZCode then compacted the 36,575-token
-  conversation successfully, continued for another eight minutes, made four
-  post-compaction edits, and passed 46/46 tests plus a CLI smoke test. The
-  server failure counter did not change and both ranks returned idle.
 - Four alternating extended Claude Code suites ran for about ten minutes,
   added 56 successful inference requests, exercised long Read/Bash/Edit/Write
   loops, and left the failure counter and generation lock unchanged.
