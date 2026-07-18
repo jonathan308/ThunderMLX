@@ -108,6 +108,53 @@ def check_models_hide_omlx_m3_directory_alias():
     assert "mlx-community--MiniMax-M3-4bit" not in model_ids, model_ids
 
 
+def check_m3_tool_turns_get_a_safe_output_floor():
+    tool = {
+        "type": "function",
+        "function": {
+            "name": "file_editor",
+            "description": "Edit a file",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+    body, model, changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3",
+            "messages": [{"role": "user", "content": "Create a large PDF."}],
+            "tools": [tool],
+            "max_completion_tokens": 8192,
+        }).encode("utf-8")
+    )
+    payload = json.loads(body)
+    assert model == "Minimax-M3", (model, payload)
+    assert changed is True, payload
+    assert payload["max_completion_tokens"] == 16384, payload
+    assert "max_tokens" not in payload, payload
+
+    no_tool_body, _, no_tool_changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3",
+            "messages": [{"role": "user", "content": "Write a short answer."}],
+            "max_completion_tokens": 8192,
+        }).encode("utf-8")
+    )
+    no_tool_payload = json.loads(no_tool_body)
+    assert no_tool_changed is False, no_tool_payload
+    assert no_tool_payload["max_completion_tokens"] == 8192, no_tool_payload
+
+    large_body, _, large_changed = normalize_openai_json_body(
+        json.dumps({
+            "model": "Minimax-M3-No-Think",
+            "messages": [{"role": "user", "content": "Edit the project."}],
+            "tools": [tool],
+            "max_tokens": 32768,
+        }).encode("utf-8")
+    )
+    large_payload = json.loads(large_body)
+    assert large_changed is False, large_payload
+    assert large_payload["max_tokens"] == 32768, large_payload
+
+
 def check_zcode_title_sidecar_is_short_and_visible():
     body, model, changed = normalize_openai_json_body(
         json.dumps({
@@ -573,6 +620,7 @@ def main():
     check_explicit_omlx_model_is_preserved()
     check_m3_case_and_path_aliases_are_canonicalized()
     check_models_hide_omlx_m3_directory_alias()
+    check_m3_tool_turns_get_a_safe_output_floor()
     check_zcode_title_sidecar_is_short_and_visible()
     check_opencode_title_sidecar_is_short_streaming_and_single()
     check_zcode_goal_verifier_is_short_no_think_and_preserves_context()
