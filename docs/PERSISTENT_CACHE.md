@@ -132,7 +132,7 @@ be different if you change the split, hardware, or storage layout.
 - model id and model path hash
 - tokenizer/chat-template hash
 - sharding mode, rank count, rank id, and `M3_PIPELINE_LAYERS`
-- MLX/MLX-VLM overlay version or git commit
+- MLX/MLX-VLM versions plus the explicit cache ABI and tensor-layout module hashes
 - prompt token count, cache length, token-id hash, and optional token-id tail hash
 - cache class names and tensor shapes/dtypes
 - created/last-access timestamps
@@ -183,6 +183,16 @@ Never restore a durable cache unless all gates pass:
 - tensor shapes and dtypes match the cache class metadata
 - token-id hash matches the new prompt prefix
 - requested prompt length is at least the stored prefix length
+
+The cache ABI is intentionally narrower than the full server source hash. API,
+tool-parser, dashboard, and telemetry edits do not change KV tensor layout and
+therefore do not invalidate every saved session. Any incompatible serialization
+or restore change must increment `PROMPT_CACHE_SSD_SCHEMA_VERSION` or
+`PROMPT_CACHE_SSD_ABI_VERSION`; model/runtime, cache implementation modules,
+cache classes, layer shapes/dtypes, split, rank count, and token hashes remain
+strict restore gates. Legacy schema-v3 artifacts that differ only by the former
+whole-file `sharded_server.py` hash are migrated after all substantive gates
+pass.
 - restored cache length agrees across both ranks
 
 If any gate fails, log the reason, mark the manifest entry `rehydratable=false`,
@@ -300,9 +310,9 @@ run its `restore` phase against the same session id and state file.
   exercised the bounded 4k internal tool-recovery budget; the capacity probe
   distinguishes that explicit bound from the rejected behavior that reserved
   the full 32k global output ceiling. Both modes ended with zero failures.
-- The final safety patch changed the runtime fingerprint, so older durable
-  artifacts may safely miss with a runtime mismatch. Rebuild/save under the
-  current fingerprint when you need a specific long session to restore from SSD.
+- Runtime changes that affect the cache ABI, model, tokenizer/template, MLX
+  versions, MSA/cache modules, split, or rank topology safely miss. Unrelated
+  server edits no longer invalidate otherwise compatible schema-v3 artifacts.
 - `--cancel-after-restore` runs a stop smoke after restore when the deployment
   has synchronized in-flight stop enabled. The reference profile enables the
   nonce-coordinated safe stop; portable defaults may leave it gated until the
