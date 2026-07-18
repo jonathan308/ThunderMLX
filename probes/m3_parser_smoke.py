@@ -32,6 +32,8 @@ os.environ.setdefault("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "768")
 os.environ.setdefault("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "1536")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_MAX_CHARS", "6000")
 os.environ.setdefault("MLX_M3_TOOL_WRITE_CHUNK_TARGET_CHARS", "4096")
+os.environ.setdefault("MLX_M3_NATIVE_TOOL_LOOP_STEERING", "1")
+os.environ.setdefault("MLX_M3_NATIVE_TOOL_LOOP_IDENTICAL_RESULTS", "3")
 
 import sharded_server as server
 
@@ -58,6 +60,8 @@ from sharded_server import (
     _incomplete_tool_call_budget_reached,
     _looks_like_tool_compat_fallback_content,
     _model_facing_tool_schemas,
+    _native_tool_loop_steering_diag,
+    _append_native_tool_loop_steer,
     _remember_assistant_reasoning,
     _tool_request_fallback_content,
     _tool_intent_without_call,
@@ -67,6 +71,7 @@ from sharded_server import (
     _tool_retry_prefers_no_think,
     _tool_retry_thinking_mode,
     _tool_retry_recovery_hint,
+    _tool_stream_progress_delta,
     _tool_choice_validation_error,
     _tools_from_request,
     _single_apply_patch_fast_recovery,
@@ -275,6 +280,36 @@ def check_stream_analysis_channel():
             content_out.append(delta_content)
     assert "check cache" in "".join(reasoning_out), reasoning_out
     assert "final answer" in "".join(content_out), content_out
+
+
+def check_buffered_tool_stream_progress_is_client_visible():
+    interval = server.TOOL_STREAM_PROGRESS_SECONDS
+    assert interval > 0, interval
+    delta, pulse_at = _tool_stream_progress_delta(
+        has_tools=True,
+        now=interval + 1,
+        last_payload_at=0,
+        last_progress_pulse_at=0,
+    )
+    assert delta.get("reasoning_content"), delta
+    assert pulse_at == interval + 1, pulse_at
+
+    quiet, unchanged = _tool_stream_progress_delta(
+        has_tools=True,
+        now=interval + 2,
+        last_payload_at=0,
+        last_progress_pulse_at=pulse_at,
+    )
+    assert quiet == {}, quiet
+    assert unchanged == pulse_at, unchanged
+
+    no_tools, _ = _tool_stream_progress_delta(
+        has_tools=False,
+        now=interval * 2,
+        last_payload_at=0,
+        last_progress_pulse_at=0,
+    )
+    assert no_tools == {}, no_tools
 
 
 def check_unknown_channel_does_not_buffer_forever():
@@ -2200,6 +2235,124 @@ def check_soft_tool_loop_steering_preserves_tools():
     assert patched[-1]["role"] == "system", patched
     assert "Tools remain available" in patched[-1]["content"], patched[-1]
     assert "tool-call format" in patched[-1]["content"], patched[-1]
+
+
+def check_native_identical_tool_loop_steers_without_stopping():
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in ("Read", "Write")
+    ]
+
+    def add_pair(messages, index, name, arguments, result):
+        call_id = f"call-{index}"
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments,
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": result,
+            },
+        ])
+
+    looped = [{"role": "user", "content": "Inspect and repair the app."}]
+    for index, result in enumerate(("same output", "same\noutput", "same output")):
+        add_pair(
+            looped,
+            index,
+            "Read",
+            {"file_path": "/tmp/app.py"},
+            result,
+        )
+    previous_overlay = server.TOOL_COMPAT_OVERLAY
+    previous_hint = server.TOOL_SYSTEM_HINT_ENABLED
+    try:
+        server.TOOL_COMPAT_OVERLAY = False
+        server.TOOL_SYSTEM_HINT_ENABLED = False
+        diag = _native_tool_loop_steering_diag(looped, tools)
+    finally:
+        server.TOOL_COMPAT_OVERLAY = previous_overlay
+        server.TOOL_SYSTEM_HINT_ENABLED = previous_hint
+    assert diag and diag["repeated_pair_count"] == 3, diag
+    assert diag["force_final"] is False, diag
+    assert diag["filtered_tools"] == [], diag
+    tools_before = json.dumps(tools, sort_keys=True)
+    patched = _append_native_tool_loop_steer(looped, diag)
+    assert patched[-1]["role"] == "user", patched[-1]
+    assert "Do not stop or abandon" in patched[-1]["content"], patched[-1]
+    assert "All provided tools remain available" in patched[-1]["content"], patched[-1]
+    assert "Check whether this repetition is accidental" in patched[-1]["content"], patched[-1]
+    assert json.dumps(tools, sort_keys=True) == tools_before
+
+    distinct_writes = [{"role": "user", "content": "Build three files."}]
+    for index in range(3):
+        add_pair(
+            distinct_writes,
+            index,
+            "Write",
+            {
+                "file_path": f"/tmp/file-{index}.txt",
+                "content": ("x" * 700) + str(index),
+            },
+            "ok",
+        )
+    assert _native_tool_loop_steering_diag(distinct_writes, tools) is None
+
+    changing_results = [{"role": "user", "content": "Wait for the build."}]
+    for index in range(3):
+        add_pair(
+            changing_results,
+            index,
+            "Read",
+            {"file_path": "/tmp/status"},
+            f"progress {index}",
+        )
+    assert _native_tool_loop_steering_diag(changing_results, tools) is None
+
+    separated = [{"role": "user", "content": "Inspect both files."}]
+    add_pair(separated, 0, "Read", {"file_path": "/tmp/a"}, "same")
+    add_pair(separated, 1, "Read", {"file_path": "/tmp/a"}, "same")
+    add_pair(separated, 2, "Read", {"file_path": "/tmp/b"}, "different")
+    add_pair(separated, 3, "Read", {"file_path": "/tmp/a"}, "same")
+    assert _native_tool_loop_steering_diag(separated, tools) is None
+
+    client_continuation = (
+        "<system-reminder>Continue the active tool round.</system-reminder>"
+    )
+    with_client_continuation = list(looped)
+    with_client_continuation.append({
+        "role": "user",
+        "content": client_continuation,
+    })
+    diag = _native_tool_loop_steering_diag(
+        with_client_continuation,
+        tools,
+    )
+    assert diag and diag["repeated_pair_count"] == 3, diag
+    assert diag["ignored_client_continuations"] == 1, diag
+
+    genuine_user_steer = list(looped)
+    genuine_user_steer.append({
+        "role": "user",
+        "content": "Stop polling that file and inspect /tmp/other instead.",
+    })
+    assert _native_tool_loop_steering_diag(genuine_user_steer, tools) is None
 
 
 def _repeated_named_tool_messages(tool_name, count):
@@ -5168,6 +5321,8 @@ def main():
     check_thinking_action_retry_is_not_clipped_at_focused_budget()
     check_file_cleanup_promise_requires_a_tool_call()
     check_stream_analysis_channel()
+    check_buffered_tool_stream_progress_is_client_visible()
+    check_native_identical_tool_loop_steers_without_stopping()
     check_unknown_channel_does_not_buffer_forever()
     check_image_generations_bypass_text_prompt_cache()
     check_malformed_positional_xml_tool_call_recovers()
