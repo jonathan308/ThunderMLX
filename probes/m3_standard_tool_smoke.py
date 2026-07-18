@@ -23,15 +23,7 @@ os.environ.setdefault("MLX_M3_TOOL_COMPAT_OVERLAY", "0")
 os.environ.setdefault("MLX_M3_TOOL_SYSTEM_HINT", "0")
 os.environ.setdefault("MLX_M3_TOOL_STREAM_BUFFER_ALL", "0")
 os.environ.setdefault("MLX_M3_TOOL_STREAM_CONTENT", "1")
-os.environ.setdefault("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "12288")
-os.environ.setdefault(
-    "MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS",
-    "65536",
-)
-os.environ.setdefault(
-    "MLX_M3_TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET",
-    "3072",
-)
+os.environ.setdefault("MLX_M3_TOOL_THINKING_RUNAWAY_TOKEN_BUDGET", "0")
 os.environ.setdefault("MLX_M3_TOOL_NO_CALL_TOKEN_BUDGET", "0")
 os.environ.setdefault("MLX_M3_TOOL_ACTION_NO_CALL_TOKEN_BUDGET", "0")
 
@@ -41,15 +33,12 @@ import sharded_server as server
 from sharded_server import (
     NATIVE_TOOL_ACTION_RETRY_ATTEMPTS,
     NATIVE_TOOL_ACTION_RETRY_RAM_RESET_TOKENS,
-    THINKING_RUNAWAY_TOKEN_BUDGET,
     TOOL_ACTION_NO_CALL_TOKEN_BUDGET,
     TOOL_COMPAT_OVERLAY,
     TOOL_NO_CALL_TOKEN_BUDGET,
     TOOL_STREAM_BUFFER_ALL,
     TOOL_STREAM_CONTENT,
     TOOL_SYSTEM_HINT_ENABLED,
-    TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET,
-    TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS,
     TOOL_THINKING_RUNAWAY_TOKEN_BUDGET,
     _parse_tool_calls,
     _native_tool_retry_ram_reset_reason,
@@ -351,150 +340,9 @@ def test_native_visible_final_does_not_force_tool_or_retry():
             req_id="native-final-smoke",
             stream=True,
             action_tool_task=False,
-            semantic_stop_reason="thinking_runaway",
         )
     assert output == final, output
     generate.assert_not_called()
-
-
-def test_long_context_tool_thinking_budget_is_adaptive():
-    tools = [{"type": "function"}]
-    assert (
-        server._thinking_runaway_budget_for_request([], [1] * 80_000)
-        == THINKING_RUNAWAY_TOKEN_BUDGET
-    )
-    assert (
-        server._thinking_runaway_budget_for_request(tools, [1] * 65_535)
-        == TOOL_THINKING_RUNAWAY_TOKEN_BUDGET
-    )
-    assert (
-        server._thinking_runaway_budget_for_request(tools, [1] * 65_536)
-        == TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET
-    )
-    assert server._tool_runaway_promised_action(
-        "<mm:think>The next step is clear. Let me edit the layout now."
-        "</mm:think>]<]minimax[>[<tool_call><invoke name=\"Edit\">"
-    )
-
-
-def test_semantic_eos_records_recovery_reason():
-    with (
-        patch.dict(server._BATCH_PATH_ACTIVE, {"value": True}),
-        patch.dict(
-            server._FORCE_EOS,
-            {
-                "active": False,
-                "eos_id": 2,
-                "reason": None,
-                "token_index": None,
-            },
-            clear=True,
-        ),
-    ):
-        assert server._arm_rank0_semantic_eos(0, "thinking_runaway", 3072)
-        assert server._FORCE_EOS == {
-            "active": True,
-            "eos_id": 2,
-            "reason": "thinking_runaway",
-            "token_index": 3072,
-        }
-
-
-def test_long_context_runaway_checkpoints_before_ram_retry():
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "Bash",
-            "description": "Run a shell command.",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-            },
-        },
-    }]
-    recovered = (
-        f"{NS}<tool_call>"
-        f'{NS}<invoke name="Bash">'
-        f"{NS}<command>pwd{NS}</command>"
-        f"{NS}</invoke>{NS}</tool_call>"
-    )
-    original_ids = [1] * 65_536
-    retry_ids = original_ids + [2, 3, 4]
-    events = []
-
-    def checkpoint(*_args, **_kwargs):
-        events.append("checkpoint")
-        return True
-
-    def reset(*_args, **_kwargs):
-        events.append("reset")
-
-    with (
-        patch.object(server, "_bcast") as broadcast,
-        patch.object(server, "_clear_stop_request"),
-        patch.object(server, "_clear_prefill_stop_file"),
-        patch.object(server, "_render_tool_retry_prompt", return_value="retry"),
-        patch.object(server, "_tokenize_prompt", return_value=retry_ids),
-        patch.object(
-            server,
-            "_checkpoint_prompt_cache_ssd_on_all_ranks",
-            side_effect=checkpoint,
-        ) as save,
-        patch.object(
-            server,
-            "_reset_prompt_cache_on_all_ranks",
-            side_effect=reset,
-        ) as clear,
-        patch.object(server, "run_generation", return_value=recovered) as generate,
-    ):
-        output = server._ensure_usable_tool_turn(
-            object(),
-            object(),
-            0,
-            full_output=(
-                "<mm:think>I have enough context. Let me run the project "
-                "checks now."
-            ),
-            rank_request={"tool_choice": "auto"},
-            prompt="prompt",
-            max_tokens=16384,
-            thinking_mode="enabled",
-            gen_params={"temperature": 0.0},
-            image_path=None,
-            token_ids=original_ids,
-            session_id="long-runaway-retry-smoke",
-            session_source="test",
-            tool_module=minimax_m3,
-            tools=tools,
-            processed_messages=[{
-                "role": "user",
-                "content": "Inspect the project and run its tests.",
-            }],
-            req_id="long-runaway-retry-smoke",
-            stream=True,
-            action_tool_task=False,
-            semantic_stop_reason="thinking_runaway",
-        )
-    assert output == recovered, output
-    assert events == ["checkpoint", "reset"], events
-    save.assert_called_once()
-    clear.assert_called_once_with(
-        0,
-        reason=(
-            "native tool retry RAM reset:"
-            "long_context:65539>=65536"
-        ),
-        clear_memory=True,
-        clear_manifest=False,
-        clear_resident=False,
-    )
-    assert generate.call_count == 1, generate.call_count
-    assert broadcast.call_count == 1, broadcast.call_count
-    retry_request = broadcast.call_args.args[0]
-    assert retry_request["thinking_mode"] == "enabled", retry_request
-    assert retry_request["action_tool_task"] is True, retry_request
-    assert retry_request["no_call_token_budget"] == 384, retry_request
 
 
 def test_native_incomplete_call_after_tool_result_gets_one_retry():
@@ -843,9 +691,7 @@ def main():
     assert TOOL_SYSTEM_HINT_ENABLED is False
     assert TOOL_STREAM_BUFFER_ALL is False
     assert TOOL_STREAM_CONTENT is True
-    assert TOOL_THINKING_RUNAWAY_TOKEN_BUDGET == 12288
-    assert TOOL_THINKING_RUNAWAY_LONG_CONTEXT_TOKENS == 65536
-    assert TOOL_THINKING_RUNAWAY_LONG_CONTEXT_BUDGET == 3072
+    assert TOOL_THINKING_RUNAWAY_TOKEN_BUDGET == 0
     assert TOOL_NO_CALL_TOKEN_BUDGET == 0
     assert TOOL_ACTION_NO_CALL_TOKEN_BUDGET == 0
     assert NATIVE_TOOL_ACTION_RETRY_ATTEMPTS == 1
@@ -899,9 +745,6 @@ def main():
     test_native_responses_style_to_attribute_recovers_exact_schema_name()
     test_native_reasoning_only_turn_gets_one_retry_without_classifier()
     test_native_visible_final_does_not_force_tool_or_retry()
-    test_long_context_tool_thinking_budget_is_adaptive()
-    test_semantic_eos_records_recovery_reason()
-    test_long_context_runaway_checkpoints_before_ram_retry()
     test_native_incomplete_call_after_tool_result_gets_one_retry()
     test_corrupt_long_native_retry_releases_only_live_ram_kv()
     test_tool_decode_reuse_override_is_request_scoped()
