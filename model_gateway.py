@@ -64,6 +64,14 @@ RESPONSES_LIVE_STREAM = env_bool("M3_GATEWAY_RESPONSES_LIVE", True)
 SSE_KEEPALIVE_SECONDS = max(
     0.0, float(os.environ.get("M3_GATEWAY_SSE_KEEPALIVE_SECONDS", "5") or "0")
 )
+# Some OpenAI-compatible agent clients default tool turns to 8,192 output
+# tokens. Large native tool arguments (for example, a generated document
+# script) can cross that boundary before the closing tool tag is emitted. Give
+# M3 tool turns enough room on their first pass instead of making the backend
+# discard and regenerate a truncated invocation.
+TOOL_MIN_MAX_TOKENS = max(
+    0, int(os.environ.get("M3_GATEWAY_TOOL_MIN_MAX_TOKENS", "16384") or "0")
+)
 SSE_STREAM_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
@@ -611,6 +619,22 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
             payload.pop("max_completion_tokens", None)
         payload["_metadata_request"] = "zcode_goal_verification"
         changed = True
+    elif canonical_m3 and TOOL_MIN_MAX_TOKENS > 0 and (
+        payload.get("tools") or payload.get("functions")
+    ):
+        # Preserve the client's chosen OpenAI token field and sampling. Only
+        # lift an explicit, undersized ceiling; requests without a ceiling keep
+        # the backend default, and non-tool chat remains untouched.
+        for key in ("max_tokens", "max_completion_tokens"):
+            if key not in payload or payload.get(key) is None:
+                continue
+            try:
+                requested_max = int(payload[key])
+            except (TypeError, ValueError):
+                continue
+            if 0 < requested_max < TOOL_MIN_MAX_TOKENS:
+                payload[key] = TOOL_MIN_MAX_TOKENS
+                changed = True
     if not changed:
         return body, model, False
     normalized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
