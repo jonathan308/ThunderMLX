@@ -1,0 +1,42 @@
+{
+ "started": "2026-07-19 15:32:30",
+ "points": [
+  {
+   "size": 50000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 118.09,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-c4a063de",
+     "elapsed": 116.9,
+     "first_token": 107.45,
+     "prompt_tps": 373.94,
+     "tokens": 231,
+     "tps": 1.98,
+     "decode_tps": 24.35
+    },
+    {
+     "rep": 1,
+     "wall": 10.25,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-c4161a1f",
+     "elapsed": 10.13,
+     "first_token": 0.64,
+     "prompt_tps": 86592.31,
+     "tokens": 234,
+     "tps": 23.1,
+     "decode_tps": 24.56
+    }
+   ]
+  }
+ ]
+}

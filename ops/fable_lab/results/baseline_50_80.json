@@ -1,0 +1,145 @@
+{
+ "started": "2026-07-19 11:57:26",
+ "points": [
+  {
+   "size": 50000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 125.51,
+     "tool_called": [],
+     "needle_ok": true,
+     "req": "chatcmpl-4b4af6b9",
+     "elapsed": 124.46,
+     "first_token": 111.54,
+     "prompt_tps": 358.96,
+     "tokens": 345,
+     "tps": 2.77,
+     "decode_tps": 26.61
+    },
+    {
+     "rep": 1,
+     "wall": 0.0,
+     "tool_called": [],
+     "needle_ok": true,
+     "req": "chatcmpl-4b4af6b9",
+     "elapsed": 124.46,
+     "first_token": 111.54,
+     "prompt_tps": 358.96,
+     "tokens": 345,
+     "tps": 2.77,
+     "decode_tps": 26.61
+    }
+   ]
+  },
+  {
+   "size": 50000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 128.4,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-673b6c86",
+     "elapsed": 128.28,
+     "first_token": 118.63,
+     "prompt_tps": 338.8,
+     "tokens": 221,
+     "tps": 1.72,
+     "decode_tps": 22.8
+    },
+    {
+     "rep": 1,
+     "wall": 0.0,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-673b6c86",
+     "elapsed": 128.28,
+     "first_token": 118.63,
+     "prompt_tps": 338.8,
+     "tokens": 221,
+     "tps": 1.72,
+     "decode_tps": 22.8
+    }
+   ]
+  },
+  {
+   "size": 50000,
+   "model": "Minimax-M3",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 130.48,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-87c5be2f",
+     "elapsed": 129.58,
+     "first_token": 108.58,
+     "prompt_tps": 366.97,
+     "tokens": 557,
+     "tps": 4.3,
+     "decode_tps": 26.48
+    },
+    {
+     "rep": 1,
+     "wall": 0.0,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-87c5be2f",
+     "elapsed": 129.58,
+     "first_token": 108.58,
+     "prompt_tps": 366.97,
+     "tokens": 557,
+     "tps": 4.3,
+     "decode_tps": 26.48
+    }
+   ]
+  },
+  {
+   "size": 50000,
+   "model": "Minimax-M3",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 128.9,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-3f7f51e1",
+     "elapsed": 128.78,
+     "first_token": 115.43,
+     "prompt_tps": 348.61,
+     "tokens": 305,
+     "tps": 2.37,
+     "decode_tps": 22.77
+    },
+    {
+     "rep": 1,
+     "wall": 0.0,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-3f7f51e1",
+     "elapsed": 128.78,
+     "first_token": 115.43,
+     "prompt_tps": 348.61,
+     "tokens": 305,
+     "tps": 2.37,
+     "decode_tps": 22.77
+    }
+   ]
+  }
+ ]
+}
