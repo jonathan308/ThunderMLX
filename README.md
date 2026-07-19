@@ -72,7 +72,9 @@ of real agentic use.
   `/v1/responses`** — codex connects directly, thinking renders as
   first-class reasoning items, tool calls stream as `function_call` items
 - 🧠 **Live thinking** — reasoning deltas stream token-by-token on every
-  wire, including during tool-bearing agent turns
+  wire, including during tool-bearing agent turns; complete standalone HTML
+  requests can recover a missing native thinking-close marker without ending
+  generation or moving final code into the reasoning channel
 - 🛠️ **Agent-grade tool calling** — native `mlx-vlm` tool emission first,
   OpenAI `tool_choice` auto/none/required/named semantics, parallel calls and
   streamed args, with narrowly evidenced repairs only for structurally invalid
@@ -96,6 +98,11 @@ of real agentic use.
   degenerate-output classifier, prefix-plan consensus (kills a whole class
   of RDMA wedges), self-healing generation locks, lifetime stats that
   persist across reboots
+
+The repeated-span classifier is an AntiDoom-inspired inference safeguard, not
+an FTPO-trained adapter. It ends only confirmed byte-identical decode spirals
+through synchronized EOS and does not alter normal token probabilities. See
+[docs/ANTIDOOM.md](docs/ANTIDOOM.md) for the exact distinction and controls.
 
 ## Client compatibility (certified)
 
@@ -146,6 +153,18 @@ added 56 clean inference requests in a ten-minute soak. OpenWebUI-shaped
 ordinary short decode remained `31.99 tok/s`. See
 [docs/NATIVE-TOOLS-2026-07-14.md](docs/NATIVE-TOOLS-2026-07-14.md) for the root
 cause, exact gates, and rollback knobs.
+
+The July 19 thinking-channel gate reproduced the complete Shadow Syntax
+single-file website failure and repaired it without a hidden reasoning cap.
+MiniMax now transitions from its own explicit implementation declaration to
+the final content channel by injecting the native `</mm:think>` token through
+the existing rank-0 sample synchronization. The exact prompt produced one
+complete 52k-character HTML document, streamed reasoning before content, and
+finished at 26.43 decode tok/s. Regression gates then passed native OpenAI,
+Anthropic, Codex Responses, Claude Code, ZCode, OpenCode, images, cancellation,
+hot and SSD cache, a true process restart, and a 200.5k-context soak. The final
+200.5k pass measured 309.14 cold prompt tok/s and 24.52 cached decode tok/s
+with 200,474/200,518 prompt tokens reused and no new failures.
 
 ## Quick Start
 

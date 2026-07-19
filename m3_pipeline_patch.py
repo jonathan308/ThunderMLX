@@ -451,6 +451,15 @@ def _install_rank0_token_sync(group):
         srv = _sys.modules.get("sharded_server")
         return getattr(srv, "_FORCE_EOS", None) if srv is not None else None
 
+    def _server_next_forced_token():
+        # Optional request-scoped semantic token injection (currently used to
+        # close MiniMax reasoning without ending generation). Resolve lazily
+        # for the same import-order reason as _server_force_eos().
+        import sys as _sys
+        srv = _sys.modules.get("sharded_server")
+        consume = getattr(srv, "_consume_rank0_forced_token", None)
+        return consume() if callable(consume) else None
+
     def _synced_sample_with_positions(*args, **kwargs):
         # Constrained tool decoding (rank0 only): mask logits before sampling;
         # the sampled token is folded into the automaton after the send-eval
@@ -479,6 +488,13 @@ def _install_rank0_token_sync(group):
                 # blocked in its h-send eval — the 20:18 stall signature.
                 eos = mx.full(y.shape, fe["eos_id"], dtype=y.dtype)
                 y = mx.depends(eos, y)
+            else:
+                forced_token_id = _server_next_forced_token()
+                if forced_token_id is not None:
+                    # Preserve the load-bearing forward dependency exactly as
+                    # the synchronized EOS path does, but keep decode alive.
+                    forced = mx.full(y.shape, forced_token_id, dtype=y.dtype)
+                    y = mx.depends(forced, y)
             sends = [
                 mx.distributed.send(y, dst, group=group, stream=mx.cpu)
                 for dst in range(1, group.size())
