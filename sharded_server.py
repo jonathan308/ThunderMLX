@@ -666,18 +666,47 @@ DEFAULT_REPETITION_PENALTY = float(
 TOOL_DEFAULT_REPETITION_PENALTY = float(
     os.environ.get("MLX_M3_TOOL_DEFAULT_REPETITION_PENALTY", "0") or "0"
 )
-# Thinking turns: a reasoning loop is a repetition spiral inside <mm:think>
-# (2026-07-09 hermes: 12.5k tokens of the same reasoning, never closing).
-# The same mild penalty that fixes tool spirals attacks the CAUSE, not just
-# the runaway-guard aftermath; plus a small temperature floor so a
-# near-greedy path (the classic 4-bit-quant loop attractor) has enough
-# entropy to escape. Both apply ONLY when thinking is enabled and the client
-# didn't set the value. 0 / negative disables each.
+# MiniMax-M3's published generation profile is temperature=1.0, top_p=0.95.
+# Keep it separate from the low-temperature no-think/tool profiles: Q4 long
+# reasoning became substantially more verbose at 0.5 + repetition_penalty=1.1
+# and exhausted the output ceiling, while the official profile completed the
+# same artifact cleanly. Explicit client values still win.
+THINKING_DEFAULT_TEMPERATURE = float(
+    os.environ.get("MLX_M3_THINKING_DEFAULT_TEMPERATURE", "1.0") or "1.0"
+)
+THINKING_DEFAULT_TOP_P = float(
+    os.environ.get("MLX_M3_THINKING_DEFAULT_TOP_P", "0.95") or "0.95"
+)
+THINKING_DEFAULT_TOP_K = int(
+    os.environ.get("MLX_M3_THINKING_DEFAULT_TOP_K", "0") or "0"
+)
+THINKING_DEFAULT_MIN_P = float(
+    os.environ.get("MLX_M3_THINKING_DEFAULT_MIN_P", "0.0") or "0.0"
+)
 THINKING_DEFAULT_REPETITION_PENALTY = float(
-    os.environ.get("MLX_M3_THINKING_DEFAULT_REPETITION_PENALTY", "1.05") or "1.05"
+    os.environ.get("MLX_M3_THINKING_DEFAULT_REPETITION_PENALTY", "1.0") or "1.0"
 )
 THINKING_MIN_TEMPERATURE = float(
     os.environ.get("MLX_M3_THINKING_MIN_TEMPERATURE", "0.5") or "0.5"
+)
+# MiniMax-M3 can occasionally begin a requested standalone HTML artifact
+# inside its native reasoning block and never emit </mm:think>.  When enabled,
+# transition at the model's own explicit implementation declaration instead of
+# truncating the response with EOS.  The close marker is sampled through the
+# existing rank-0 token synchronization, so both pipeline ranks consume the
+# identical token and normal generation continues in the content channel.
+THINKING_ARTIFACT_TRANSITION_ENABLED = os.environ.get(
+    "MLX_M3_THINKING_ARTIFACT_TRANSITION", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+THINKING_ARTIFACT_TRANSITION_MIN_TOKENS = max(
+    0,
+    int(
+        os.environ.get(
+            "MLX_M3_THINKING_ARTIFACT_TRANSITION_MIN_TOKENS",
+            "64",
+        )
+        or "64"
+    ),
 )
 # Tools to hide from the model (comma-separated). MiniMax-4bit reliably
 # invents its own patch dialects for apply_patch while its exec_command
@@ -1840,7 +1869,217 @@ _STOP_NONCE = {"value": None}
 # swaps its next SAMPLED token for EOS inside the existing sampled-token
 # sync; both ranks receive EOS through the collective they already run and
 # end the generation identically, with zero new collectives.
-_FORCE_EOS = {"active": False, "eos_id": None}
+_FORCE_EOS = {"active": False, "eos_id": None, "reason": None}
+_FORCE_TOKEN_SEQUENCE = {
+    "active": False,
+    "token_ids": [],
+    "index": 0,
+    "reason": None,
+    "thinking_close_ids": [],
+}
+
+_THINKING_ARTIFACT_PHASE_PATTERNS = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\blet me start coding\s*:\s*",
+        r"\blet me code this[^:\n]{0,80}:\s*",
+        r"\blet me structure the html\s*:\s*",
+        r"\blet me start writing (?:the )?(?:complete|full)[^:\n]{0,80}:\s*",
+        r"\blet me (?:now )?write (?:the )?(?:complete|full)[^:\n]{0,80}:\s*",
+        r"\b(?:now|next),? (?:i(?:'ll| will)|let me) "
+        r"(?:start|write|build|implement)[^:\n]{0,80}:\s*",
+    )
+)
+_THINKING_ARTIFACT_REASONING_HOLDBACK_CHARS = 256
+
+
+def _reset_forced_token_sequence():
+    """Clear request-scoped token injection without losing tokenizer metadata."""
+    _FORCE_TOKEN_SEQUENCE["active"] = False
+    _FORCE_TOKEN_SEQUENCE["token_ids"] = []
+    _FORCE_TOKEN_SEQUENCE["index"] = 0
+    _FORCE_TOKEN_SEQUENCE["reason"] = None
+
+
+def _consume_rank0_forced_token():
+    """Return the next forced token id; called only by rank 0's sampler hook."""
+    if not _FORCE_TOKEN_SEQUENCE.get("active"):
+        return None
+    token_ids = _FORCE_TOKEN_SEQUENCE.get("token_ids") or []
+    index = int(_FORCE_TOKEN_SEQUENCE.get("index") or 0)
+    if index >= len(token_ids):
+        _reset_forced_token_sequence()
+        return None
+    token_id = int(token_ids[index])
+    _FORCE_TOKEN_SEQUENCE["index"] = index + 1
+    if index + 1 >= len(token_ids):
+        _FORCE_TOKEN_SEQUENCE["active"] = False
+    return token_id
+
+
+def _arm_rank0_thinking_close(rank, reason, token_index):
+    """Inject MiniMax's native thinking-close token without ending decode."""
+    if rank != 0 or not _BATCH_PATH_ACTIVE.get("value"):
+        return False
+    if _FORCE_EOS.get("active") or _FORCE_TOKEN_SEQUENCE.get("active"):
+        return False
+    close_ids = list(_FORCE_TOKEN_SEQUENCE.get("thinking_close_ids") or [])
+    if not close_ids:
+        logger.error(
+            "rank 0: cannot transition reasoning for %s at token %d: "
+            "thinking-close token ids are unavailable",
+            reason,
+            token_index,
+        )
+        return False
+    _FORCE_TOKEN_SEQUENCE.update(
+        active=True,
+        token_ids=close_ids,
+        index=0,
+        reason=str(reason),
+    )
+    logger.info(
+        "rank 0: arming synchronized native thinking close for %s at token %d "
+        "(%d token%s)",
+        reason,
+        token_index,
+        len(close_ids),
+        "" if len(close_ids) == 1 else "s",
+    )
+    return True
+
+
+def _thinking_artifact_request(prompt, thinking_mode, tools):
+    """Conservatively identify tool-free, complete standalone HTML requests."""
+    if (
+        not THINKING_ARTIFACT_TRANSITION_ENABLED
+        or tools
+        or thinking_mode not in {"enabled", "adaptive"}
+    ):
+        return False
+    text = str(prompt or "").lower()
+    html_request = any(
+        marker in text
+        for marker in (
+            "single-file",
+            "single file",
+            "complete html",
+            "html file",
+        )
+    ) and any(marker in text for marker in ("html", "website", "web app"))
+    complete_delivery = any(
+        marker in text
+        for marker in (
+            "output the complete",
+            "complete, single-file",
+            "complete single-file",
+            "all js inline",
+            "fully interactive html",
+        )
+    )
+    return bool(html_request and complete_delivery)
+
+
+def _thinking_artifact_phase_match(raw_tail, token_index):
+    """Return the model's explicit planning-to-implementation declaration."""
+    if token_index < THINKING_ARTIFACT_TRANSITION_MIN_TOKENS:
+        return None
+    text = str(raw_tail or "")
+    tail_start = max(0, len(text) - 1200)
+    matches = [
+        match
+        for pattern in _THINKING_ARTIFACT_PHASE_PATTERNS
+        if (match := pattern.search(text, tail_start)) is not None
+    ]
+    return min(matches, key=lambda match: match.start()) if matches else None
+
+
+def _collapse_repeated_html_preamble(text):
+    """Collapse only consecutive opening fence+DOCTYPE copies at byte zero."""
+    if not isinstance(text, str) or not text:
+        return text
+    match = re.match(
+        r"(?is)^(\s*```(?:html)?\s*<!doctype\s+html>\s*)"
+        r"((?:```(?:html)?\s*<!doctype\s+html>\s*)+)",
+        text,
+    )
+    if not match:
+        return text
+    return match.group(1) + text[match.end():]
+
+
+def _new_thinking_artifact_completion_state():
+    return {
+        "tail": "",
+        "fence_opened": False,
+        "body_opened": False,
+        "html_closed_at_token": None,
+        "completion_suffix_chars": 0,
+    }
+
+
+def _thinking_artifact_completion_reached(state, content, token_index):
+    """Recognize one complete standalone HTML artifact without prose limits."""
+    if not isinstance(state, dict) or not content:
+        return False
+    tail = (str(state.get("tail") or "") + str(content))[-8192:]
+    state["tail"] = tail
+    if not state.get("fence_opened") and re.search(
+        r"(?im)^\s*```(?:html)?\s*$",
+        tail,
+    ):
+        state["fence_opened"] = True
+    if not state.get("body_opened") and re.search(r"<body\b", tail, re.IGNORECASE):
+        state["body_opened"] = True
+
+    close_match = None
+    if state.get("body_opened"):
+        matches = list(
+            re.finditer(
+                r"</body\s*>\s*</html\s*>",
+                tail,
+                re.IGNORECASE,
+            )
+        )
+        close_match = matches[-1] if matches else None
+    if close_match is not None and state.get("html_closed_at_token") is None:
+        state["html_closed_at_token"] = int(token_index)
+        # The distributed sampler observes this boundary after the current
+        # detokenizer yield. Keep the requested document visible, but hide any
+        # bytes already decoded after </html> while synchronized EOS reaches
+        # both ranks.
+        state["completion_suffix_chars"] = max(
+            0,
+            len(tail) - close_match.end(),
+        )
+    # The requested deliverable is complete at the closing document boundary.
+    # Stop before a missing Markdown fence can turn into a second full page.
+    return state.get("html_closed_at_token") is not None
+
+
+def _trim_thinking_artifact_completion_delta(state, content):
+    """Trim bytes decoded after the first complete standalone document."""
+    if not isinstance(content, str) or not content:
+        return content
+    suffix_chars = int(state.get("completion_suffix_chars") or 0)
+    state["completion_suffix_chars"] = 0
+    if suffix_chars <= 0:
+        return content
+    if suffix_chars >= len(content):
+        return ""
+    return content[:-suffix_chars]
+
+
+def _trim_thinking_artifact_completion_text(text):
+    """Return one complete standalone HTML document from non-stream output."""
+    if not isinstance(text, str) or not text:
+        return text
+    match = re.search(
+        r"</body\s*>\s*</html\s*>",
+        text,
+        re.IGNORECASE,
+    )
+    return text[:match.end()] if match is not None else text
 
 
 def _arm_rank0_semantic_eos(rank, reason, token_index):
@@ -1879,6 +2118,7 @@ def _arm_rank0_semantic_eos(rank, reason, token_index):
             token_index,
         )
         _FORCE_EOS["active"] = True
+        _FORCE_EOS["reason"] = str(reason)
     return True
 
 # Rank-0 op-channel mutex: _bcast frames each op as bare size+payload
@@ -7731,10 +7971,17 @@ def _request_generation_params(request, tools=None):
     # 0.5 thinking floor replaced the 0.2 tool default on thinking+tools turns,
     # which made the quantized model drift into long reasoning instead of
     # emitting a call. Explicit client values still win through setdefault.
-    if not has_tools and _resolve_thinking_mode(request) == "enabled":
-        if THINKING_DEFAULT_REPETITION_PENALTY > 0:
-            params.setdefault("repetition_penalty",
-                              THINKING_DEFAULT_REPETITION_PENALTY)
+    if not has_tools and _resolve_thinking_mode(request) in {"enabled", "adaptive"}:
+        thinking_defaults = {
+            "temperature": THINKING_DEFAULT_TEMPERATURE,
+            "top_p": THINKING_DEFAULT_TOP_P,
+            "top_k": THINKING_DEFAULT_TOP_K,
+            "min_p": THINKING_DEFAULT_MIN_P,
+            "repetition_penalty": THINKING_DEFAULT_REPETITION_PENALTY,
+        }
+        for key, value in thinking_defaults.items():
+            if key not in request:
+                params[key] = value
         if (THINKING_MIN_TEMPERATURE > 0
                 and "temperature" not in request  # client didn't ask
                 and float(params.get("temperature", 0.0) or 0.0)
@@ -7761,6 +8008,11 @@ def _generation_defaults_status():
         "tool_top_p": TOOL_DEFAULT_TOP_P,
         "tool_top_k": TOOL_DEFAULT_TOP_K,
         "tool_min_p": TOOL_DEFAULT_MIN_P,
+        "thinking_temperature": THINKING_DEFAULT_TEMPERATURE,
+        "thinking_top_p": THINKING_DEFAULT_TOP_P,
+        "thinking_top_k": THINKING_DEFAULT_TOP_K,
+        "thinking_min_p": THINKING_DEFAULT_MIN_P,
+        "thinking_repetition_penalty": THINKING_DEFAULT_REPETITION_PENALTY,
         "tool_decode_topk_reuse_tokens": TOOL_DECODE_TOPK_REUSE_TOKENS,
         "tool_seed": TOOL_DEFAULT_SEED,
         "tool_thinking_mode": TOOL_THINKING_MODE,
@@ -7839,6 +8091,12 @@ def _generation_defaults_status():
         "decode_eval_after_every": DECODE_EVAL_AFTER_EVERY,
         "thinking_decode_eval_every": THINKING_DECODE_EVAL_EVERY,
         "thinking_raw_silent_limit": THINKING_RAW_SILENT_LIMIT,
+        "thinking_artifact_transition": THINKING_ARTIFACT_TRANSITION_ENABLED,
+        "thinking_artifact_transition_min_tokens": (
+            THINKING_ARTIFACT_TRANSITION_MIN_TOKENS
+        ),
+        "decode_repetition_guard_tokens": DECODE_REPETITION_GUARD_TOKENS,
+        "decode_repetition_guard_strategy": "synchronized_eos",
         "long_context_decode_eval_tokens": LONG_CONTEXT_DECODE_EVAL_TOKENS,
         "long_context_decode_eval_every": LONG_CONTEXT_DECODE_EVAL_EVERY,
         "adaptive_long_context_decode_eval": ADAPTIVE_LONG_CONTEXT_DECODE_EVAL,
@@ -9904,7 +10162,11 @@ def _looks_like_degenerate_repetition(text, min_cycles=10):
             continue
         window = tail[-span:]
         unit = window[:period]
-        if unit.strip() and all(
+        # Punctuation-only runs are common in generated source (for example
+        # CSS comment rulers made of '=' or '-'). They are not a model loop.
+        # Require semantic bytes so this guard targets repeated prose, code,
+        # commands, or MiniMax marker fragments rather than valid formatting.
+        if re.search(r"[A-Za-z0-9]", unit) and all(
             window[i:i + period] == unit for i in range(0, span, period)
         ):
             return True
@@ -17227,6 +17489,8 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     # /v1/stop poisoned every later non-stream request into an instant-EOS
     # empty reply ("generation complete: 0 chars", found 2026-07-07).
     _FORCE_EOS["active"] = False
+    _FORCE_EOS["reason"] = None
+    _reset_forced_token_sequence()
     _refresh_generation_stream()
 
     multimodal_context = None
@@ -17372,6 +17636,13 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
             else TOOL_NO_CALL_TOKEN_BUDGET
         )
     write_scaffold_threshold = _tool_write_early_stop_chars()
+    artifact_transition_enabled = _thinking_artifact_request(
+        prompt,
+        thinking_mode,
+        tools,
+    )
+    artifact_transition_armed = False
+    artifact_completion_state = _new_thinking_artifact_completion_state()
     request_decode_reuse_state = _begin_request_decode_topk_reuse(tools, rank)
     _arm_constrained_tools(processor, tools, rank)
     try:
@@ -17395,7 +17666,10 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                     and token is not None
                     and int(token) == int(_FORCE_EOS["eos_id"])
                 ):
-                    stopped = True  # bookkeeping only; generator ends itself
+                    stopped = (
+                        _FORCE_EOS.get("reason")
+                        != "complete_standalone_html_artifact"
+                    )
                 token_text = getattr(response, "text", None) or ""
                 if token_text:
                     tool_accumulated += token_text
@@ -17414,6 +17688,49 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 else:
                     tool_detokenizer_silent_tokens = 0
                 n += 1
+                phase_match = None
+                if (
+                    rank == 0
+                    and artifact_transition_enabled
+                    and not artifact_transition_armed
+                    and not _FORCE_EOS.get("active")
+                    and (
+                        thinking_mode == "enabled"
+                        or "<mm:think>" in text
+                        or "<think>" in text
+                    )
+                    and "</mm:think>" not in text
+                    and "</think>" not in text
+                    and (
+                        phase_match := _thinking_artifact_phase_match(text, n)
+                    ) is not None
+                ):
+                    artifact_transition_armed = _arm_rank0_thinking_close(
+                        rank,
+                        "standalone_html_artifact_phase",
+                        n,
+                    )
+                    if artifact_transition_armed:
+                        _thinking_artifact_completion_reached(
+                            artifact_completion_state,
+                            text[phase_match.end():],
+                            n,
+                        )
+                elif (
+                    rank == 0
+                    and artifact_transition_armed
+                    and not _FORCE_EOS.get("active")
+                    and _thinking_artifact_completion_reached(
+                        artifact_completion_state,
+                        token_text,
+                        n,
+                    )
+                ):
+                    _arm_rank0_semantic_eos(
+                        rank,
+                        "complete_standalone_html_artifact",
+                        n,
+                    )
                 if rank == 0 and progress_cb is not None:
                     metrics = {}
                     if n == 1:
@@ -17745,6 +18062,8 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         if stopped:
             if not _keep_prompt_prefix_after_cancel(token_ids, "stop"):
                 _reset_prompt_cache("reset after stop", clear_resident=False)
+        if rank == 0 and artifact_completion_state.get("html_closed_at_token"):
+            text = _trim_thinking_artifact_completion_text(text)
         return text if rank == 0 else None
     except GenerationCancelled as e:
         stopped = True
@@ -17757,6 +18076,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         _reset_prompt_cache("reset after error", clear_resident=False)
         raise
     finally:
+        _reset_forced_token_sequence()
         _disarm_constrained_tools()
         _restore_request_decode_topk_reuse(request_decode_reuse_state, rank)
         if cache_marked_in_use:
@@ -17793,6 +18113,8 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     # /v1/stop poisoned every later non-stream request into an instant-EOS
     # empty reply ("generation complete: 0 chars", found 2026-07-07).
     _FORCE_EOS["active"] = False
+    _FORCE_EOS["reason"] = None
+    _reset_forced_token_sequence()
     _refresh_generation_stream()
 
     multimodal_context = None
@@ -17954,6 +18276,18 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
             else TOOL_NO_CALL_TOKEN_BUDGET
         )
     write_scaffold_threshold = _tool_write_early_stop_chars()
+    artifact_transition_enabled = _thinking_artifact_request(
+        prompt,
+        thinking_mode,
+        tools,
+    )
+    artifact_transition_armed = False
+    artifact_reasoning_buffer = ""
+    artifact_content_prefix_buffer = ""
+    artifact_postclose_buffer = ""
+    artifact_initial_content_buffer = ""
+    artifact_initial_content_released = False
+    artifact_completion_state = _new_thinking_artifact_completion_state()
     request_decode_reuse_state = _begin_request_decode_topk_reuse(tools, rank)
     _arm_constrained_tools(processor, tools, rank)
     try:
@@ -17993,7 +18327,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     and token is not None
                     and int(token) == int(_FORCE_EOS["eos_id"])
                 ):
-                    stopped = True  # bookkeeping only; generator ends itself
+                    stopped = (
+                        _FORCE_EOS.get("reason")
+                        != "complete_standalone_html_artifact"
+                    )
                 token_text = getattr(response, "text", None) or ""
                 n += 1
                 # Rolling raw-text tail: `accumulated` is CONSUMED by
@@ -18226,6 +18563,139 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                     accumulated, token_text, in_thinking,
                     at_response_start=at_response_start,
                 )
+                if (
+                    rank == 0
+                    and artifact_transition_enabled
+                    and not artifact_transition_armed
+                    and in_thinking
+                ):
+                    artifact_reasoning_buffer += delta_reasoning or ""
+                    delta_reasoning = None
+                    phase_match = _thinking_artifact_phase_match(
+                        artifact_reasoning_buffer,
+                        n,
+                    )
+                    if (
+                        phase_match is not None
+                        and not _FORCE_EOS.get("active")
+                        and _arm_rank0_thinking_close(
+                            rank,
+                            "standalone_html_artifact_phase",
+                            n,
+                        )
+                    ):
+                        artifact_transition_armed = True
+                        reasoning_prefix = artifact_reasoning_buffer[
+                            :phase_match.end()
+                        ]
+                        content_suffix = artifact_reasoning_buffer[
+                            phase_match.end():
+                        ]
+                        artifact_reasoning_buffer = ""
+                        delta_reasoning = reasoning_prefix or None
+                        # Some detokenizer yields contain the phase sentence
+                        # and the first artifact bytes together. Hold those
+                        # bytes until post-close output arrives: if MiniMax
+                        # restarts the artifact (its usual behavior), emit the
+                        # native post-close copy once; if it continues instead,
+                        # prepend the held bytes so nothing is lost.
+                        artifact_content_prefix_buffer = content_suffix
+                        artifact_postclose_buffer = delta_content or ""
+                        delta_content = None
+                        # The next sampled token is the synchronized native
+                        # close marker. Route any same-chunk artifact bytes to
+                        # content now; when that marker arrives the splitter
+                        # strips it while remaining in content mode.
+                        in_thinking = False
+                        accumulated = ""
+                        raw_tail = ""
+                    elif (
+                        len(artifact_reasoning_buffer)
+                        > _THINKING_ARTIFACT_REASONING_HOLDBACK_CHARS
+                    ):
+                        flush_len = (
+                            len(artifact_reasoning_buffer)
+                            - _THINKING_ARTIFACT_REASONING_HOLDBACK_CHARS
+                        )
+                        delta_reasoning = artifact_reasoning_buffer[:flush_len]
+                        artifact_reasoning_buffer = artifact_reasoning_buffer[
+                            flush_len:
+                        ]
+                elif rank == 0 and artifact_reasoning_buffer and not in_thinking:
+                    # Natural close won the race before a repair was needed.
+                    delta_reasoning = artifact_reasoning_buffer + (
+                        delta_reasoning or ""
+                    )
+                    artifact_reasoning_buffer = ""
+                if (
+                    rank == 0
+                    and artifact_transition_armed
+                    and artifact_content_prefix_buffer
+                    and delta_content
+                ):
+                    artifact_postclose_buffer += delta_content
+                    delta_content = None
+                    if artifact_postclose_buffer.startswith(
+                        artifact_content_prefix_buffer
+                    ):
+                        delta_content = artifact_postclose_buffer
+                        artifact_content_prefix_buffer = ""
+                        artifact_postclose_buffer = ""
+                    elif not artifact_content_prefix_buffer.startswith(
+                        artifact_postclose_buffer
+                    ):
+                        delta_content = (
+                            artifact_content_prefix_buffer
+                            + artifact_postclose_buffer
+                        )
+                        artifact_content_prefix_buffer = ""
+                        artifact_postclose_buffer = ""
+                if rank == 0 and artifact_transition_armed and delta_content:
+                    if artifact_completion_state.get("html_closed_at_token"):
+                        # EOS injection is synchronized but can trail the
+                        # semantic boundary by a few detokenizer yields.
+                        delta_content = None
+                    elif (
+                        not _FORCE_EOS.get("active")
+                        and _thinking_artifact_completion_reached(
+                            artifact_completion_state,
+                            delta_content,
+                            n,
+                        )
+                    ):
+                        delta_content = (
+                            _trim_thinking_artifact_completion_delta(
+                                artifact_completion_state,
+                                delta_content,
+                            )
+                            or None
+                        )
+                        _arm_rank0_semantic_eos(
+                            rank,
+                            "complete_standalone_html_artifact",
+                            n,
+                        )
+                if (
+                    rank == 0
+                    and artifact_transition_armed
+                    and not artifact_initial_content_released
+                    and delta_content
+                ):
+                    artifact_initial_content_buffer += delta_content
+                    delta_content = None
+                    if (
+                        len(artifact_initial_content_buffer) >= 512
+                        or re.search(
+                            r"<html\b",
+                            artifact_initial_content_buffer,
+                            flags=re.IGNORECASE,
+                        )
+                    ):
+                        delta_content = _collapse_repeated_html_preamble(
+                            artifact_initial_content_buffer
+                        )
+                        artifact_initial_content_buffer = ""
+                        artifact_initial_content_released = True
                 routed_delta_text = (delta_reasoning or "") + (delta_content or "")
                 visible_delta_text = _strip_thinking_control_markers(
                     routed_delta_text
@@ -18383,6 +18853,29 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         tool_complete_seen = True
                     continue
 
+        if rank == 0 and artifact_reasoning_buffer and not stopped:
+            yield {"reasoning": artifact_reasoning_buffer}
+            artifact_reasoning_buffer = ""
+        if (
+            rank == 0
+            and artifact_content_prefix_buffer
+            and not stopped
+        ):
+            yield {
+                "content": (
+                    artifact_content_prefix_buffer
+                    + artifact_postclose_buffer
+                )
+            }
+            artifact_content_prefix_buffer = ""
+            artifact_postclose_buffer = ""
+        if rank == 0 and artifact_initial_content_buffer and not stopped:
+            yield {
+                "content": _collapse_repeated_html_preamble(
+                    artifact_initial_content_buffer
+                )
+            }
+            artifact_initial_content_buffer = ""
         # Flush any trailing buffered text
         if rank == 0 and accumulated and not stopped:
             if malformed_thinking:
@@ -18460,6 +18953,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         _reset_prompt_cache("reset after error", clear_resident=False)
         raise
     finally:
+        _reset_forced_token_sequence()
         _disarm_constrained_tools()
         _restore_request_decode_topk_reuse(request_decode_reuse_state, rank)
         if cache_marked_in_use:
@@ -18740,6 +19234,11 @@ def _install_rank0_token_sync(group):
             and _FORCE_EOS["eos_id"] is not None
         ):
             y = mx.full(y.shape, _FORCE_EOS["eos_id"], dtype=y.dtype)
+        elif sync_rank == 0:
+            forced_token_id = _consume_rank0_forced_token()
+            if forced_token_id is not None:
+                forced = mx.full(y.shape, forced_token_id, dtype=y.dtype)
+                y = mx.depends(forced, y)
         if con is not None:
             # fold the actually-sampled token (post force-eos) into the automaton
             try:
@@ -18853,8 +19352,18 @@ def main():
             _eid = next(iter(_eid), None)
         _FORCE_EOS["eos_id"] = int(_eid) if _eid is not None else None
         logger.info("decode-stop EOS id: %s", _FORCE_EOS["eos_id"])
+        _close_ids = _tok.encode("</mm:think>", add_special_tokens=False)
+        if hasattr(_close_ids, "tolist"):
+            _close_ids = _close_ids.tolist()
+        _FORCE_TOKEN_SEQUENCE["thinking_close_ids"] = [
+            int(token_id) for token_id in _close_ids
+        ]
+        logger.info(
+            "native thinking-close token ids: %s",
+            _FORCE_TOKEN_SEQUENCE["thinking_close_ids"],
+        )
     except Exception as e:
-        logger.warning("decode-stop EOS id unavailable: %s", e)
+        logger.warning("decode-stop/thinking-close token ids unavailable: %s", e)
     with _prompt_cache_lock:
         _load_prompt_cache_session_manifest_unlocked()
     _start_prompt_cache_janitor()
@@ -20868,6 +21377,14 @@ def run_http_server(model, processor, rank):
             # could produce an executable call.
             and not tools
             and _request_looks_like_openwebui(request, processed_messages)
+            # Complete standalone artifacts need the normal text budget. A
+            # client that omits max_tokens must not be silently truncated at
+            # the short-chat OpenWebUI default.
+            and not _thinking_artifact_request(
+                _last_user_instruction_text(processed_messages),
+                thinking_mode,
+                tools,
+            )
         ):
             if max_tokens > OPENWEBUI_DEFAULT_MAX_TOKENS:
                 logger.info(
@@ -21275,6 +21792,7 @@ def run_http_server(model, processor, rank):
                         _clear_prefill_stop_file("rank 0 stream generation start")
                         _STOP_NONCE["value"] = rank_request.get("stop_nonce")
                         _FORCE_EOS["active"] = False
+                        _FORCE_EOS["reason"] = None
                         request_start_keepwarm(req_id)
                         _bcast(rank_request, rank)
                         rank_request_broadcast = True
@@ -22208,6 +22726,7 @@ def run_http_server(model, processor, rank):
                     _clear_prefill_stop_file("rank 0 non-stream generation start")
                     _STOP_NONCE["value"] = rank_request.get("stop_nonce")
                     _FORCE_EOS["active"] = False
+                    _FORCE_EOS["reason"] = None
                     request_start_keepwarm(req_id)
                     _bcast(rank_request, rank)
                     rank_request_broadcast = True
@@ -22772,6 +23291,7 @@ def run_mirror(model, processor, rank):
         _clear_prefill_stop_file("rank 1 new request")
         _STOP_NONCE["value"] = req.get("stop_nonce")
         _FORCE_EOS["active"] = False
+        _FORCE_EOS["reason"] = None
         import m3_eagle3 as _m3e3
         _m3e3.REQUEST_ACTIVE["value"] = bool(req.get("eagle3"))
 

@@ -62,6 +62,26 @@ session, retry, SSD-restore, or prewarm boundaries.
 Full evidence and reproduction commands are in
 [`docs/NATIVE-TOOLS-2026-07-14.md`](../docs/NATIVE-TOOLS-2026-07-14.md).
 
+## Thinking-to-content artifact gate (2026-07-19)
+
+`m3_thinking_channel_probe.py` reproduces the exact long-form Shadow Syntax
+request that previously left the complete HTML trapped in reasoning. It
+requires streamed reasoning, a later content transition, exactly one complete
+HTML document, and a healthy idle endpoint at the end. Use
+`--omit-sampling --omit-max-tokens` to exercise the production server defaults.
+
+`m3_thinking_transition_smoke.py` is the offline companion. It checks the
+request classifier, official MiniMax thinking sampling defaults, phase
+detection, synchronized close-token queue, standalone document completion,
+and false-positive exclusions for generated punctuation rulers.
+
+The final candidate produced 2,158 reasoning characters followed by a
+52,020-character HTML artifact, stopped at the first complete `</body></html>`
+boundary, and decoded at 26.43 tok/s. The same build passed a 200.5k-context
+soak at 309.14 cold prompt tok/s and 24.52 cached decode tok/s, then released
+wired memory to 4GB/3GB on the two ranks and restored a 20.6k-token agent/tool
+session from SSD after a true restart.
+
 Common probes:
 
 - `m3_turn_probe.py`: thinking/no-thinking multi-turn hot-cache check. The
@@ -75,6 +95,10 @@ Common probes:
   comparison. Its default prompt is intentionally bounded so `--max-tokens 768`
   validates both reasoning and visible final content instead of hitting the cap
   in reasoning-only output.
+- `m3_thinking_channel_probe.py`: exact long-form reasoning-to-content channel
+  and standalone-artifact completion gate.
+- `m3_thinking_transition_smoke.py`: offline scope, token-injection, completion,
+  and repetition-guard false-positive checks for that repair.
 - `m3_agent_cache_probe.py`: long agent-context cache preservation check.
 - `m3_agent_staged_suffix_probe.py`: uneven coding-agent transcript growth
   check. Default stages are roughly 20k, then +8k, +2k, and +500 prompt tokens;
