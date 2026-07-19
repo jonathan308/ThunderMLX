@@ -44,6 +44,7 @@ _KERNEL_STATS_ENABLED = os.environ.get(
     "MLX_M3_KERNEL_STATS", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 _KERNEL_STATS = {
+    "decode_select_v2_calls": 0,
     "topk_native": 0,
     "topk_fallback": 0,
     "topk_native_error": 0,
@@ -886,6 +887,122 @@ _MSA_DECODE_BLOCK_SCORES = mx.fast.metal_kernel(
 )
 
 
+_MSA_SELECT_V2 = os.environ.get("MLX_M3_MSA_SELECT_V2", "0").strip() == "1"
+
+_MSA_DECODE_BLOCK_SCORES_V2 = mx.fast.metal_kernel(
+    name="minimax_m3_msa_decode_block_scores_v2",
+    input_names=["idx_q", "idx_k", "params"],
+    output_names=["block_scores"],
+    header="#include <metal_simdgroup>\nusing namespace metal;\n",
+    ensure_row_contiguous=False,
+    source=r"""
+        // V2 (fable speed lab): ONE pass over the key history scores ALL
+        // H_IDX query heads (v1 re-read the full key tensor once per head =
+        // 4x memory traffic), with the inner-dim index hoisted for the
+        // contiguous case and an 8-wide unrolled accumulation. Per-head
+        // accumulation order (d ascending) is IDENTICAL to v1, so scores are
+        // bit-identical and selection is provably unchanged.
+        const int TOTAL_K = params[0];
+        const int NUM_BLOCKS = params[1];
+        uint tg = threadgroup_position_in_grid.x;
+        uint tid = thread_index_in_threadgroup;
+        uint lane = thread_index_in_simdgroup;
+        uint sgid = simdgroup_index_in_threadgroup;
+        int blocks_per_tg = THREADS / BLOCK_SIZE;
+        int block_base = int(tg) * blocks_per_tg;
+        if (block_base >= NUM_BLOCKS) {
+            return;
+        }
+
+        threadgroup float q_s[H_IDX * D_IDX];
+        for (int i = int(tid); i < H_IDX * D_IDX; i += THREADS) {
+            int h = i / D_IDX;
+            int d = i % D_IDX;
+            q_s[i] = float(idx_q[int64_t(h) * idx_q_strides[1]
+                                 + int64_t(d) * idx_q_strides[3]]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        int local_block = int(tid) / BLOCK_SIZE;
+        int block = block_base + local_block;
+        int k_pos = block * BLOCK_SIZE + (int(tid) % BLOCK_SIZE);
+        float acc[H_IDX];
+        bool valid = (block < NUM_BLOCKS) && (k_pos < TOTAL_K);
+        for (int h = 0; h < H_IDX; ++h) {
+            acc[h] = 0.0f;
+        }
+        if (valid) {
+            const int64_t k_base = int64_t(k_pos) * idx_k_strides[2];
+            const int64_t ks = idx_k_strides[3];
+            if (ks == 1) {
+                const device T* krow = idx_k + k_base;
+                for (int d = 0; d + 8 <= D_IDX; d += 8) {
+                    float k0 = float(krow[d + 0]);
+                    float k1 = float(krow[d + 1]);
+                    float k2 = float(krow[d + 2]);
+                    float k3 = float(krow[d + 3]);
+                    float k4 = float(krow[d + 4]);
+                    float k5 = float(krow[d + 5]);
+                    float k6 = float(krow[d + 6]);
+                    float k7 = float(krow[d + 7]);
+                    for (int h = 0; h < H_IDX; ++h) {
+                        const threadgroup float* qh = q_s + h * D_IDX + d;
+                        acc[h] += qh[0] * k0;
+                        acc[h] += qh[1] * k1;
+                        acc[h] += qh[2] * k2;
+                        acc[h] += qh[3] * k3;
+                        acc[h] += qh[4] * k4;
+                        acc[h] += qh[5] * k5;
+                        acc[h] += qh[6] * k6;
+                        acc[h] += qh[7] * k7;
+                    }
+                }
+                for (int d = (D_IDX / 8) * 8; d < D_IDX; ++d) {
+                    float kv = float(krow[d]);
+                    for (int h = 0; h < H_IDX; ++h) {
+                        acc[h] += q_s[h * D_IDX + d] * kv;
+                    }
+                }
+            } else {
+                for (int d = 0; d < D_IDX; ++d) {
+                    float kv = float(idx_k[k_base + int64_t(d) * ks]);
+                    for (int h = 0; h < H_IDX; ++h) {
+                        acc[h] += q_s[h * D_IDX + d] * kv;
+                    }
+                }
+            }
+        }
+
+        constexpr int SIMDS = THREADS / 32;
+        constexpr int SIMDS_PER_BLOCK = BLOCK_SIZE / 32;
+        threadgroup float partial_s[SIMDS * H_IDX];
+        for (int h = 0; h < H_IDX; ++h) {
+            float score = valid
+                ? (acc[h] == acc[h] ? acc[h] : -INFINITY)
+                : -INFINITY;
+            float smax = simd_max(score);
+            if (lane == 0) {
+                partial_s[int(sgid) * H_IDX + h] = smax;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < uint(blocks_per_tg)) {
+            int b = block_base + int(tid);
+            if (b < NUM_BLOCKS) {
+                for (int h = 0; h < H_IDX; ++h) {
+                    float best = -INFINITY;
+                    for (int s = 0; s < SIMDS_PER_BLOCK; ++s) {
+                        int sg = int(tid) * SIMDS_PER_BLOCK + s;
+                        best = max(best, partial_s[sg * H_IDX + h]);
+                    }
+                    block_scores[int64_t(h) * NUM_BLOCKS + b] = best;
+                }
+            }
+        }
+    """,
+)
+
+
 _MSA_DECODE_TOPK_SELECT_SMEM = mx.fast.metal_kernel(
     name="minimax_m3_msa_decode_topk_select_smem",
     input_names=["block_scores", "params"],
@@ -1017,20 +1134,39 @@ def msa_decode_select_topk(
     blocks_per_tg = max(threads // int(block_size), 1)
     tgs_per_head = (num_blocks + blocks_per_tg - 1) // blocks_per_tg
     params_a = mx.array([int(total_k), int(num_blocks)], dtype=mx.int32)
-    block_scores = _MSA_DECODE_BLOCK_SCORES(
-        inputs=[idx_queries, idx_keys, params_a],
-        template=[
-            ("T", idx_queries.dtype),
-            ("H_IDX", h_idx),
-            ("D_IDX", d_idx),
-            ("BLOCK_SIZE", int(block_size)),
-            ("THREADS", threads),
-        ],
-        grid=(h_idx * tgs_per_head * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[(h_idx, num_blocks)],
-        output_dtypes=[mx.float32],
-    )[0]
+    if _MSA_SELECT_V2:
+        # V2: one pass over keys scores all heads (4x less memory traffic),
+        # bit-identical scores (same per-head accumulation order).
+        block_scores = _MSA_DECODE_BLOCK_SCORES_V2(
+            inputs=[idx_queries, idx_keys, params_a],
+            template=[
+                ("T", idx_queries.dtype),
+                ("H_IDX", h_idx),
+                ("D_IDX", d_idx),
+                ("BLOCK_SIZE", int(block_size)),
+                ("THREADS", threads),
+            ],
+            grid=(tgs_per_head * threads, 1, 1),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(h_idx, num_blocks)],
+            output_dtypes=[mx.float32],
+        )[0]
+        _stat("decode_select_v2_calls")
+    else:
+        block_scores = _MSA_DECODE_BLOCK_SCORES(
+            inputs=[idx_queries, idx_keys, params_a],
+            template=[
+                ("T", idx_queries.dtype),
+                ("H_IDX", h_idx),
+                ("D_IDX", d_idx),
+                ("BLOCK_SIZE", int(block_size)),
+                ("THREADS", threads),
+            ],
+            grid=(h_idx * tgs_per_head * threads, 1, 1),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(h_idx, num_blocks)],
+            output_dtypes=[mx.float32],
+        )[0]
 
     cur_block = int(q_pos) // int(block_size)
     params_b = mx.array([int(num_blocks), int(cur_block)], dtype=mx.int32)
