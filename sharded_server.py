@@ -8418,7 +8418,19 @@ def _recall_assistant_reasoning(session_id, visible_content, *, tool_calls=None,
         entries.move_to_end(key)
         _reasoning_recall_sessions.move_to_end(session_key)
         reasoning = entry.get("reasoning")
-    return reasoning if isinstance(reasoning, str) and reasoning.strip() else None
+    if not (isinstance(reasoning, str) and reasoning.strip()):
+        return None
+    if _looks_like_degenerate_repetition(reasoning):
+        # Read-side twin of the store gate: a poisoned entry (stored before
+        # the gate existed, or borderline text a later detector version
+        # flags) must not re-prime the model either.
+        logger.warning(
+            "reasoning-recall: dropping stored copy-spiral reasoning "
+            "(%s chars) instead of re-priming it",
+            len(reasoning),
+        )
+        return None
+    return reasoning
 
 
 def _remember_assistant_reasoning(session_id, visible_content, raw_output, *,
@@ -8450,6 +8462,21 @@ def _remember_assistant_reasoning(session_id, visible_content, raw_output, *,
     if REASONING_RECALL_MAX_CHARS > 0 and len(reasoning) > REASONING_RECALL_MAX_CHARS:
         logger.info(
             "reasoning-recall: skipped %s-char reasoning for session %s",
+            len(reasoning),
+            session_id,
+        )
+        return False
+    if _looks_like_degenerate_repetition(reasoning):
+        # 2026-07-20 opencode echo incident: a contained copy-spiral's
+        # reasoning was stored here, re-inserted into every subsequent
+        # prompt for KV alignment, and greedy decode faithfully regenerated
+        # it verbatim each turn — a self-sustaining echo through this store
+        # (11 identical thinking streams). Degenerate reasoning must never
+        # be re-primed; the cost is one turn of think-block cache
+        # misalignment instead of an indefinite echo.
+        logger.warning(
+            "reasoning-recall: refusing to store copy-spiral reasoning "
+            "(%s chars) for session %s",
             len(reasoning),
             session_id,
         )
