@@ -224,6 +224,25 @@ def build_descriptor(
     }
 
 
+def prefix_manifest_hash(items: Sequence[dict], count: int) -> str:
+    """Hash the first `count` manifest items exactly as source_manifest would.
+
+    Reconstructs the manifest shape for a PREFIX of the image list so an old
+    descriptor's aggregate source_hash can be verified against the leading
+    images of a new, longer request — the append-aware reuse check. Order
+    sensitivity is inherited from the item list.
+    """
+    manifest = {
+        "schema": SCHEMA_VERSION,
+        "image_count": int(count),
+        "items": [
+            {"sha256": item.get("sha256"), "bytes": item.get("bytes")}
+            for item in list(items)[: int(count)]
+        ],
+    }
+    return stable_hash(manifest)
+
+
 def cache_session_id(session_id: str | None, fingerprint: str) -> str:
     base = str(session_id or "__default__")
     return f"{base}:mm{SCHEMA_VERSION}:{fingerprint}"

@@ -1422,6 +1422,15 @@ PROMPT_CACHE_DIRECT_SUFFIX_IDS = os.environ.get(
 IMAGE_PROMPT_CACHE_ENABLED = os.environ.get(
     "MLX_M3_IMAGE_PROMPT_CACHE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Append-aware image reuse: when a request's image set EXTENDS the cached
+# set (screenshot workflows), reuse the verified common expanded-token
+# prefix instead of the whole-cache fingerprint invalidation. Requires the
+# anchored-marker path (IMAGE_PROMPT_CACHE_ENABLED) — the legacy num_images
+# rendering pins all image tokens to the last user message and is
+# structurally append-hostile.
+IMAGE_PROMPT_CACHE_APPEND_ENABLED = os.environ.get(
+    "MLX_M3_IMAGE_PROMPT_CACHE_APPEND", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 PROMPT_CACHE_MIN_REUSE = int(os.environ.get("MLX_M3_PROMPT_CACHE_MIN_REUSE", "32"))
 PROMPT_CACHE_TTL_SECONDS = int(os.environ.get("MLX_M3_PROMPT_CACHE_TTL_SECONDS", "10800"))
 PROMPT_CACHE_MAX_TOKENS = int(os.environ.get("MLX_M3_PROMPT_CACHE_MAX_TOKENS", "0"))
@@ -5079,6 +5088,12 @@ def _prepare_multimodal_cache_context(
             descriptor.get("media_safe_prefix_min") or 0
         ),
         "media_token_ids": tuple(descriptor.get("media_token_ids") or ()),
+        # Per-image sha256 items (order-sensitive). Rank-symmetric: byte
+        # equality across ranks is enforced against the broadcast manifest
+        # above and by consensus element 0. Consumed by the append-aware
+        # reuse check to verify the leading images of a longer request are
+        # exactly the previously cached set.
+        "source_manifest": source,
     }, True, None
 
 
@@ -5161,6 +5176,90 @@ def _multimodal_session_identity(session_id, context):
     return _mm_cache.cache_session_id(session_id, context["fingerprint"])
 
 
+def _multimodal_append_reuse_plan(cached_descriptor, cached_token_ids, context):
+    """Return an append-reuse plan when the new image set EXTENDS the cached one.
+
+    Verifies, from rank-symmetric inputs only (the holder descriptor both
+    ranks maintain identically on the healthy path, plus the consensus-proven
+    new context), that every cached image is byte- and layout-identical to
+    the leading images of the new request:
+      1. image counts strictly grew;
+      2. processor config unchanged;
+      3. sha256 prefix-manifest of the new request's first k images equals
+         the cached aggregate source_hash (per-image items ride the context);
+      4. per-image grid rows for the first k images are unchanged (catches
+         per-request resize/max-pixel gen_params outside processor_hash);
+      5. the cached expanded ids are a strict prefix-compatible base: the
+         cached media region (media_safe_prefix_min) must sit inside the
+         common prefix, which the caller's normal common-prefix computation
+         enforces via the returned minimum_safe_reuse floor.
+    Any doubt returns None and the caller takes the proven cold rebuild. A
+    rank-divergent verdict (possible only under holder skew) yields divergent
+    plans that _prefix_plan_consensus collapses to a symmetric full prefill —
+    no collectives are involved here by the v0.3.2 invariant.
+    """
+    if not IMAGE_PROMPT_CACHE_APPEND_ENABLED or not context:
+        return None
+    new_desc = context.get("descriptor") or {}
+    old_desc = cached_descriptor or {}
+    try:
+        old_count = int(old_desc.get("image_count") or 0)
+        new_count = int(new_desc.get("image_count") or 0)
+        if old_count <= 0 or new_count <= old_count:
+            return None
+        if (old_desc.get("processor_hash") or None) != (
+            new_desc.get("processor_hash") or None
+        ):
+            return None
+        manifest = context.get("source_manifest") or {}
+        items = manifest.get("items") or []
+        if len(items) < new_count:
+            return None
+        if _mm_cache.prefix_manifest_hash(items, old_count) != (
+            old_desc.get("source_hash") or None
+        ):
+            return None
+        old_grids = old_desc.get("image_grid_thw") or []
+        new_grids = new_desc.get("image_grid_thw") or []
+        if len(new_grids) < new_count or len(old_grids) != old_count:
+            return None
+        if any(
+            list(map(int, old_grids[i])) != list(map(int, new_grids[i]))
+            for i in range(old_count)
+        ):
+            return None
+        old_media_min = int(old_desc.get("media_safe_prefix_min") or 0)
+        if old_media_min <= 0:
+            return None
+        # The cached ids must actually match the new expanded prefix through
+        # the cached media region; the generic flow recomputes the exact
+        # common prefix, but verifying here keeps a corrupted holder from
+        # even entering append mode.
+        new_ids = context.get("token_ids") or []
+        cached_ids = list(cached_token_ids or [])
+        if len(cached_ids) < old_media_min or len(new_ids) < old_media_min:
+            return None
+        if cached_ids[:old_media_min] != list(new_ids[:old_media_min]):
+            return None
+        appended_row_start = 0
+        for grid in old_grids:
+            row = 1
+            for dim in grid:
+                row *= int(dim)
+            appended_row_start += row
+        return {
+            "old_image_count": old_count,
+            "new_image_count": new_count,
+            "minimum_safe_reuse": old_media_min,
+            "appended_pixel_row_start": appended_row_start,
+        }
+    except Exception as exc:
+        logger.warning(
+            "multimodal append check failed; using cold rebuild: %s", exc
+        )
+        return None
+
+
 def _apply_multimodal_generation_inputs(
     gen_kwargs,
     context,
@@ -5178,15 +5277,49 @@ def _apply_multimodal_generation_inputs(
         and suffix_ids
         and 0 < reuse_tokens < len(token_ids)
     )
+    append_plan = context.get("append_reuse") or None
     if cache_hit and not _mm_cache.prefix_is_media_safe(
         token_ids,
         reuse_tokens,
         context["media_token_ids"],
     ):
-        raise RuntimeError(
-            "multimodal cache plan attempted to reuse a prefix before the media boundary"
-        )
-    if cache_hit:
+        if not append_plan:
+            raise RuntimeError(
+                "multimodal cache plan attempted to reuse a prefix before the media boundary"
+            )
+        # Append mode: the boundary legitimately sits between the cached
+        # media region and the appended images' spans. The verified floor
+        # guarantees every CACHED span is inside the reuse; every span in
+        # the suffix belongs to the appended images, whose pixels we feed
+        # below. A boundary below the floor means the common prefix ended
+        # early (holder skew / edited transcript) — decline to cold.
+        if reuse_tokens < int(append_plan.get("minimum_safe_reuse") or 0):
+            raise RuntimeError(
+                "multimodal append reuse boundary fell below the cached "
+                "media region; refusing unsafe partial-media reuse"
+            )
+    if cache_hit and append_plan:
+        row_start = int(append_plan.get("appended_pixel_row_start") or 0)
+        pixel_values = context.get("pixel_values")
+        data_kwargs = dict(context.get("data_kwargs") or {})
+        grids = data_kwargs.get("image_grid_thw")
+        old_count = int(append_plan.get("old_image_count") or 0)
+        if pixel_values is None or grids is None or row_start <= 0:
+            raise RuntimeError(
+                "multimodal append reuse missing pixel/grid tensors for the "
+                "appended images"
+            )
+        # Rows partition deterministically per image (prod of its grid row);
+        # the model's feature/token scatter count check is the
+        # crash-don't-corrupt backstop if this slicing is ever wrong.
+        gen_kwargs["input_ids"] = mx.array([suffix_ids], dtype=mx.int32)
+        gen_kwargs["pixel_values"] = pixel_values[row_start:]
+        gen_kwargs["mask"] = None
+        data_kwargs["image_grid_thw"] = grids[old_count:]
+        gen_kwargs.update(data_kwargs)
+        context["input_ids"] = None
+        context["mask"] = None
+    elif cache_hit:
         gen_kwargs["input_ids"] = mx.array([suffix_ids], dtype=mx.int32)
         gen_kwargs["mask"] = None
         # The image is already represented in the reused language KV. Release
@@ -5824,7 +5957,7 @@ def _prewarm_plan_consensus(my_skip, prompt_to_send, cached_prompt_cache):
 
 def _prepare_cached_prompt(model, processor, prompt, token_ids,
                            session_id=None, session_source=None,
-                           thinking_mode="adaptive",
+                           thinking_mode="adaptive", multimodal_context=None,
                            append_reserve_tokens=0,
                            multimodal_fingerprint=None,
                            minimum_safe_reuse=0,
@@ -5942,60 +6075,106 @@ def _prepare_cached_prompt(model, processor, prompt, token_ids,
         cached_multimodal_fingerprint = holder.get("multimodal_fingerprint") or None
         requested_multimodal_fingerprint = multimodal_fingerprint or None
         if cached_multimodal_fingerprint != requested_multimodal_fingerprint:
-            logger.warning(
-                "prompt-cache: multimodal fingerprint mismatch; rebuilding cold "
-                "(cached=%s requested=%s)",
-                (cached_multimodal_fingerprint or "text")[:16],
-                (requested_multimodal_fingerprint or "text")[:16],
-            )
-            _prompt_cache_stash_current_unlocked(
-                reason=f"multimodal_mismatch:{session_id or '__default__'}"
-            )
-            holder["cache"] = None
-            _clear_prompt_cache_key_state_unlocked(holder)
-            gc.collect()
-            restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
-                model,
-                processor,
-                token_ids,
-                session_id=session_id,
-                session_source=session_source,
-                reason="multimodal_mismatch_after_stash",
-                allow_partial_restore=allow_partial_ssd_restore,
-                allow_thinking_boundary_restore=allow_thinking_boundary_restore,
-                append_reserve_tokens=append_reserve_tokens,
-                multimodal_fingerprint=multimodal_fingerprint,
-            )
-            if restored_ssd:
-                return _prepare_cached_prompt(
+            append_plan = None
+            if (
+                cached_multimodal_fingerprint
+                and requested_multimodal_fingerprint
+                and holder.get("cache") is not None
+            ):
+                append_plan = _multimodal_append_reuse_plan(
+                    holder.get("multimodal_descriptor"),
+                    holder.get("token_ids"),
+                    multimodal_context,
+                )
+            if append_plan:
+                logger.info(
+                    "prompt-cache: image set extended %d -> %d; append-aware "
+                    "prefix reuse (media-safe floor %d tokens)",
+                    append_plan["old_image_count"],
+                    append_plan["new_image_count"],
+                    append_plan["minimum_safe_reuse"],
+                )
+                # Adopt the NEW multimodal identity in place: the cached KV is
+                # a verified byte-identical base of the new expanded prompt.
+                # The generic common-prefix flow below then trims/reuses like
+                # any text continuation, floored at the cached media region,
+                # and _apply_multimodal_generation_inputs feeds only the
+                # appended images' pixels alongside the suffix ids.
+                holder["multimodal_fingerprint"] = requested_multimodal_fingerprint
+                holder["multimodal_descriptor"] = copy.deepcopy(
+                    multimodal_context.get("descriptor")
+                )
+                holder["session_id"] = session_id
+                holder["session_source"] = session_source
+                multimodal_context["append_reuse"] = append_plan
+                minimum_safe_reuse = int(append_plan["minimum_safe_reuse"])
+                _set_prompt_cache_event(
+                    "multimodal_append_reuse",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    suffix_tokens=0,
+                    session_id=session_id,
+                    session_source=session_source,
+                    cached_multimodal_fingerprint=cached_multimodal_fingerprint,
+                    multimodal_fingerprint=requested_multimodal_fingerprint,
+                    old_image_count=append_plan["old_image_count"],
+                    new_image_count=append_plan["new_image_count"],
+                )
+            else:
+                logger.warning(
+                    "prompt-cache: multimodal fingerprint mismatch; rebuilding cold "
+                    "(cached=%s requested=%s)",
+                    (cached_multimodal_fingerprint or "text")[:16],
+                    (requested_multimodal_fingerprint or "text")[:16],
+                )
+                _prompt_cache_stash_current_unlocked(
+                    reason=f"multimodal_mismatch:{session_id or '__default__'}"
+                )
+                holder["cache"] = None
+                _clear_prompt_cache_key_state_unlocked(holder)
+                gc.collect()
+                restored_ssd = _prompt_cache_ssd_maybe_restore_unlocked(
                     model,
                     processor,
-                    prompt,
                     token_ids,
                     session_id=session_id,
                     session_source=session_source,
-                    thinking_mode=thinking_mode,
+                    reason="multimodal_mismatch_after_stash",
+                    allow_partial_restore=allow_partial_ssd_restore,
+                    allow_thinking_boundary_restore=allow_thinking_boundary_restore,
                     append_reserve_tokens=append_reserve_tokens,
                     multimodal_fingerprint=multimodal_fingerprint,
-                    minimum_safe_reuse=minimum_safe_reuse,
-                    _restored_ssd=restored_ssd,
                 )
-            holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
-            holder["session_id"] = session_id
-            holder["session_source"] = session_source
-            holder["last_suffix_ids"] = list(token_ids)
-            _set_prompt_cache_event(
-                "multimodal_fingerprint_rebuild",
-                prompt_tokens=len(token_ids),
-                reuse_tokens=0,
-                suffix_tokens=len(token_ids),
-                session_id=session_id,
-                session_source=session_source,
-                cached_multimodal_fingerprint=cached_multimodal_fingerprint,
-                multimodal_fingerprint=requested_multimodal_fingerprint,
-                **_prompt_cache_match_fields(len(token_ids), 0),
-            )
-            return prompt, holder["cache"]
+                if restored_ssd:
+                    return _prepare_cached_prompt(
+                        model,
+                        processor,
+                        prompt,
+                        token_ids,
+                        session_id=session_id,
+                        session_source=session_source,
+                        thinking_mode=thinking_mode,
+                        append_reserve_tokens=append_reserve_tokens,
+                        multimodal_fingerprint=multimodal_fingerprint,
+                        minimum_safe_reuse=minimum_safe_reuse,
+                        _restored_ssd=restored_ssd,
+                    )
+                holder["cache"] = _get_or_build_prompt_cache_unlocked(model)
+                holder["session_id"] = session_id
+                holder["session_source"] = session_source
+                holder["last_suffix_ids"] = list(token_ids)
+                _set_prompt_cache_event(
+                    "multimodal_fingerprint_rebuild",
+                    prompt_tokens=len(token_ids),
+                    reuse_tokens=0,
+                    suffix_tokens=len(token_ids),
+                    session_id=session_id,
+                    session_source=session_source,
+                    cached_multimodal_fingerprint=cached_multimodal_fingerprint,
+                    multimodal_fingerprint=requested_multimodal_fingerprint,
+                    **_prompt_cache_match_fields(len(token_ids), 0),
+                )
+                return prompt, holder["cache"]
 
         # Common prefix between the stored INPUT ids and the new prompt ids.
         L = _common_prefix_len(cached_ids, token_ids)
@@ -17870,6 +18049,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 session_id=session_id,
                 session_source=session_source,
                 thinking_mode=thinking_mode,
+                multimodal_context=multimodal_context,
                 append_reserve_tokens=max_tokens,
                 multimodal_fingerprint=(
                     multimodal_context["fingerprint"]
@@ -18540,6 +18720,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 session_id=session_id,
                 session_source=session_source,
                 thinking_mode=thinking_mode,
+                multimodal_context=multimodal_context,
                 append_reserve_tokens=max_tokens,
                 multimodal_fingerprint=(
                     multimodal_context["fingerprint"]
