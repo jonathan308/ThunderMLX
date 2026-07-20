@@ -1824,7 +1824,19 @@ async function refresh(){
   /* live strip */
   const liveTps = liveDecodeTps(ar, lr.decode_tps ?? stats.avg_decode_tps);
   tween("mDecode", liveTps, v => fmt(v));
-  tween("mPrefill", lr.prompt_tps ?? stats.avg_prompt_tps_meaningful ?? stats.avg_prompt_tps, v => fmt(v, 0));
+  /* The tile's label promises ">=512-tok prompts": honor it. Short prompts
+     measure dispatch overhead, not prefill; show the newest REAL prefill
+     (fresh tokens >= 512, cache-corrected) like the sparkline already does. */
+  let lastRealPrefill = null;
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const x = recent[i];
+    const fresh = Number(x.processed_prompt_tokens ?? x.prompt_tokens) || 0;
+    if (x.ok !== false && fresh >= 512) {
+      lastRealPrefill = Number(x.prompt_tps_excluding_cache ?? x.prompt_tps) || null;
+      break;
+    }
+  }
+  tween("mPrefill", lastRealPrefill ?? stats.avg_prompt_tps_meaningful ?? lr.prompt_tps ?? stats.avg_prompt_tps, v => fmt(v, 0));
   tween("mTtft", stats.avg_ttft_s, v => fmt(v, 2));
   setText("mReqs", fmtInt(lt.requests));
   setText("mReqsSub", (stats.ok_count ?? "—")+"/"+(stats.count ?? "—")+" recent ok");
