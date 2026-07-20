@@ -45,3 +45,9 @@ dashboard_v2.html
 ops/logs/
 runtime_patches/variants/
 ops/.last_published_sha
+# Active research workspaces and local backups stay untracked (machine paths;
+# externally edited by other agents) — never git add -A them into golden.
+ops/notes/sol_drafter_plan/
+ops/notes/gpt_sol_drafter_brief.md
+model_gateway.py.bak-*
+model_gateway.py.passthrough-*
