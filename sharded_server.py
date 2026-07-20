@@ -10248,8 +10248,11 @@ def _looks_like_degenerate_repetition(text, min_cycles=10):
     True when the last stretch of output is a unit repeated many times
     back-to-back — the quantized-decode loop shape, whatever the unit is
     (marker spam, a repeated shell command, a word, a whole paragraph).
-    Two bands:
-      * short periods (3-120 chars): >=10 tight repeats — conservative so
+    Three bands:
+      * tiny periods (3-8 chars): >=16 tight repeats — 10 was low enough to
+        truncate legitimate walls of short markup ("<br>" runs) that real
+        HTML emits back-to-back; a genuine tiny-unit spiral runs hundreds.
+      * short periods (9-120 chars): >=10 tight repeats — conservative so
         numbered lists / a few repeated code lines never trip; real text
         varies within the period, a spiral is byte-identical.
       * long periods (121-1200 chars): >=5 verbatim repeats. 2026-07-10
@@ -10257,14 +10260,29 @@ def _looks_like_degenerate_repetition(text, min_cycles=10):
         ("Wait, I see at line 367... Hmm, I don't see this...") ~30 times
         and sailed under the old 120-char cap. Five byte-identical copies
         of a >120-char block back-to-back does not occur in real prose.
-    Early-exit slicing keeps the common (non-looping) case ~free.
+    Unit gates (2026-07-20 audit: confirmed false-fire families in benign
+    agent payloads):
+      * the unit must contain a LETTER (any script — the unicode-aware
+        not-nonword-not-digit class, so CJK loops are visible):
+        digit/punctuation-only units are data, not prose — zero-run hashes
+        ("000..."), numeric array fillers ("0, 0, 0, "), and separator
+        rulers never trip;
+      * the unit needs >=2 distinct characters: single-character alnum runs
+        (base64 "AAAA..." padding) are payload bytes, not a loop.
+    Early-exit slicing keeps the common (non-looping) case ~free. The 6000
+    tail covers the documented band exactly (1200 chars x 5 copies).
     """
     if not text:
         return False
-    tail = text[-4800:]
+    tail = text[-6000:]
     n = len(tail)
     for period in range(3, 1201):
-        cycles = min_cycles if period <= 120 else 5
+        if period <= 8:
+            cycles = max(min_cycles, 16)
+        elif period <= 120:
+            cycles = min_cycles
+        else:
+            cycles = 5
         span = period * cycles
         if span > n:
             if period > 120:
@@ -10272,12 +10290,12 @@ def _looks_like_degenerate_repetition(text, min_cycles=10):
             continue
         window = tail[-span:]
         unit = window[:period]
-        # Punctuation-only runs are common in generated source (for example
-        # CSS comment rulers made of '=' or '-'). They are not a model loop.
-        # Require semantic bytes so this guard targets repeated prose, code,
-        # commands, or MiniMax marker fragments rather than valid formatting.
-        if re.search(r"[A-Za-z0-9]", unit) and all(
-            window[i:i + period] == unit for i in range(0, span, period)
+        if (
+            re.search(r"[^\W\d_]", unit)
+            and len(set(unit)) >= 2
+            and all(
+                window[i:i + period] == unit for i in range(0, span, period)
+            )
         ):
             return True
     return False
@@ -18201,8 +18219,10 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                         "(decode tail is a tight copy-spiral) — forcing EOS",
                         n,
                     )
-                    _FORCE_EOS["active"] = True
-                    stopped = True
+                    if _arm_rank0_semantic_eos(
+                        rank, "degenerate-repetition guard", n
+                    ):
+                        stopped = True
                 # API/client cancellation also applies to native VLM requests.
                 # Image requests carry pixel_values and intentionally bypass the
                 # text-only batch path, but rank 0's sampled-token synchronizer
@@ -18360,8 +18380,17 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         elif preserve_existing_cache:
             logger.info("prompt-cache: preserved existing cache after bypassed request")
         if stopped:
-            if not _keep_prompt_prefix_after_cancel(token_ids, "stop"):
-                _reset_prompt_cache("reset after stop", clear_resident=False)
+            # Repetition-guard stops keep the FULL recorded sequence: rank 1
+            # (which never sees the rank-0-local arm) records input+generated,
+            # so a rank-0 prefix trim here left the holders asymmetric and the
+            # next request paid a divergence full re-prefill. Both ranks
+            # recording the same full sequence converges naturally: the next
+            # prompt's common-prefix match trims the loop tail identically on
+            # both ranks. User/client stops keep the trim (their transaction
+            # boundary runs a coordinated two-rank reset).
+            if _FORCE_EOS.get("reason") != "degenerate-repetition guard":
+                if not _keep_prompt_prefix_after_cancel(token_ids, "stop"):
+                    _reset_prompt_cache("reset after stop", clear_resident=False)
         if rank == 0 and artifact_completion_state.get("html_closed_at_token"):
             text = _trim_thinking_artifact_completion_text(text)
         return text if rank == 0 else None
@@ -18660,7 +18689,11 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 # buffer, near-empty most steps), so guards must not read it
                 # for history. 2026-07-10 ca0f2748: a retry spiraled 3.8k
                 # tokens of bare markers past a guard checking `accumulated`.
-                raw_tail = (raw_tail + token_text)[-600:]
+                # 6000 chars so the repetition guard's long band (1200-char
+                # units x5) is reachable on the streaming path — the original
+                # 600 cap silently made paragraph-scale loop detection dead
+                # code on every SSE request (2026-07-20 audit).
+                raw_tail = (raw_tail + token_text)[-6000:]
                 if tools and token_text:
                     tool_guard_text += token_text
                     if not tool_call_started:
@@ -18827,8 +18860,10 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                         "(decode tail is a tight copy-spiral) — forcing EOS",
                         n,
                     )
-                    _FORCE_EOS["active"] = True
-                    stopped = True
+                    if _arm_rank0_semantic_eos(
+                        rank, "degenerate-repetition guard", n
+                    ):
+                        stopped = True
                 # Keep coordinated stop available on the upstream VLM path as
                 # well as the text-only batch path. The EOS token is injected
                 # before rank 0's existing sampled-token synchronization.
@@ -19222,8 +19257,15 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 and _thinking_generation_hit_limit(thinking_mode, n, max_tokens)
             )
             if stopped:
-                if not _keep_prompt_prefix_after_cancel(token_ids, "stream stop"):
-                    _reset_prompt_cache("reset after stop", clear_resident=False)
+                # See the run_generation twin: guard stops skip the rank-local
+                # trim so both ranks keep the identical full sequence.
+                if _FORCE_EOS.get("reason") != "degenerate-repetition guard":
+                    if not _keep_prompt_prefix_after_cancel(
+                        token_ids, "stream stop"
+                    ):
+                        _reset_prompt_cache(
+                            "reset after stop", clear_resident=False
+                        )
             elif malformed_thinking:
                 _reset_prompt_cache("reset after no-visible generation stream")
             elif incomplete_thinking:
@@ -19555,7 +19597,11 @@ def _install_rank0_token_sync(group):
             and _FORCE_EOS["active"]
             and _FORCE_EOS["eos_id"] is not None
         ):
-            y = mx.full(y.shape, _FORCE_EOS["eos_id"], dtype=y.dtype)
+            # mx.depends is LOAD-BEARING (m3_pipeline_patch twin): a bare
+            # constant no longer forces rank 0's forward when eagerly
+            # evaluated, starving the peer's h-recv mid-pipeline.
+            eos = mx.full(y.shape, _FORCE_EOS["eos_id"], dtype=y.dtype)
+            y = mx.depends(eos, y)
         elif sync_rank == 0:
             forced_token_id = _consume_rank0_forced_token()
             if forced_token_id is not None:
