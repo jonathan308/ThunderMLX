@@ -71,8 +71,26 @@ python3 -c "import mlx_vlm; print(mlx_vlm.__version__)" 2>/dev/null
 
 If missing: create a venv at the **same path on both machines**
 (`~/mlx-env`), `pip install mlx "mlx-vlm>=0.6.6"`, and repeat the check on
-the worker over SSH. Then link the repo's interpreter wrapper on both:
-`ln -sf ~/mlx-env/bin/python3 <repo>/bin/mlx-python`.
+the worker over SSH. Then create the repo's interpreter wrapper on both —
+it must be a two-line **script**, not a symlink (a symlink resolves through
+to the base interpreter and picks up the wrong site-packages):
+
+```bash
+printf '#!/bin/sh
+exec %s "$@"
+' "$HOME/mlx-env/bin/python3" > <repo>/bin/mlx-python
+chmod +x <repo>/bin/mlx-python
+```
+
+Finally, apply the two bundled mlx-vlm runtime patches on **both** machines
+(they add the prefill progress callback the cancellation path uses and make
+the prefill cache-trim cadence configurable; both are idempotent and safe to
+re-run after any mlx-vlm upgrade):
+
+```bash
+./bin/mlx-python runtime_patches/apply_mlx_vlm_prefill_progress_patch.py
+./bin/mlx-python runtime_patches/apply_mlx_vlm_prefill_clear_cache_patch.py
+```
 
 ## Phase 4 — Model
 
@@ -126,6 +144,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/
 Success criteria: health shows 2 ranks; a chat turn answers; the dashboard
 shows both machines; a second turn in the same chat has a sub-2s first token
 (cache reuse working).
+
+Ongoing runtime updates need no manual pip work: the dashboard's runtime
+panel checks PyPI and updates mlx-vlm on both ranks as one transaction
+(staged wheels, patch re-application, verification, rollback on failure).
 
 ## Agent safety rules (non-negotiable)
 
