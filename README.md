@@ -1,6 +1,6 @@
 # ⚡ ThunderMLX
 
-**Run a 427B-parameter (23B-active) frontier MoE on your desk.** ThunderMLX turns two
+**Run a 428B-parameter (23B-active) frontier MoE on your desk.** ThunderMLX turns two
 Apple Silicon Macs connected by Thunderbolt 5 into a single, production-grade
 inference machine serving **MiniMax-M3** — with an OpenAI-compatible API,
 agent-ready tool calling, live thinking streams, tiered KV caching, and
