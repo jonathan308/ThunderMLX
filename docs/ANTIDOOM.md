@@ -23,14 +23,27 @@ provide an MLX inference plugin.
 
 ## What ThunderMLX does at runtime
 
-ThunderMLX checks the rolling decode tail every 12 generated tokens. It only
-matches byte-identical, contiguous spans containing semantic characters:
+ThunderMLX checks the rolling decode tail every 12 generated tokens (rank 0
+only, after a 48-token warm-up, on the batch-cancel generation path). It only
+matches byte-identical, contiguous spans whose repeating unit contains a
+letter (any script, so CJK loops are visible) and at least two distinct
+characters:
 
-- short spans (3-120 characters) require at least 10 consecutive copies;
-- long spans (121-1,200 characters) require at least 5 consecutive copies;
-- punctuation-only rulers and separators are ignored;
+- tiny spans (3-8 characters) require at least 16 consecutive copies, so
+  legitimate short-markup walls (e.g. `<br>` runs) are not truncated;
+- short spans (9-120 characters) require at least 10 consecutive copies;
+- long spans (121-1,200 characters) require at least 5 consecutive copies
+  (the scan window is 6,000 characters on both request paths, so the full
+  band is reachable while streaming);
+- punctuation-only rulers, digit-only fillers ("0, 0, 0, "), zero-run
+  hashes, and single-character runs (base64 padding) are ignored — they are
+  data, not loops;
 - ordinary repetition penalties remain disabled for the published MiniMax-M3
   thinking profile, so valid reasoning and code are not globally distorted.
+
+On a confirmed loop the guard arms the validated synchronized-EOS helper, and
+both ranks record the identical full sequence afterwards, so the next request
+reuses the shared prefix without a cross-rank divergence rebuild.
 
 On a confirmed loop, rank 0 injects EOS through the existing sampled-token
 synchronization. Both pipeline ranks consume the same token and leave decode
