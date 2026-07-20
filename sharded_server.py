@@ -2468,6 +2468,15 @@ _prompt_cache_ssd_state = {
     "auto_save_deferred_count": 0,
 }
 _prompt_cache_ssd_autosave_anchors = OrderedDict()
+
+# One-shot flag set (symmetrically, from the consensus verdict) when the
+# prefix plans diverge: the NEXT SSD restore attempt is skipped on every rank
+# so both ranks run a true cold rebuild whose holder cache then autosaves
+# fresh, re-aligned artifacts. Without this, per-rank artifact skew replays
+# restore->divergence->transient-prefill forever (no artifact rewrite ever
+# happens because the divergence prefill bypasses the holder). Consumed by
+# _prompt_cache_ssd_maybe_restore_unlocked under _prompt_cache_lock.
+_prompt_cache_post_divergence_cold_once = {"active": False}
 _prompt_cache_ssd_scan_cache = {"at": None, "scan": None}
 _metal_warmup_lock = _threading.RLock()
 _metal_warmup_last_event = None
@@ -3576,8 +3585,12 @@ def _prompt_cache_ssd_autosave_due_unlocked(model, processor):
 
     A 256k two-rank checkpoint is roughly 33 GiB. Rewriting it after every
     tiny follow-up adds seconds after the final token and unnecessary SSD
-    wear. Anchors are advanced only after a successful save or coordinated
-    restore, so both ranks make the same deterministic token-delta decision.
+    wear. Anchors are advanced ONLY after a successful save (2026-07-20:
+    restores no longer advance them — restores are rank-local now, and an
+    anchor recorded at restore froze per-rank artifact skew forever by
+    suppressing the resync save; see _prompt_cache_ssd_try_restore_unlocked).
+    The cost is one extra autosave after each restored session's first
+    generation.
     """
     holder = _prompt_cache_holder
     token_ids = list(holder.get("token_ids") or [])
@@ -4077,25 +4090,29 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
         append_reserve_tokens=append_reserve_tokens,
         multimodal_fingerprint=multimodal_fingerprint,
     )
-    rank, world = _prompt_cache_ssd_current_rank_world()
+    rank, _world = _prompt_cache_ssd_current_rank_world()
     local_ok = 1 if cache is not None and stored_ids and meta else 0
     local_cache_len = int((meta or {}).get("_restore_tokens") or 0) if local_ok else 0
     local_key_tokens = local_cache_len
-    try:
-        ok_total = mx.distributed.all_sum(mx.array(local_ok, dtype=mx.int32))
-        len_total = mx.distributed.all_sum(mx.array(local_cache_len, dtype=mx.int64))
-        key_total = mx.distributed.all_sum(mx.array(local_key_tokens, dtype=mx.int64))
-        mx.eval(ok_total, len_total, key_total)
-        all_ok = int(ok_total.item()) == world
-        same_len = int(len_total.item()) == local_cache_len * world
-        same_key = int(key_total.item()) == local_key_tokens * world
-    except Exception as e:
-        all_ok = False
-        same_len = False
-        same_key = False
-        miss_reason = f"restore_sync_failed:{e}"
-    if not (all_ok and same_len and same_key and local_ok):
-        reason = miss_reason or "rank_restore_mismatch"
+    # 2026-07-20 rank-symmetric junction fix: the restore verdict is now
+    # rank-LOCAL. This function used to run three all_sums here to verify all
+    # ranks restored the same artifact — but whether a rank even REACHES this
+    # function depends on its own holder/slot state (cold-miss, low-reuse,
+    # session-switch, auto-isolation, multimodal-mismatch call sites), so any
+    # per-rank state skew (slot eviction, TTL race) sent one rank through the
+    # collectives while its peer skipped to _prefix_plan_consensus — the
+    # cross-paired all_sums desynced the pipeline (2026-07-19 22:38 wedge).
+    # Restore is best-effort per rank; _prefix_plan_consensus runs on every
+    # request whose (rank-symmetric) cache_allowed is true — its inputs are
+    # broadcast/env-derived plus the synced multimodal fingerprint and the
+    # image-presence consensus, and MUST stay that way — and resolves ANY
+    # cross-rank plan mismatch (restored-N vs restored-M vs nothing) by
+    # dropping both ranks to an identical full prefill. A passing consensus forces equal reuse r,
+    # and reuse is common_prefix_len against the broadcast token_ids, so both
+    # trimmed KV prefixes cover the same tokens — content coherence holds
+    # without any cross-rank exchange during prepare.
+    if not local_ok:
+        reason = miss_reason or "local_restore_miss"
         _prompt_cache_ssd_state["last_restore_miss_reason"] = reason
         _prompt_cache_ssd_state["last_error"] = None
         if cache is not None:
@@ -4146,11 +4163,13 @@ def _prompt_cache_ssd_try_restore_unlocked(model, processor, token_ids,
             meta.get("_thinking_boundary_restore")
         ),
     })
-    _prompt_cache_ssd_record_autosave_anchor_unlocked(
-        session_key,
-        stored_ids,
-        meta.get("runtime_hash"),
-    )
+    # 2026-07-20: intentionally NOT advancing the autosave anchor here. The
+    # anchor invariant is "advance only after a save or COORDINATED restore";
+    # restores are now rank-local, and a partial restore records a token
+    # length matching no on-disk artifact. Leaving the anchor at its last
+    # SAVE means the first post-restore autosave rewrites the artifact —
+    # one extra save per restored session, and per-rank artifact skew heals
+    # instead of freezing.
     _set_prompt_cache_event(
         "ssd_restore",
         prompt_tokens=len(token_ids or []),
@@ -4221,11 +4240,22 @@ def _prompt_cache_ssd_maybe_restore_unlocked(model, processor, token_ids,
                                              multimodal_fingerprint=None):
     """Try durable restore only when RAM/live reuse has already missed.
 
-    This helper intentionally does not inspect local artifact existence before
-    calling the distributed restore path. All ranks must make the same decision;
-    the restore path itself synchronizes success/failure safely.
+    2026-07-20: the restore path is rank-LOCAL (no collectives) — each rank
+    restores best-effort from its own artifact and _prefix_plan_consensus
+    reconciles any cross-rank plan mismatch afterwards. Ranks no longer need
+    to reach this helper together.
     """
     if not _prompt_cache_ssd_restore_eligible_unlocked(token_ids, session_id):
+        return None
+    if _prompt_cache_post_divergence_cold_once["active"]:
+        # Post-divergence heal: force one true cold rebuild (both ranks —
+        # the flag was armed by the symmetric consensus verdict) so the
+        # holder gets a real cache and the next autosave rewrites aligned
+        # artifacts on every rank.
+        _prompt_cache_post_divergence_cold_once["active"] = False
+        _prompt_cache_ssd_state["last_restore_miss_reason"] = (
+            "post_divergence_cold_rebuild"
+        )
         return None
     _prompt_cache_ssd_state["last_restore_attempt_reason"] = reason
     return _prompt_cache_ssd_try_restore_unlocked(
@@ -5636,8 +5666,35 @@ def _metal_warmup_status():
 
 
 
+def _image_presence_consensus(image_present_local):
+    """Symmetric probe: did ANY rank materialize image bytes for this request?
+
+    Each rank fetches/materializes images independently and swallows failures,
+    so the rank-local `image` can differ across ranks (expired URL, one-rank
+    fetch error). The cache-allowed gate must not read that local value — a
+    per-rank cache_allowed flip lets one rank skip the prefix-plan consensus
+    all_sum its peer issues (collective cross-pair class). Callers only invoke
+    this under broadcast-symmetric conditions (request expects an image and no
+    synced multimodal context), so both ranks enter together; one scalar
+    all_sum. any-rank-has-image -> ALL ranks bypass the cache; no rank has
+    image bytes -> ALL ranks may cache the text-tokenized transcript (the
+    pre-2026-07-20 behavior for fully-degraded image sessions).
+    """
+    try:
+        group = mx.distributed.init()
+        if group.size() <= 1:
+            return bool(image_present_local)
+        total = mx.distributed.all_sum(
+            mx.array(1 if image_present_local else 0, dtype=mx.int32)
+        )
+        mx.eval(total)
+        return int(total.item()) > 0
+    except Exception:
+        return True  # conservative: bypass caching
+
+
 def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
-                           cached_suffix_ids):
+                           cached_suffix_ids, prepare_failed=False):
     """Rank-coherence gate for the prefill plan (2026-07-07; hardened 2026-07-08).
 
     Both ranks compute cache reuse independently and are ASSUMED to agree.
@@ -5672,6 +5729,13 @@ def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
             my_counter = -1
         if my_counter != my_phys:
             my_incoherent = 1
+    if prepare_failed:
+        # 2026-07-20 rank-symmetry: a rank whose _prepare_cached_prompt raised
+        # still votes here (its caller re-raises AFTER this exchange) so the
+        # peer's all_sum is never left unpaired to cross-pair with the mirror
+        # _bcast / generation-barrier scalars. The sentinel makes the healthy
+        # peer abort the request in lockstep instead of generating alone.
+        my_incoherent = 4
     if cached_suffix_ids:
         my_suffix = len(cached_suffix_ids)
     else:
@@ -5691,6 +5755,13 @@ def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
     except Exception as e:
         logger.warning("prefix-plan consensus unavailable (%s); keeping local plan", e)
         return prompt_to_send, cached_prompt_cache, cached_suffix_ids
+    if peer[3] >= 4 and my_incoherent < 4:
+        raise RuntimeError(
+            "peer rank failed during prompt-cache prepare; aborting the "
+            "request in lockstep (no one-sided generation collectives)"
+        )
+    if my_incoherent >= 4:
+        return prompt, None, None  # caller re-raises its prepare exception
     if (
         peer[0] == my_phys
         and peer[1] == my_counter
@@ -5707,6 +5778,14 @@ def _prefix_plan_consensus(rank, prompt, prompt_to_send, cached_prompt_cache,
         my_incoherent, peer[3],
     )
     _reset_prompt_cache("prefix plan divergence", clear_resident=False)
+    try:
+        with _prompt_cache_lock:
+            # Both ranks reach this branch together (verdict is computed from
+            # the summed totals), so flag + anchor state stay rank-symmetric.
+            _prompt_cache_post_divergence_cold_once["active"] = True
+            _prompt_cache_ssd_autosave_anchors.clear()
+    except Exception:
+        pass
     return prompt, None, None
 
 
@@ -6722,13 +6801,22 @@ def _prompt_cache_allowed_for_generation(
     token_ids,
     image,
     multimodal_fingerprint=None,
+    image_request_expected=False,
 ):
     """Allow image KV reuse only with an exact expanded multimodal plan.
 
     The feature gate preserves Beta 5's full-prefill path unless both direct
     suffix IDs and an exact image/preprocessor fingerprint are available.
+
+    2026-07-20 rank-symmetry: the image test keys on image_request_expected
+    (broadcast-derived, identical on every rank) rather than only the
+    rank-LOCAL materialized `image`. Each rank materializes image bytes
+    independently and swallows failures, so `image` alone can differ across
+    ranks after a one-rank fetch failure — which flipped cache_allowed on one
+    rank only and let it skip the prefix-plan consensus all_sum its peer was
+    issuing (collective cross-pair -> pipeline desync class).
     """
-    if image is not None and not (
+    if (image is not None or image_request_expected) and not (
         IMAGE_PROMPT_CACHE_ENABLED
         and PROMPT_CACHE_DIRECT_SUFFIX_IDS
         and multimodal_fingerprint
@@ -7054,7 +7142,13 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
     existing_reuse = 0
     existing_suffix = len(token_ids)
     with _prompt_cache_lock:
-        existing_ids = list(_prompt_cache_holder.get("token_ids") or [])
+        # token_ids without a live cache (e.g. post-divergence bookkeeping)
+        # must count as zero reuse, else a max-context prewarm slips past the
+        # too-large guard and cold-prefills the entire transcript.
+        existing_ids = (
+            list(_prompt_cache_holder.get("token_ids") or [])
+            if _prompt_cache_holder.get("cache") is not None else []
+        )
     if existing_ids:
         existing_reuse = _common_prefix_len(existing_ids, token_ids)
         existing_suffix = max(0, len(token_ids) - existing_reuse)
@@ -7092,21 +7186,35 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
     try:
         my_skip = my_skip_too_large
         prepare_event = {}
+        prepare_error = None
         if not my_skip_too_large:
-            prompt_to_send, cache = _prepare_cached_prompt(
-                model, processor, prompt, token_ids,
-                session_id=session_id,
-                session_source=session_source,
-                append_reserve_tokens=1,
-            )
-            prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
-            my_skip = bool(
-                cache is None
-                and _prompt_cache_prepare_preserves_existing_cache(
-                    prepare_event.get("action")
+            try:
+                prompt_to_send, cache = _prepare_cached_prompt(
+                    model, processor, prompt, token_ids,
+                    session_id=session_id,
+                    session_source=session_source,
+                    append_reserve_tokens=1,
                 )
-            )
+                prepare_event = _prompt_cache_status().get("last_prepare_event") or {}
+                my_skip = bool(
+                    cache is None
+                    and _prompt_cache_prepare_preserves_existing_cache(
+                        prepare_event.get("action")
+                    )
+                )
+            except Exception as prep_exc:
+                # 2026-07-20 rank-symmetry: a one-rank prepare failure used to
+                # bail through the outer except BEFORE the consensus below,
+                # leaving the healthy peer's consensus all_sum unpaired (it
+                # would cross-pair with this rank's next mirror _bcast). Vote
+                # skip in the consensus FIRST, then re-raise so the outer
+                # except keeps its exact cleanup semantics.
+                prepare_error = prep_exc
+                prompt_to_send, cache = prompt, None
+                my_skip = True
         verdict = _prewarm_plan_consensus(my_skip, prompt_to_send, cache)
+        if prepare_error is not None:
+            raise prepare_error
         if verdict == "skip":
             if not my_skip_too_large:
                 logger.info(
@@ -7210,7 +7318,7 @@ def _prewarm_prompt_cache(model, processor, prompt, token_ids, *,
             logger.info("prompt-cache: preserved large cache after bypassed prewarm failure")
             return False
         if reset_on_failure:
-            _reset_prompt_cache("prewarm failed")
+            _reset_prompt_cache("prewarm failed", clear_resident=False)
         return False
     finally:
         _mark_prompt_cache_in_use(False)
@@ -17476,12 +17584,6 @@ _ADMISSION_DROP_STALE_LIVE = (
     os.environ.get("MLX_M3_ADMISSION_DROP_STALE_LIVE", "0").strip() == "1"
 )
 
-# Rung-2 idle-slot eviction — LAB-ONLY until the SSD-restore junction runs a
-# rank-symmetric collective sequence (see list_idle_evictables for the
-# 2026-07-19 22:38 wedge forensics). Do not enable in production.
-_ADMISSION_EVICT_SLOTS_UNSAFE = (
-    os.environ.get("MLX_M3_ADMISSION_EVICT_SLOTS_UNSAFE", "0").strip() == "1"
-)
 
 
 def _admission_drop_stale_live_unlocked(model, processor):
@@ -17565,18 +17667,12 @@ def _maybe_run_prefill_admission(new_tokens, rank, model=None, processor=None,
             return max(0, before - after)
 
         def list_idle_evictables():
-            # UNSAFE until the SSD-restore junction is made rank-symmetric.
-            # 2026-07-19 22:38 lab wedge: rung-2 evicted bigA's slot on rank0
-            # only (rank1 had no deficit); on bigA's return rank1 slot-HIT
-            # skipped _prompt_cache_ssd_try_restore_unlocked while rank0's
-            # slot-MISS entered it — its three all_sums cross-paired with
-            # rank1's prefix-plan consensus all_sum (peer suffix=2097152000,
-            # incoherent=42739860 garbage), desyncing the pipeline into a
-            # zero-progress stall -> watchdog force-exit. ANY per-rank cache
-            # eviction (idle slots or live holder) can arm that landmine, so
-            # rung-2 stays empty unless explicitly forced for lab testing.
-            if not _ADMISSION_EVICT_SLOTS_UNSAFE:
-                return []
+            # Per-rank eviction is safe as of 2026-07-20: the SSD restore
+            # path runs no collectives (each rank restores locally,
+            # _prefix_plan_consensus reconciles), so a slot evicted on one
+            # rank only can no longer desequence the collective stream. The
+            # 2026-07-19 22:38 wedge this used to cause is documented at the
+            # restore verdict in _prompt_cache_ssd_try_restore_unlocked.
             items = []
             kv_per = _admission.DEFAULT_KV_BYTES_PER_TOKEN
             with _prompt_cache_lock:
@@ -17602,11 +17698,10 @@ def _maybe_run_prefill_admission(new_tokens, rank, model=None, processor=None,
         # persist+release the stale resident session's live KV before the
         # standard trim/idle ladder. Uses the production one-slot-switch release
         # sequence; never touches the cache this request uses (cold => none).
-        # LAB-ONLY for the same reason as rung-2: releasing the holder on one
-        # rank only can route that rank through the SSD-restore collectives on
-        # the session's next visit while the peer skips them (the 22:38
-        # cross-paired-all_sum wedge). Keep off until the restore junction is
-        # rank-symmetric.
+        # Safe with per-rank state skew as of 2026-07-20: the SSD restore path
+        # is collective-free, so a holder released on one rank only just makes
+        # that rank restore/rebuild locally and _prefix_plan_consensus
+        # reconciles the plans.
         if (cold_prefill and _ADMISSION_DROP_STALE_LIVE
                 and model is not None and processor is not None):
             _limit = read_limit() or 0
@@ -17708,6 +17803,9 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
     cached_suffix_ids = None
     cache_marked_in_use = False
     cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
+    image_gate_expected = image_request_expected
+    if image_request_expected and multimodal_context is None:
+        image_gate_expected = _image_presence_consensus(image is not None)
     cache_allowed = _prompt_cache_allowed_for_generation(
         thinking_mode,
         token_ids,
@@ -17715,6 +17813,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         multimodal_fingerprint=(
             multimodal_context["fingerprint"] if multimodal_context else None
         ),
+        image_request_expected=image_gate_expected,
     )
     if cache_allowed:
         _expire_idle_prompt_cache()
@@ -17741,14 +17840,28 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                 and cached_prompt_cache is not None
             ):
                 cached_suffix_ids = _prompt_cache_last_suffix_ids()
+        except Exception as prepare_exc:
+            # 2026-07-20 rank-symmetry: vote in the consensus BEFORE
+            # re-raising so the peer's all_sum stays paired (same pattern as
+            # the prewarm fix; a one-sided skip here was the remaining twin
+            # of the 22:38 cross-pair class).
+            _mark_prompt_cache_in_use(False)
+            cache_marked_in_use = False
+            try:
+                _prefix_plan_consensus(rank, prompt, prompt, None, None,
+                                       prepare_failed=True)
+            except Exception:
+                pass
+            raise prepare_exc
+        try:
+            prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
+                _prefix_plan_consensus(rank, prompt, prompt_to_send,
+                                       cached_prompt_cache, cached_suffix_ids)
+            )
         except Exception:
             _mark_prompt_cache_in_use(False)
             cache_marked_in_use = False
             raise
-        prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
-            _prefix_plan_consensus(rank, prompt, prompt_to_send,
-                                   cached_prompt_cache, cached_suffix_ids)
-        )
 
     # Prefill admission guard (per-rank-local; runs after the prefix-plan
     # barrier so both ranks are already synchronized, adds no collective).
@@ -18340,6 +18453,9 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
     cached_suffix_ids = None
     cache_marked_in_use = False
     cache_mode = _prompt_cache_mode_for_request(thinking_mode, token_ids)
+    image_gate_expected = image_request_expected
+    if image_request_expected and multimodal_context is None:
+        image_gate_expected = _image_presence_consensus(image is not None)
     cache_allowed = _prompt_cache_allowed_for_generation(
         thinking_mode,
         token_ids,
@@ -18347,6 +18463,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         multimodal_fingerprint=(
             multimodal_context["fingerprint"] if multimodal_context else None
         ),
+        image_request_expected=image_gate_expected,
     )
     timing = {
         "cache_prepare_started_at": None,
@@ -18382,6 +18499,17 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
                 and cached_prompt_cache is not None
             ):
                 cached_suffix_ids = _prompt_cache_last_suffix_ids()
+        except Exception as prepare_exc:
+            # rank-symmetry: vote before re-raise (see run_generation twin).
+            _mark_prompt_cache_in_use(False)
+            cache_marked_in_use = False
+            try:
+                _prefix_plan_consensus(rank, prompt, prompt, None, None,
+                                       prepare_failed=True)
+            except Exception:
+                pass
+            raise prepare_exc
+        try:
             prompt_to_send, cached_prompt_cache, cached_suffix_ids = (
                 _prefix_plan_consensus(rank, prompt, prompt_to_send,
                                        cached_prompt_cache, cached_suffix_ids)
@@ -19912,6 +20040,7 @@ def run_http_server(model, processor, rank):
                         "thinking_mode": DEFAULT_THINKING_MODE,
                         "session_id": snapshot.get("session_id"),
                         "session_source": snapshot.get("session_source"),
+                        "reset_on_failure": False,
                     }, rank)
                 except Exception as e:
                     logger.debug("coordinated keepwarm prewarm broadcast failed: %s", e)
@@ -23464,6 +23593,13 @@ def run_mirror(model, processor, rank):
                 reason=reason,
                 session_id=req.get("session_id"),
                 session_source=req.get("session_source"),
+                # rank-symmetry: mirror rank must apply the SAME failure
+                # cleanup as the broadcasting rank — the keepwarm caller
+                # preserves caches (False) while the visible-transcript
+                # caller resets (True); a mismatched default here dropped
+                # rank1's holder+slots while rank0 kept its own, seeding
+                # per-rank cache-state divergence.
+                reset_on_failure=bool(req.get("reset_on_failure", True)),
             )
             if CLEAR_CACHE_AFTER_REQUEST:
                 _clear_transient_mlx_memory("rank 1 prompt-cache prewarm")
