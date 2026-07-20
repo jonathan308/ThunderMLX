@@ -15,7 +15,7 @@ Expect 30–60 minutes plus the model download.
   Ethernet works for control traffic but the data path wants Thunderbolt.
 - **macOS** on both, same major version preferred.
 - **Python 3.12+** on both, with [MLX](https://github.com/ml-explore/mlx) and
-  [mlx-vlm >= 0.6.5](https://github.com/Blaizzy/mlx-vlm) installed in the same
+  [mlx-vlm >= 0.6.6](https://github.com/Blaizzy/mlx-vlm) installed in the same
   interpreter path on each machine.
 - At least ~250GB free disk on the primary for the ~225GB model plus download
   and runtime headroom. If you enable the SSD prompt-cache tier, budget its

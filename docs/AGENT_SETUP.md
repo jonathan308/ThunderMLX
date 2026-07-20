@@ -70,7 +70,7 @@ python3 -c "import mlx_vlm; print(mlx_vlm.__version__)" 2>/dev/null
 ```
 
 If missing: create a venv at the **same path on both machines**
-(`~/mlx-env`), `pip install mlx "mlx-vlm>=0.6.5"`, and repeat the check on
+(`~/mlx-env`), `pip install mlx "mlx-vlm>=0.6.6"`, and repeat the check on
 the worker over SSH. Then link the repo's interpreter wrapper on both:
 `ln -sf ~/mlx-env/bin/python3 <repo>/bin/mlx-python`.
 
