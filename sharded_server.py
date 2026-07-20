@@ -56,6 +56,7 @@ from contextlib import asynccontextmanager, contextmanager
 import mlx.core as mx
 
 import m3_multimodal_cache as _mm_cache
+import m3_prefill_admission as _admission
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [rank ?] %(levelname)s %(message)s")
@@ -7527,6 +7528,7 @@ def _configure_metal_memory_limits():
         limits["cache_limit_gb"] = _bytes_to_gb(cache_limit)
         limits["old_cache_limit_gb"] = _bytes_to_gb(old)
 
+    limits["wired_limit_bytes"] = int(wired_limit) if wired_limit else 0
     _METAL_LIMITS = limits
     logger.info("Metal memory limits: %s", limits)
 
@@ -17455,6 +17457,183 @@ def _disarm_constrained_tools():
         pass
 
 
+def _prefill_admission_new_tokens(token_ids, cached_prompt_cache, cached_suffix_ids):
+    """New tokens the prefill will actually process (drives the admission
+    estimate). Cold prefill = full prompt (the wedge case). Direct-suffix cache
+    hit = exact suffix length. Other cache hit = 0 (small incremental prefill;
+    the resident prefix is already reflected in current wired memory)."""
+    try:
+        if cached_suffix_ids:
+            return len(cached_suffix_ids)
+        if cached_prompt_cache is not None:
+            return 0
+        return len(token_ids or [])
+    except Exception:
+        return 0
+
+
+_ADMISSION_DROP_STALE_LIVE = (
+    os.environ.get("MLX_M3_ADMISSION_DROP_STALE_LIVE", "0").strip() == "1"
+)
+
+# Rung-2 idle-slot eviction — LAB-ONLY until the SSD-restore junction runs a
+# rank-symmetric collective sequence (see list_idle_evictables for the
+# 2026-07-19 22:38 wedge forensics). Do not enable in production.
+_ADMISSION_EVICT_SLOTS_UNSAFE = (
+    os.environ.get("MLX_M3_ADMISSION_EVICT_SLOTS_UNSAFE", "0").strip() == "1"
+)
+
+
+def _admission_drop_stale_live_unlocked(model, processor):
+    """Release a STALE resident live cache before a cold prefill (rung 3).
+
+    Reuses the exact release sequence the one-slot session switch already runs
+    (checkpoint to SSD, holder['cache']=None, clear key state, gc) — a
+    production-proven path. Only ever called on a COLD prefill (cached_prompt_
+    cache is None), so the holder's cache is NOT the one this request will use;
+    it is stale relative to this request and safe to persist+drop. Does NOT
+    touch the in_use flag (the direct-assignment release never did). Fills the
+    gap where the built-in switch-release skips auto-sessions. Returns bytes-ish
+    freed estimate (token count) for logging."""
+    holder = _prompt_cache_holder
+    cache = holder.get("cache")
+    if cache is None:
+        return 0
+    outgoing_session = holder.get("session_id")
+    outgoing_len = int(holder.get("cache_len") or 0)
+    try:
+        _prompt_cache_ssd_maybe_autosave_unlocked(
+            model, processor, prompt=holder.get("prompt"),
+            reason="admission_pressure_release",
+        )
+    except Exception:
+        pass  # checkpoint best-effort; correctness holds (SSD restore optional)
+    holder["cache"] = None
+    _clear_prompt_cache_key_state_unlocked(holder)
+    gc.collect()
+    logger.warning(
+        "prefill admission: pressure-released stale %s-session %d-token live "
+        "cache before cold prefill",
+        outgoing_session, outgoing_len,
+    )
+    return outgoing_len
+
+
+def _maybe_run_prefill_admission(new_tokens, rank, model=None, processor=None,
+                                 cold_prefill=False):
+    """Per-rank-local memory admission before a large prefill. No collectives,
+    no cross-rank messaging: each rank frees its own headroom. Fail-open."""
+    if not _admission.ENABLED or not new_tokens:
+        return
+    try:
+        if not getattr(mx, "metal", None) or not mx.metal.is_available():
+            return
+
+        def read_wired():
+            try:
+                return int(mx.get_active_memory())
+            except Exception:
+                return 0
+
+        def read_limit():
+            # Test hook: MLX_M3_ADMISSION_TEST_LIMIT_GIB forces a low ceiling so
+            # the eviction ladder can be exercised without filling real memory.
+            _test = os.environ.get("MLX_M3_ADMISSION_TEST_LIMIT_GIB", "")
+            if _test:
+                try:
+                    return int(float(_test) * (1024 ** 3))
+                except (TypeError, ValueError):
+                    pass
+            return int(_METAL_LIMITS.get("wired_limit_bytes") or 0)
+
+        def trim_pool():
+            before = 0
+            try:
+                before = int(mx.get_cache_memory())
+            except Exception:
+                pass
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
+            gc.collect()
+            after = 0
+            try:
+                after = int(mx.get_cache_memory())
+            except Exception:
+                pass
+            return max(0, before - after)
+
+        def list_idle_evictables():
+            # UNSAFE until the SSD-restore junction is made rank-symmetric.
+            # 2026-07-19 22:38 lab wedge: rung-2 evicted bigA's slot on rank0
+            # only (rank1 had no deficit); on bigA's return rank1 slot-HIT
+            # skipped _prompt_cache_ssd_try_restore_unlocked while rank0's
+            # slot-MISS entered it — its three all_sums cross-paired with
+            # rank1's prefix-plan consensus all_sum (peer suffix=2097152000,
+            # incoherent=42739860 garbage), desyncing the pipeline into a
+            # zero-progress stall -> watchdog force-exit. ANY per-rank cache
+            # eviction (idle slots or live holder) can arm that landmine, so
+            # rung-2 stays empty unless explicitly forced for lab testing.
+            if not _ADMISSION_EVICT_SLOTS_UNSAFE:
+                return []
+            items = []
+            kv_per = _admission.DEFAULT_KV_BYTES_PER_TOKEN
+            with _prompt_cache_lock:
+                for key, entry in list(_prompt_cache_resident_slots.items()):
+                    clen = int(entry.get("cache_len") or 0)
+                    if clen <= 0:
+                        continue
+
+                    def _drop(k=key):
+                        with _prompt_cache_lock:
+                            _prompt_cache_resident_slots.pop(k, None)
+                        try:
+                            mx.clear_cache()
+                        except Exception:
+                            pass
+                        gc.collect()
+
+                    items.append({"label": str(key)[:40],
+                                  "bytes": clen * kv_per, "drop": _drop})
+            return items
+
+        # Rung 3 (highest lever, opt-in): on a COLD prefill under real pressure,
+        # persist+release the stale resident session's live KV before the
+        # standard trim/idle ladder. Uses the production one-slot-switch release
+        # sequence; never touches the cache this request uses (cold => none).
+        # LAB-ONLY for the same reason as rung-2: releasing the holder on one
+        # rank only can route that rank through the SSD-restore collectives on
+        # the session's next visit while the peer skips them (the 22:38
+        # cross-paired-all_sum wedge). Keep off until the restore junction is
+        # rank-symmetric.
+        if (cold_prefill and _ADMISSION_DROP_STALE_LIVE
+                and model is not None and processor is not None):
+            _limit = read_limit() or 0
+            _before = read_wired() or 0
+            if _admission.admission_deficit_bytes(int(new_tokens), _before,
+                                                  _limit) > 0:
+                with _prompt_cache_lock:
+                    _admission_drop_stale_live_unlocked(model, processor)
+                try:
+                    mx.clear_cache()
+                except Exception:
+                    pass
+                gc.collect()
+
+        info = _admission.run_admission(
+            int(new_tokens), read_wired, read_limit, trim_pool,
+            list_idle_evictables, logger=logger,
+        )
+        if info.get("guarded") and info.get("actions"):
+            _prompt_cache_holder_note = None  # (telemetry hook; no-op)
+    except Exception as e:  # the guard must NEVER break generation
+        try:
+            logger.warning("prefill admission guard skipped (non-fatal): %s", e)
+        except Exception:
+            pass
+
+
 def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    thinking_mode="adaptive", gen_params=None, progress_cb=None,
                    token_ids=None, session_id=None, session_source=None,
@@ -17571,6 +17750,14 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                                    cached_prompt_cache, cached_suffix_ids)
         )
 
+    # Prefill admission guard (per-rank-local; runs after the prefix-plan
+    # barrier so both ranks are already synchronized, adds no collective).
+    _maybe_run_prefill_admission(
+        _prefill_admission_new_tokens(token_ids, cached_prompt_cache,
+                                      cached_suffix_ids),
+        rank, model=model, processor=processor,
+        cold_prefill=(cached_prompt_cache is None),
+    )
     gen_kwargs = dict(
         model=model, processor=processor, prompt=prompt_to_send,
         max_tokens=max_tokens,
@@ -18205,6 +18392,13 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
             cache_marked_in_use = False
             raise
 
+    # Prefill admission guard (per-rank-local; see run_generation twin).
+    _maybe_run_prefill_admission(
+        _prefill_admission_new_tokens(token_ids, cached_prompt_cache,
+                                      cached_suffix_ids),
+        rank, model=model, processor=processor,
+        cold_prefill=(cached_prompt_cache is None),
+    )
     gen_kwargs = dict(
         model=model, processor=processor, prompt=prompt_to_send,
         max_tokens=max_tokens,

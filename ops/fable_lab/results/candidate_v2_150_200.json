@@ -1,0 +1,283 @@
+{
+ "started": "2026-07-19 13:12:39",
+ "points": [
+  {
+   "size": 150000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 368.22,
+     "tool_called": [],
+     "needle_ok": true,
+     "req": "chatcmpl-cdd4b2b3",
+     "elapsed": 366.23,
+     "first_token": 353.66,
+     "prompt_tps": 335.27,
+     "tokens": 314,
+     "tps": 0.86,
+     "decode_tps": 24.9
+    },
+    {
+     "rep": 1,
+     "wall": 17.3,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-0a428fe6",
+     "elapsed": 17.04,
+     "first_token": 4.58,
+     "prompt_tps": 253988.22,
+     "tokens": 321,
+     "tps": 18.84,
+     "decode_tps": 25.67
+    }
+   ]
+  },
+  {
+   "size": 150000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 373.67,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-2ec5f46c",
+     "elapsed": 373.42,
+     "first_token": 363.15,
+     "prompt_tps": 327.0,
+     "tokens": 231,
+     "tps": 0.62,
+     "decode_tps": 22.4
+    },
+    {
+     "rep": 1,
+     "wall": 11.09,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-7353ccfd",
+     "elapsed": 10.86,
+     "first_token": 0.72,
+     "prompt_tps": 183538.34,
+     "tokens": 228,
+     "tps": 21.0,
+     "decode_tps": 22.39
+    }
+   ]
+  },
+  {
+   "size": 150000,
+   "model": "Minimax-M3",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 372.18,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-2865d095",
+     "elapsed": 370.11,
+     "first_token": 351.79,
+     "prompt_tps": 336.37,
+     "tokens": 446,
+     "tps": 1.21,
+     "decode_tps": 24.29
+    },
+    {
+     "rep": 1,
+     "wall": 26.54,
+     "tool_called": [],
+     "needle_ok": true,
+     "req": "chatcmpl-e1a8aa9f",
+     "elapsed": 23.65,
+     "first_token": 4.78,
+     "prompt_tps": 205609.23,
+     "tokens": 485,
+     "tps": 20.51,
+     "decode_tps": 25.65
+    }
+   ]
+  },
+  {
+   "size": 150000,
+   "model": "Minimax-M3",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 379.18,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-f8a35a7a",
+     "elapsed": 378.92,
+     "first_token": 366.24,
+     "prompt_tps": 327.36,
+     "tokens": 285,
+     "tps": 0.75,
+     "decode_tps": 22.4
+    },
+    {
+     "rep": 1,
+     "wall": 17.69,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-c54c3191",
+     "elapsed": 17.45,
+     "first_token": 0.97,
+     "prompt_tps": 132455.52,
+     "tokens": 370,
+     "tps": 21.2,
+     "decode_tps": 22.38
+    }
+   ]
+  },
+  {
+   "size": 200000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 509.54,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-d317bb2c",
+     "elapsed": 505.96,
+     "first_token": 490.67,
+     "prompt_tps": 320.85,
+     "tokens": 358,
+     "tps": 0.71,
+     "decode_tps": 23.34
+    },
+    {
+     "rep": 1,
+     "wall": 24.24,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-0ac5f02e",
+     "elapsed": 19.04,
+     "first_token": 5.45,
+     "prompt_tps": 371256.48,
+     "tokens": 342,
+     "tps": 17.97,
+     "decode_tps": 25.1
+    }
+   ]
+  },
+  {
+   "size": 200000,
+   "model": "Minimax-M3-No-Think",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 512.39,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-548642fd",
+     "elapsed": 512.05,
+     "first_token": 501.17,
+     "prompt_tps": 317.37,
+     "tokens": 235,
+     "tps": 0.46,
+     "decode_tps": 21.5
+    },
+    {
+     "rep": 1,
+     "wall": 11.12,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-c7d9792c",
+     "elapsed": 10.8,
+     "first_token": 0.78,
+     "prompt_tps": 226754.16,
+     "tokens": 217,
+     "tps": 20.09,
+     "decode_tps": 21.55
+    }
+   ]
+  },
+  {
+   "size": 200000,
+   "model": "Minimax-M3",
+   "kind": "chat",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 524.61,
+     "tool_called": [],
+     "needle_ok": true,
+     "req": "chatcmpl-a31962f4",
+     "elapsed": 519.8,
+     "first_token": 490.69,
+     "prompt_tps": 321.08,
+     "tokens": 688,
+     "tps": 1.32,
+     "decode_tps": 23.6
+    },
+    {
+     "rep": 1,
+     "wall": 32.35,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-33994b8c",
+     "elapsed": 26.47,
+     "first_token": 5.13,
+     "prompt_tps": 39053.56,
+     "tokens": 536,
+     "tps": 20.25,
+     "decode_tps": 25.08
+    }
+   ]
+  },
+  {
+   "size": 200000,
+   "model": "Minimax-M3",
+   "kind": "tool",
+   "reps": [
+    {
+     "rep": 0,
+     "wall": 513.87,
+     "tool_called": [
+      "write"
+     ],
+     "needle_ok": true,
+     "req": "chatcmpl-a6d3b5c3",
+     "elapsed": 513.53,
+     "first_token": 497.29,
+     "prompt_tps": 320.02,
+     "tokens": 350,
+     "tps": 0.68,
+     "decode_tps": 21.49
+    },
+    {
+     "rep": 1,
+     "wall": 582.61,
+     "tool_called": [],
+     "needle_ok": false,
+     "req": "chatcmpl-71c990b2",
+     "elapsed": 582.17,
+     "first_token": 1.04,
+     "prompt_tps": 322.35,
+     "tokens": 1008,
+     "tps": 1.73,
+     "decode_tps": 1.73
+    }
+   ]
+  }
+ ]
+}
