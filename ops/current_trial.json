@@ -1,1 +1,0 @@
-{"index": 1, "name": "pristine, poller OFF (A/B baseline)", "env": {}, "restart": false, "soak": {"rounds": 3, "gap": 30, "max_tokens": 10000}, "iogpu0": 0, "iogpu1": 0, "poller": "off", "status": "running", "why": "Dashboard-overhead A/B leg 1: no status polling during rounds.", "started": "2026-07-05T20:01:43.421571"}

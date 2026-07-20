@@ -13,7 +13,6 @@ Start here if you are setting up or validating the cluster.
 
 - [PERSISTENT_CACHE.md](PERSISTENT_CACHE.md): SSD-backed prompt/KV cache design,
   privacy notes, restore gates, pruning, and validation commands.
-- [CURRENT_GOAL_STATUS.md](CURRENT_GOAL_STATUS.md): current benchmark ledger and
   recovery notes. This is intentionally detailed and is mostly for maintainers.
 - [SPECULATIVE_MTP.md](SPECULATIVE_MTP.md): speculative decoding/MTP research
   notes and audit status.
