@@ -1,6 +1,6 @@
 # ⚡ ThunderMLX
 
-**Run a 456B-parameter frontier MoE on your desk.** ThunderMLX turns two
+**Run a 427B-parameter (23B-active) frontier MoE on your desk.** ThunderMLX turns two
 Apple Silicon Macs connected by Thunderbolt 5 into a single, production-grade
 inference machine serving **MiniMax-M3** — with an OpenAI-compatible API,
 agent-ready tool calling, live thinking streams, tiered KV caching, and
@@ -153,18 +153,6 @@ added 56 clean inference requests in a ten-minute soak. OpenWebUI-shaped
 ordinary short decode remained `31.99 tok/s`. See
 [docs/NATIVE-TOOLS-2026-07-14.md](docs/NATIVE-TOOLS-2026-07-14.md) for the root
 cause, exact gates, and rollback knobs.
-
-The July 19 thinking-channel gate reproduced the complete Shadow Syntax
-single-file website failure and repaired it without a hidden reasoning cap.
-MiniMax now transitions from its own explicit implementation declaration to
-the final content channel by injecting the native `</mm:think>` token through
-the existing rank-0 sample synchronization. The exact prompt produced one
-complete 52k-character HTML document, streamed reasoning before content, and
-finished at 26.43 decode tok/s. Regression gates then passed native OpenAI,
-Anthropic, Codex Responses, Claude Code, ZCode, OpenCode, images, cancellation,
-hot and SSD cache, a true process restart, and a 200.5k-context soak. The final
-200.5k pass measured 309.14 cold prompt tok/s and 24.52 cached decode tok/s
-with 200,474/200,518 prompt tokens reused and no new failures.
 
 ## Quick Start
 

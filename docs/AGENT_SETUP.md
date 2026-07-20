@@ -7,7 +7,7 @@ dependencies, configuring, and booting the cluster, asking you only the
 questions that need a human.
 
 **To the agent:** you are setting up ThunderMLX — a two-Mac Apple Silicon
-cluster that serves MiniMax-M3 (456B MoE, 4-bit) over Thunderbolt RDMA as an
+cluster that serves MiniMax-M3 (427B MoE, 23B active, 4-bit) over Thunderbolt RDMA as an
 OpenAI-compatible endpoint. Read `README.md` and `docs/SETUP.md` first; this
 file is your operating procedure. Work phase by phase, verify each phase
 before the next, and ask the user rather than guess whenever a decision is
