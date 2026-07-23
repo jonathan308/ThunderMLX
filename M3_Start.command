@@ -183,6 +183,9 @@ start_dashboard_ui() {
     fi
   fi
   pkill -TERM -f "$CLUSTER/cluster_gui.py" 2>/dev/null || true
+  # Also match a GUI started with a relative path (a stale one survived every
+  # restart this way, serving old routes until 2026-07-23).
+  pkill -TERM -f "cluster_gui.py" 2>/dev/null || true
   sleep 1
   M3_GUI_DIR="$CLUSTER" \
   M3_GUI_PYTHON_BIN="$GUI_PYTHON" \

@@ -1,0 +1,10 @@
+[
+ {"id": "probe-deliberate", "kind": "probe", "max_tokens": 8192,
+  "prompt": "Our 2-Mac MLX inference cluster can use either RDMA over Thunderbolt (faster wake, occasional driver stalls) or TCP ring (equal throughput, fully stable). Pick ONE, definitively, considering reliability, speed, maintenance burden, and future-proofing. End with a single-sentence decision."},
+ {"id": "probe-artifact", "kind": "probe", "max_tokens": 8192,
+  "prompt": "Create a complete standalone HTML file implementing a playable snake game with score tracking and increasing speed. Output the full file."},
+ {"id": "probe-line367", "kind": "probe", "max_tokens": 8192,
+  "prompt": "In this trace, requests hang after retry 3.\n\nlog: handler.enter req=41\nlog: buffer_len=4096 cap=4096\nlog: retry=1 backoff=200ms\nlog: retry=2 backoff=400ms\nlog: retry=3 backoff=800ms\nlog: handler.exit code=0\n\nA teammate claims the handler at line 367 returns early and that's the bug. Find the actual root cause of the hang and state it plainly."},
+ {"id": "probe-constraints", "kind": "probe", "max_tokens": 8192,
+  "prompt": "Plan a single 8-hour maintenance window schedule for 6 tasks with these constraints: DB migration (2h) must precede API deploy (1h); cache warmup (1h) must follow API deploy; backup (1.5h) cannot overlap DB migration; monitoring upgrade (1h) needs the first or last slot; smoke tests (30m) must be last; two tasks max may run in parallel and backup cannot be parallel with anything. Give the final schedule with start times only."}
+]

@@ -58,6 +58,9 @@ PEER = (
     or ""
 )
 ENDPOINT = env_str("M3_ENDPOINT", "http://127.0.0.1:8080")
+# Dashboard "Overthink guard" ON strength (integer lambda; A/B 2026-07-23:
+# lam=1 cut thinking 22% at 100% accuracy; lam=2 halved loop-probe thinking).
+OVERTHINK_ON_LAMBDA = env_int("M3_GUI_OVERTHINK_ON_LAMBDA", 1)
 GUI_HOST = env_str("M3_GUI_HOST", "0.0.0.0")
 GUI_PORT = env_int("M3_GUI_PORT", 8090)
 DEFAULT_MODEL_ID = "mlx-community/MiniMax-M3-4bit"
@@ -1242,6 +1245,20 @@ async def api_generation_stop(request: Request):
         status_code = int(result.get("status_code") or 502)
         return JSONResponse(status_code=status_code, content=result)
     return result
+
+
+@APP.post("/api/runtime/overthink-on")
+async def api_runtime_overthink_on():
+    result = runtime_tuning({"overthink_penalty": OVERTHINK_ON_LAMBDA})
+    return JSONResponse(content={"ok": bool(result.get("ok")),
+                                 "overthink_penalty": OVERTHINK_ON_LAMBDA})
+
+
+@APP.post("/api/runtime/overthink-off")
+async def api_runtime_overthink_off():
+    result = runtime_tuning({"overthink_penalty": 0})
+    return JSONResponse(content={"ok": bool(result.get("ok")),
+                                 "overthink_penalty": 0})
 
 
 @APP.post("/api/runtime/profile")
