@@ -19,6 +19,14 @@ fi
 CLUSTER="${M3_CLUSTER_DIR:-$SCRIPT_DIR}"
 PYTHON="$CLUSTER/bin/mlx-python"
 LAUNCHER="$CLUSTER/run_with_watchdog.py"
+
+# Never launch mixed code: rank1 must run the same tree as rank0 before any
+# boot (auto_restart/M3_Start already sync; this covers bare-hands launches —
+# a rank0-new/rank1-old pair can shift the data-plane message stream by one).
+# Idempotent, ~1s. Skip with M3_SKIP_RANK1_SYNC=1.
+if [[ "${M3_SKIP_RANK1_SYNC:-0}" != "1" ]]; then
+  "$CLUSTER/sync_rank1.sh" || { echo "rank1 sync failed; refusing mixed-code launch" >&2; exit 1; }
+fi
 MLX_LAUNCH="${M3_MLX_LAUNCH:-/Library/Frameworks/Python.framework/Versions/3.14/bin/mlx.launch}"
 MODEL="${MLX_M3_MODEL:-mlx-community/MiniMax-M3-4bit}"
 MODEL_ID="${MLX_M3_MODEL_ID:-mlx-community/MiniMax-M3-4bit}"
@@ -346,6 +354,7 @@ exec "$MLX_LAUNCH" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM="${MLX_M3_PROMPT_CACHE_KEEPWARM:-0}" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM_MODE="${MLX_M3_PROMPT_CACHE_KEEPWARM_MODE:-metal}" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS="${MLX_M3_PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS:-5}" \
+  --env MLX_M3_KEEPWARM_DATAPLANE_PING="${MLX_M3_KEEPWARM_DATAPLANE_PING:-0}" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS="${MLX_M3_PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS:-3}" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM_MATRIX_SIZE="${MLX_M3_PROMPT_CACHE_KEEPWARM_MATRIX_SIZE:-1}" \
   --env MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS="${MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS:-8192}" \
