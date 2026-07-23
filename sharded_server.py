@@ -1502,6 +1502,15 @@ PROMPT_CACHE_KEEPWARM_LARGE_CACHE_TOKENS = int(
 PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS = float(
     os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_LARGE_INTERVAL_SECONDS", "60") or "60"
 )
+# Data-plane idle ping: jaccl's RDMA QPs sleep within ~1-2s of pipeline
+# inactivity and take ~3s to wake — measured 2026-07-22 as the entire
+# TTFT-after-idle penalty (prefill 65 vs 164 tps). A matmul keepwarm cannot
+# reach those QPs; only traffic through the pipeline channels does. Rank1
+# acts on the broadcast payload flag, never its own env, so the exchange is
+# rank-symmetric even if the env were absent on rank1.
+KEEPWARM_DATAPLANE_PING = os.environ.get(
+    "MLX_M3_KEEPWARM_DATAPLANE_PING", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS = float(
     os.environ.get("MLX_M3_PROMPT_CACHE_KEEPWARM_SLOW_BACKOFF_SECONDS", "60") or "60"
 )
@@ -5750,6 +5759,42 @@ def _start_prompt_cache_keepwarm(warmup_cb=None):
         PROMPT_CACHE_KEEPWARM_INTERVAL_SECONDS,
         PROMPT_CACHE_KEEPWARM_IDLE_AFTER_SECONDS,
     )
+
+
+def _dataplane_ping(rank_id):
+    """One tiny send/recv pair in each direction through the pipeline QPs.
+
+    Complementary order (rank0 sends first, rank1 receives first) — no
+    deadlock. Default group/stream to hit the same channels prefill uses.
+    Runs only inside the keepwarm op transaction on both ranks.
+
+    Failure policy: a half-completed exchange leaves the peer blocked inside
+    a data-plane op, which desyncs the NEXT control-channel collective —
+    logging and limping wedges the pipeline minutes later with the lock
+    held. Die fast instead and ride the proven guard→teardown→auto-relaunch
+    path (exit 75, ~60s outage, both ranks restart in lockstep)."""
+    group = mx.distributed.init()
+    if group.size() < 2:
+        return
+    tiny = mx.zeros((1, 16), dtype=mx.bfloat16)
+    try:
+        if rank_id == 0:
+            mx.eval(mx.distributed.send(tiny, 1))
+            mx.eval(mx.distributed.recv_like(tiny, 1))
+        else:
+            mx.eval(mx.distributed.recv_like(tiny, 0))
+            mx.eval(mx.distributed.send(tiny, 0))
+    except Exception as e:
+        logger.critical(
+            "dataplane ping failed on rank %s (%s) — exiting for clean "
+            "relaunch rather than desyncing the next collective",
+            rank_id, e,
+        )
+        try:
+            mx.clear_cache()
+        except Exception:
+            pass
+        os._exit(75)
 
 
 def _metal_warmup_touch(size=128, repeats=2, reason="manual"):
@@ -20325,16 +20370,30 @@ def run_http_server(model, processor, rank):
                     "matrix_size": size,
                     "repeats": repeats,
                     "reason": reason,
+                    "dataplane_ping": KEEPWARM_DATAPLANE_PING,
                 }, rank)
             except Exception as e:
                 logger.debug("coordinated keepwarm broadcast failed: %s", e)
                 return {"ok": False, "error": str(e), "reason": reason}
-            return _metal_warmup_touch(size=size, repeats=repeats, reason=reason)
+            event = _metal_warmup_touch(size=size, repeats=repeats, reason=reason)
+            if KEEPWARM_DATAPLANE_PING:
+                # Both ranks: matmul touch first, then the ping — same order.
+                # A ping failure never returns (die-fast, exit 75).
+                _dataplane_ping(0)
+                event["dataplane_ping"] = True
+            return event
         finally:
             if op_channel_acquired:
                 _RANK0_OP_MUTEX.release()
-            clear_generation_lock_owner("keepwarm")
-            generation_lock.release()
+            # Release only if we are still the recorded owner: after a
+            # 120s stale-lock steal the lock belongs to a live request, and
+            # a blind release here would admit a second request into the
+            # pipeline (rank-divergent collectives).
+            if clear_generation_lock_owner("keepwarm"):
+                try:
+                    generation_lock.release()
+                except RuntimeError:
+                    pass
 
     _start_prompt_cache_keepwarm(warmup_cb=coordinated_keepwarm)
 
@@ -22380,6 +22439,12 @@ def run_http_server(model, processor, rank):
                                          "finish_reason": None}],
                         })
 
+                        # Live prefill rate from per-chunk deltas: the final
+                        # prompt_tps is only computed at completion, which left
+                        # the dashboard's prefill metric at 0 during the phase
+                        # users actually watch it.
+                        _pp_state = {"tokens": None, "at": None}
+
                         def _prefill_progress(processed_tokens, total_tokens):
                             total_tokens = int(total_tokens or 0)
                             processed_tokens = int(processed_tokens or 0)
@@ -22387,6 +22452,19 @@ def run_http_server(model, processor, rank):
                                 processed_tokens / total_tokens
                                 if total_tokens > 0 else 0.0
                             )
+                            now = time.time()
+                            live_tps = None
+                            if (
+                                _pp_state["tokens"] is not None
+                                and processed_tokens > _pp_state["tokens"]
+                                and now - _pp_state["at"] > 0.01
+                            ):
+                                live_tps = round(
+                                    (processed_tokens - _pp_state["tokens"])
+                                    / (now - _pp_state["at"]), 2
+                                )
+                            _pp_state["tokens"] = processed_tokens
+                            _pp_state["at"] = now
                             _watchdog_tick(progress=True)
                             update_generation_slot(
                                 active,
@@ -22399,6 +22477,7 @@ def run_http_server(model, processor, rank):
                                 last_progress_s=round(
                                     time.time() - active["started"], 3
                                 ),
+                                **({"prompt_tps": live_tps} if live_tps else {}),
                             )
 
                         for chunk in run_generation_stream(
@@ -23322,6 +23401,9 @@ def run_http_server(model, processor, rank):
                                 or active.get("prompt_cache_prepare")
                             ),
                         )
+                    # Live prefill rate from per-chunk deltas (see stream twin).
+                    _pp_state = {"tokens": None, "at": None}
+
                     def _prefill_progress(processed_tokens, total_tokens):
                         total_tokens = int(total_tokens or 0)
                         processed_tokens = int(processed_tokens or 0)
@@ -23329,6 +23411,19 @@ def run_http_server(model, processor, rank):
                             processed_tokens / total_tokens
                             if total_tokens > 0 else 0.0
                         )
+                        now = time.time()
+                        live_tps = None
+                        if (
+                            _pp_state["tokens"] is not None
+                            and processed_tokens > _pp_state["tokens"]
+                            and now - _pp_state["at"] > 0.01
+                        ):
+                            live_tps = round(
+                                (processed_tokens - _pp_state["tokens"])
+                                / (now - _pp_state["at"]), 2
+                            )
+                        _pp_state["tokens"] = processed_tokens
+                        _pp_state["at"] = now
                         _watchdog_tick(progress=True)
                         update_generation_slot(
                             active,
@@ -23341,6 +23436,7 @@ def run_http_server(model, processor, rank):
                             last_progress_s=round(
                                 time.time() - active["started"], 3
                             ),
+                            **({"prompt_tps": live_tps} if live_tps else {}),
                         )
                     if mirror_stream_consumer:
                         logger.info(
@@ -23828,7 +23924,16 @@ def run_mirror(model, processor, rank):
                 repeats=req.get("repeats") or 2,
                 reason=req.get("reason") or "rank 0 request",
             )
-            logger.info("rank 1: metal warmup event: %s", event)
+            if req.get("dataplane_ping"):
+                # Payload-driven (never rank1's own env) so both ranks always
+                # agree; same order as rank 0: matmul touch, then ping.
+                # A ping failure never returns (die-fast, exit 75).
+                _dataplane_ping(1)
+            if req.get("reason") == "prompt-cache keepwarm":
+                # 1s tick cadence — keep the per-tick line out of INFO logs.
+                logger.debug("rank 1: metal warmup event: %s", event)
+            else:
+                logger.info("rank 1: metal warmup event: %s", event)
             continue
         if isinstance(req, dict) and req.get("op") == "idle_heartbeat":
             continue

@@ -58,6 +58,11 @@ ALLOW_STOP_M3 = env_bool("M3_GATEWAY_ALLOW_STOP_M3", True)
 # 30s (was 120): single-user cluster - a 2-minute cooldown before oMLX
 # switches just feels broken from the model picker (2026-07-09).
 STOP_M3_GRACE_S = float(os.environ.get("M3_GATEWAY_STOP_M3_GRACE_S", "30"))
+# Sticky-oMLX window (2026-07-22): while gateway-routed oMLX traffic is this
+# recent, an M3 request must NOT auto-start M3 (which unloads oMLX models).
+# Interactive oMLX sessions (Laguna) were being torn down by background M3
+# agents between prompts. Symmetric counterpart of STOP_M3_GRACE_S.
+OMLX_GRACE_S = float(os.environ.get("M3_GATEWAY_OMLX_GRACE_S", "900"))
 # Streamed /v1/responses translates upstream deltas live (codex sees thinking
 # stream into its reasoning UI). 0 falls back to the end-of-turn replay.
 RESPONSES_LIVE_STREAM = env_bool("M3_GATEWAY_RESPONSES_LIVE", True)
@@ -478,6 +483,27 @@ def record_event(action: str, **fields: Any) -> None:
     event = {"time": time.time(), "action": action, **fields}
     STATE["last_switch"] = event
     STATE["events"] = ([event] + STATE.get("events", []))[:64]
+
+
+def log_m3_wakeup_attribution(request: Request | None, model: str | None, path: str) -> None:
+    """Persistent stdout line identifying WHO asked for M3 while it was inactive.
+
+    Exists to catch the background client that keeps resurrecting M3 and
+    unloading the user's interactive oMLX models (2026-07-22 loop complaint).
+    Logged before ensure_backend so deferred attempts are attributed too."""
+    if STATE.get("active_backend") == "m3":
+        return
+    client = "?"
+    ua = "?"
+    if request is not None:
+        if request.client:
+            client = f"{request.client.host}:{request.client.port}"
+        ua = (request.headers.get("user-agent") or "?")[:80]
+    print(
+        f"[m3-wakeup-attribution] {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        f"model={model} path={path} client={client} ua={ua}",
+        flush=True,
+    )
 
 
 def backend_for_model(model: str | None) -> str:
@@ -2301,6 +2327,7 @@ async def anthropic_messages(payload: dict[str, Any]) -> JSONResponse:
             aliases=sorted(aliases.keys()),
         )
         openai_payload["model"] = ANTHROPIC_SMALL_MODEL
+    log_m3_wakeup_attribution(None, str(payload.get("model") or "?"), "/v1/messages")
     ready = await ensure_backend("m3")
     if not ready.get("ok"):
         return JSONResponse(status_code=503, content={"error": {"type": "gateway_switch_error", "message": json.dumps(ready)}})
@@ -2769,6 +2796,49 @@ async def unload_omlx_loaded_models() -> dict[str, Any]:
     return {"ok": ok, "results": results}
 
 
+def _note_backend_traffic(backend: str) -> None:
+    if backend == "m3":
+        STATE["last_m3_traffic"] = time.time()
+    elif backend == "omlx":
+        STATE["last_omlx_traffic"] = time.time()
+
+
+def _omlx_busy_reason_for_start() -> str | None:
+    """Why M3 must not be auto-started right now, or None if oMLX is idle."""
+    last = STATE.get("last_omlx_traffic")
+    if last and (time.time() - last) < OMLX_GRACE_S:
+        return (f"oMLX traffic {time.time() - last:.0f}s ago "
+                f"(grace {OMLX_GRACE_S:.0f}s)")
+    return None
+
+
+async def _seed_omlx_traffic_if_loaded() -> str | None:
+    """After a gateway restart, STATE has no oMLX traffic history. If a real
+    (non-utility) model is loaded on oMLX while M3 is down, treat it as an
+    active session so the sticky window survives gateway restarts."""
+    if STATE.get("last_omlx_traffic") is not None:
+        return None
+    admin = await get_json(f"{OMLX_BASE_URL}/admin/api/models")
+    models = admin.get("models") if isinstance(admin, dict) else None
+    if not isinstance(models, list):
+        return None
+    for model in models:
+        if not isinstance(model, dict) or not model.get("loaded"):
+            continue
+        estimated_size = int(model.get("estimated_size") or 0)
+        actual_size = int(model.get("actual_size") or 0)
+        if estimated_size <= 0 and actual_size <= 0:
+            continue
+        # A loaded model is a heuristic, not observed traffic (it may be a
+        # directly-driven subagent model, loaded days ago). Grant a short
+        # one-shot window: real Laguna use will re-stamp the full grace.
+        seed_grace = min(OMLX_GRACE_S, 300.0)
+        STATE["last_omlx_traffic"] = time.time() - (OMLX_GRACE_S - seed_grace)
+        return (f"oMLX model {model.get('id')} loaded at gateway start "
+                f"(seed grace {seed_grace:.0f}s)")
+    return None
+
+
 def _m3_busy_reason(health: dict[str, Any]) -> str | None:
     """Why M3 must not be auto-stopped right now, or None if idle."""
     active = health.get("active_request") or {}
@@ -2801,11 +2871,27 @@ async def stop_m3_for_omlx() -> dict[str, Any]:
     return {"ok": bool(result.get("ok")) and down, "command": result, "down": down}
 
 
-async def start_m3_for_request() -> dict[str, Any]:
+async def start_m3_for_request(force: bool = False) -> dict[str, Any]:
     if await m3_health():
         return {"ok": True, "already_running": True}
     if not ALLOW_START_M3:
         return {"ok": False, "error": "M3 auto-start disabled"}
+    if not force and OMLX_GRACE_S > 0:
+        busy = _omlx_busy_reason_for_start()
+        if busy is None:
+            busy = await _seed_omlx_traffic_if_loaded()
+        if busy:
+            # Bursty M3 agents defer several times a minute; don't let the
+            # repeats flush real switch events out of the forensic ring.
+            last_logged = STATE.get("last_deferral_event_ts") or 0.0
+            if time.time() - last_logged > 60.0:
+                STATE["last_deferral_event_ts"] = time.time()
+                record_event("start_m3_deferred_omlx_busy", reason=busy)
+            return {
+                "ok": False,
+                "error": (f"oMLX in use — M3 auto-start deferred: {busy}. "
+                          "Retry after the grace window, or POST /gateway/start-m3 to force."),
+            }
     unload = await unload_omlx_loaded_models()
     result = await run_shell(START_COMMAND)
     up = await wait_for_m3(True)
@@ -2813,7 +2899,7 @@ async def start_m3_for_request() -> dict[str, Any]:
     return {"ok": bool(result.get("ok")) and up, "unload_omlx": unload, "command": result, "up": up}
 
 
-async def ensure_backend(backend: str) -> dict[str, Any]:
+async def ensure_backend(backend: str, force_start: bool = False) -> dict[str, Any]:
     async with SWITCH_LOCK:
         if backend == "claude":
             if not Path(CLAUDE_CLI).exists():
@@ -2828,7 +2914,7 @@ async def ensure_backend(backend: str) -> dict[str, Any]:
                 return {"ok": True, "backend": "m3", "already_ready": True}
             if not AUTO_SWITCH:
                 return {"ok": False, "backend": "m3", "error": "M3 unavailable and auto-switch disabled"}
-            result = await start_m3_for_request()
+            result = await start_m3_for_request(force=force_start)
             STATE["active_backend"] = "m3" if result.get("ok") else "unknown"
             if result.get("ok"):
                 STATE["last_error"] = None
@@ -2861,8 +2947,7 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
         and payload.get("_metadata_request") == "zcode_goal_verification"
     )
 
-    if backend == "m3":
-        STATE["last_m3_traffic"] = time.time()
+    _note_backend_traffic(backend)
     # Non-stream agent turns can legitimately run tens of minutes (a 32k
     # tool turn at ~20 t/s is ~27 min). SWITCH_TIMEOUT=900 killed a live
     # goal turn at the proxy hop (httpcore.ReadTimeout, 2026-07-07) while
@@ -2900,8 +2985,7 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
             finally:
                 await response.aclose()
                 await client.aclose()
-                if backend == "m3":
-                    STATE["last_m3_traffic"] = time.time()
+                _note_backend_traffic(backend)
 
         return StreamingResponse(
             iterator(),
@@ -2924,6 +3008,7 @@ async def proxy_request(request: Request, backend: str, path: str, body: bytes) 
         )
     finally:
         await client.aclose()
+        _note_backend_traffic(backend)
 
 
 async def request_model(request: Request, body: bytes) -> str | None:
@@ -2953,6 +3038,11 @@ async def health():
             "anthropic_messages_small_model": ANTHROPIC_SMALL_MODEL,
             "last_switch": STATE.get("last_switch"),
             "last_error": STATE.get("last_error"),
+            "omlx_grace_s": OMLX_GRACE_S,
+            "last_omlx_traffic_age_s": (
+                round(time.time() - STATE["last_omlx_traffic"], 1)
+                if STATE.get("last_omlx_traffic") else None
+            ),
         },
         "m3": {"online": bool(m3), "health": m3},
         "omlx": {"online": bool(omlx), "health": omlx},
@@ -3009,7 +3099,8 @@ async def models():
 async def switch_backend(backend: str):
     if backend not in {"m3", "omlx"}:
         return JSONResponse(status_code=400, content={"ok": False, "error": "backend must be m3 or omlx"})
-    result = await ensure_backend(backend)
+    # Explicit admin action: like /gateway/start-m3, bypasses the sticky-oMLX grace.
+    result = await ensure_backend(backend, force_start=True)
     return JSONResponse(status_code=200 if result.get("ok") else 503, content=result)
 
 
@@ -3021,7 +3112,8 @@ async def gateway_stop_m3():
 
 @APP.post("/gateway/start-m3")
 async def gateway_start_m3():
-    result = await start_m3_for_request()
+    # Explicit admin action: bypasses the sticky-oMLX grace window.
+    result = await start_m3_for_request(force=True)
     return JSONResponse(status_code=200 if result.get("ok") else 503, content=result)
 
 
@@ -3428,10 +3520,13 @@ async def _responses_chat_completion(payload: dict[str, Any]) -> tuple[int, dict
     chat_payload = _responses_chat_payload(payload)
     model = str(chat_payload.get("model") or "")
     backend = backend_for_model(model)
+    if backend == "m3":
+        log_m3_wakeup_attribution(None, model, "/v1/responses")
     ready = await ensure_backend(backend)
     if not ready.get("ok"):
         return 503, {"error": {"message": json.dumps(ready), "type": "gateway_switch_error"}}
     base = M3_BASE_URL if backend == "m3" else OMLX_BASE_URL
+    _note_backend_traffic(backend)
     try:
         async with httpx.AsyncClient(timeout=ANTHROPIC_INTERNAL_TIMEOUT) as client:
             response = await client.post(f"{base}/v1/chat/completions", json=chat_payload)
@@ -3443,6 +3538,7 @@ async def _responses_chat_completion(payload: dict[str, Any]) -> tuple[int, dict
         return 503, {"error": {
             "message": f"backend {backend} unavailable (switching or restarting); retry shortly",
             "type": "upstream_unavailable"}}
+    _note_backend_traffic(backend)
     if response.status_code >= 400:
         record_event("responses_upstream_error", backend=backend, model=model,
                      status=response.status_code, body=response.text[:200])
@@ -3463,10 +3559,13 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
     chat_payload["stream"] = True
     model = str(chat_payload.get("model") or "")
     backend = backend_for_model(model)
+    if backend == "m3":
+        log_m3_wakeup_attribution(request, model, "/v1/responses[stream]")
     ready = await ensure_backend(backend)
     if not ready.get("ok"):
         return JSONResponse(status_code=503, content={"error": {"message": json.dumps(ready), "type": "gateway_switch_error"}})
     base = M3_BASE_URL if backend == "m3" else OMLX_BASE_URL
+    _note_backend_traffic(backend)
     response_id = f"resp_{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
@@ -3832,6 +3931,7 @@ async def _responses_stream_live(payload: dict[str, Any], request: Request):
                 except BaseException:
                     pass
             await client.aclose()
+            _note_backend_traffic(backend)
 
     return StreamingResponse(
         iterator(),
@@ -4058,6 +4158,8 @@ async def openai_proxy(rest: str, request: Request):
     if routed_model and routed_model != model:
         body = rewrite_json_model(body, str(routed_model))
         model = str(routed_model)
+    if backend == "m3":
+        log_m3_wakeup_attribution(request, model, f"/v1/{rest}")
     ready = await ensure_backend(backend)
     if not ready.get("ok"):
         STATE["last_error"] = ready
