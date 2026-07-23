@@ -464,6 +464,11 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
         </table>
       </div>
       <div class="btnrow" style="margin-top:12px">
+        <span class="chip" id="overthinkChip" title="Overthink guard: softly discourages hesitation words (wait/but/however…) inside the model's thinking only — quantized models over-hesitate at decision points (arXiv 2606.00206). Never touches tool calls or final answers. A/B: −22% thinking at 100% accuracy.">Overthink guard: …</span>
+        <button class="btn sm" data-post="/api/runtime/overthink-on" title="Enable the overthink guard (λ=1)">Guard ON</button>
+        <button class="btn sm" data-post="/api/runtime/overthink-off" title="Disable the overthink guard">Guard OFF</button>
+      </div>
+      <div class="btnrow" style="margin-top:12px">
         <button class="btn sm" data-post="/api/cache/reset" title="Drops only the live RAM KV cache">Clear RAM</button>
         <button class="btn sm" data-post="/api/cache/manifest/clear">Clear map</button>
         <button class="btn sm" data-post="/api/cache/ssd/save">SSD save</button>
@@ -1793,6 +1798,8 @@ async function refresh(){
   const pc = h.prompt_cache || {};
   const ks = h.kernel_stats || {};
   const recent = h.recent_requests || [];
+  const otp = h.generation_defaults?.overthink_penalty ?? 0;
+  setText("overthinkChip", "Overthink guard: " + (otp > 0 ? `ON (λ=${otp})` : "OFF"));
   const activeId = ar && ar.id ? String(ar.id) : null;
   if(cancelPendingRequestId && cancelPendingRequestId !== activeId) cancelPendingRequestId = null;
   currentActiveRequestId = activeId;

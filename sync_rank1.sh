@@ -56,7 +56,7 @@ FILES=(
 )
 
 ssh -o BatchMode=yes -o ConnectTimeout=10 "$PEER" \
-  "mkdir -p '$CLUSTER' '$CLUSTER/bin' '$CLUSTER/ops'" >/dev/null
+  "mkdir -p '$CLUSTER' '$CLUSTER/bin' '$CLUSTER/ops' '$CLUSTER/overthink'" >/dev/null
 for f in "${FILES[@]}"; do
   if [[ -f "$CLUSTER/$f" ]]; then
     scp -o BatchMode=yes -o ConnectTimeout=10 \
@@ -64,7 +64,7 @@ for f in "${FILES[@]}"; do
   fi
 done
 
-for f in ops/known_answer.py ops/check_runtime_compat.py; do
+for f in ops/known_answer.py ops/check_runtime_compat.py overthink/markers.json; do
   if [[ -f "$CLUSTER/$f" ]]; then
     scp -o BatchMode=yes -o ConnectTimeout=10 \
       "$CLUSTER/$f" "$PEER:$CLUSTER/$f" >/dev/null

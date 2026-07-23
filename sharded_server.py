@@ -34,6 +34,7 @@ import copy
 import difflib
 import gc
 import hashlib
+import math
 import importlib.metadata
 import json
 import os
@@ -914,6 +915,9 @@ _runtime_tuning = {
         os.environ.get("MLX_M3_COMPACT_DECODE_SORT_TOPK", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     ),
+    "overthink_penalty": int(
+        float(os.environ.get("MLX_M3_OVERTHINK_PENALTY", "0") or "0")
+    ),
 }
 _applied_decode_runtime = {
     "decode_topk_reuse_tokens": None,
@@ -1026,6 +1030,9 @@ def _set_runtime_tuning(values, clamped_out=None):
         "sparse_topk_blocks": (0, 64),
         "decode_topk_reuse_tokens": (0, 64),
         "compact_decode_sort_topk": (0, 1),
+        # Overthink logit penalty (arXiv 2606.00206): integer lambda, 0=off.
+        # Rank-local sampling change only; safe to move live. Dashboard toggle.
+        "overthink_penalty": (0, 8),
     }
     # Storage caps: same pattern, except out-of-range integers CLAMP to the
     # guard rails (reported via clamped_out) instead of erroring; garbage
@@ -1387,7 +1394,26 @@ GEN_PARAM_KEYS = (
     "resize_shape",
     "max_long_side_pixel",
     "skip_special_tokens",
+    "overthink_penalty",
 )
+# Overthink logit penalty (arXiv 2606.00206): quantized reasoning models
+# inflate hesitation-marker probabilities at high-entropy positions, producing
+# longer CoT and reached-answer-without-committing failures. A static logit
+# penalty on curated marker tokens shortens thinking 12-23% with equal or
+# better accuracy. OUR deviation from the paper: gated to the thinking phase
+# only (tracked via <think>/</think> token ids in the generated stream) so
+# agentic/tool output and final answers are NEVER touched. Default 0 = the
+# processor is not installed at all (zero overhead, zero behavior change).
+OVERTHINK_PENALTY = float(os.environ.get("MLX_M3_OVERTHINK_PENALTY", "0") or "0")
+OVERTHINK_MARKERS_FILE = os.environ.get("MLX_M3_OVERTHINK_MARKERS_FILE") or (
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "overthink", "markers.json")
+)
+OVERTHINK_ALLOW_REQUEST_OVERRIDE = os.environ.get(
+    "MLX_M3_OVERTHINK_ALLOW_REQUEST_OVERRIDE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_OVERTHINK_DATA = None  # lazy: {"ids", "open_ids", "close_ids"} or {} on failure
+_OVERTHINK_MASK = None  # lazy vocab-sized vector: -1.0 at marker ids
 _SHUTTING_DOWN = False
 _WATCHDOG_TICK = None
 _WATCHDOG_PREFILL_BUDGET = None  # set by run_with_watchdog; sizes prefill stall window (fix A)
@@ -1901,12 +1927,18 @@ _THINKING_ARTIFACT_PHASE_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
         r"\blet me start coding\s*:\s*",
-        r"\blet me code this[^:\n]{0,80}:\s*",
+        r"\blet me code this[^:\n]{0,80}[:.]\s*",
         r"\blet me structure the html\s*:\s*",
-        r"\blet me start writing (?:the )?(?:complete|full)[^:\n]{0,80}:\s*",
-        r"\blet me (?:now )?write (?:the )?(?:complete|full)[^:\n]{0,80}:\s*",
+        r"\blet me start writing (?:the )?(?:complete|full)[^:\n]{0,80}[:.]\s*",
+        r"\blet me (?:now )?write (?:the |this )?"
+        r"(?:complete|full|comprehensive)[^:\n]{0,80}[:.]\s*",
         r"\b(?:now|next),? (?:i(?:'ll| will)|let me) "
         r"(?:start|write|build|implement)[^:\n]{0,80}:\s*",
+        # 2026-07-23 escape: declarations end in periods as often as colons
+        # ("Let me write the full implementation now."). The completion
+        # tracker still gates the actual transition, so sentence-final
+        # punctuation is safe to accept on the write/build declarations.
+        r"\blet me build this[^:\n]{0,80}[:.]\s*",
     )
 )
 _THINKING_ARTIFACT_REASONING_HOLDBACK_CHARS = 256
@@ -1994,9 +2026,27 @@ def _thinking_artifact_request(prompt, thinking_mode, tools):
             "complete single-file",
             "all js inline",
             "fully interactive html",
+            "single file html",
+            "single html file",
+            "one html file",
+            "standalone html",
+            "self-contained html",
         )
     )
-    return bool(html_request and complete_delivery)
+    # Real users say "make/overhaul it as a single file html", not "output the
+    # complete single-file artifact" (2026-07-23 escape: a flappy-bird overhaul
+    # drafted entirely inside thinking because no delivery marker matched).
+    # Arming is near-free — the transition still requires the model's own
+    # implementation declaration AND a tracked complete artifact — so a build
+    # verb plus the html request is enough.
+    build_intent = any(
+        marker in text
+        for marker in (
+            "create", "make", "build", "write", "recreate", "overhaul",
+            "clone", "remake", "implement", "code up",
+        )
+    )
+    return bool(html_request and (complete_delivery or build_intent))
 
 
 def _thinking_artifact_phase_match(raw_tail, token_index):
@@ -8465,6 +8515,7 @@ def _generation_defaults_status():
         ),
         "clear_cache_after_request": CLEAR_CACHE_AFTER_REQUEST,
         "clear_cache_after_error": CLEAR_CACHE_AFTER_ERROR,
+        "overthink_penalty": runtime_tuning.get("overthink_penalty", 0),
         "visible_transcript_prewarm_blocking": VISIBLE_TRANSCRIPT_PREWARM_BLOCKING,
         "refresh_generation_stream": REFRESH_GENERATION_STREAM,
         "kv_quant_enabled": KV_QUANT_ENABLED,
@@ -8612,6 +8663,34 @@ def _reasoning_recall_tool_calls_key(tool_calls):
     return "tool:" + _short_hash(normalized)
 
 
+RECALL_ARTIFACT_FILTER = os.environ.get(
+    "MLX_M3_RECALL_ARTIFACT_FILTER", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reasoning_contains_artifact_draft(text):
+    """True when reasoning embeds a substantial code/artifact draft.
+
+    2026-07-23 steering-resistance incident: a turn that drafted an entire
+    HTML game inside <mm:think> had that draft recalled VERBATIM into the
+    next prompt (and the warmed KV) as a self-authored demonstration — which
+    reliably overrides a one-sentence user correction ("stop coding in
+    thinking"). Same class as the 2026-07-20 copy-spiral echo, but the
+    payload is coherent, so the repetition gate cannot see it. Thresholds
+    keep normal reasoning-about-code recallable: small snippets pass; a
+    complete document skeleton or draft-scale fenced code does not."""
+    if not isinstance(text, str) or len(text) < 400:
+        return False
+    low = text.lower()
+    if "<!doctype html" in low or "</html>" in low:
+        return True
+    fenced = re.findall(r"```[a-zA-Z]*\n(.*?)(?:```|\Z)", text, re.S)
+    fenced_chars = sum(len(f) for f in fenced)
+    if fenced_chars >= 600:
+        return True
+    return fenced_chars / len(text) >= 0.35
+
+
 def _reasoning_recall_key(visible_content=None, tool_calls=None):
     tool_key = _reasoning_recall_tool_calls_key(tool_calls)
     if tool_key:
@@ -8650,6 +8729,15 @@ def _recall_assistant_reasoning(session_id, visible_content, *, tool_calls=None,
         # flags) must not re-prime the model either.
         logger.warning(
             "reasoning-recall: dropping stored copy-spiral reasoning "
+            "(%s chars) instead of re-priming it",
+            len(reasoning),
+        )
+        return None
+    if RECALL_ARTIFACT_FILTER and _reasoning_contains_artifact_draft(reasoning):
+        # Read-side twin: entries stored before this filter existed must not
+        # re-prime either.
+        logger.info(
+            "reasoning-recall: dropping stored artifact-draft reasoning "
             "(%s chars) instead of re-priming it",
             len(reasoning),
         )
@@ -8700,6 +8788,21 @@ def _remember_assistant_reasoning(session_id, visible_content, raw_output, *,
         # misalignment instead of an indefinite echo.
         logger.warning(
             "reasoning-recall: refusing to store copy-spiral reasoning "
+            "(%s chars) for session %s",
+            len(reasoning),
+            session_id,
+        )
+        return False
+    if RECALL_ARTIFACT_FILTER and _reasoning_contains_artifact_draft(reasoning):
+        # 2026-07-23 steering-resistance incident: a coherent in-thinking
+        # artifact draft was recalled verbatim into the next prompt + warmed
+        # KV, functioning as a self-authored few-shot demonstration that
+        # defeated an explicit user correction. Same store-then-echo class
+        # as the copy-spiral above, coherent payload edition. Cost of
+        # refusing: one turn of think-block cache misalignment on artifact
+        # turns (long-decode turns anyway).
+        logger.info(
+            "reasoning-recall: refusing to store artifact-draft reasoning "
             "(%s chars) for session %s",
             len(reasoning),
             session_id,
@@ -17779,7 +17882,14 @@ def _generation_iter(rank, gen_kwargs):
     # EAGLE3 speculative path (2026-07-09): per-request decision travels in
     # the broadcast request op (REQUEST_ACTIVE is set from it on BOTH ranks
     # before run_generation), so the generator choice is always symmetric.
-    if m3_eagle3.enabled() and m3_eagle3.REQUEST_ACTIVE.get("value"):
+    if (
+        m3_eagle3.enabled()
+        and m3_eagle3.REQUEST_ACTIVE.get("value")
+        and not gen_kwargs.get("logits_processors")
+        # eagle3 absorbs logits_processors into **kwargs without applying
+        # them (silent drop); the processors flag is a pure function of the
+        # broadcast gen_params, so both ranks skip eagle3 together.
+    ):
         try:
             it = m3_eagle3.eagle3_stream_generate(rank=rank, **gen_kwargs)
             logger.info("rank %s: eagle3 speculative path active", rank)
@@ -17998,6 +18108,103 @@ def _maybe_run_prefill_admission(new_tokens, rank, model=None, processor=None,
             pass
 
 
+def _overthink_marker_data():
+    global _OVERTHINK_DATA
+    if _OVERTHINK_DATA is None:
+        try:
+            with open(OVERTHINK_MARKERS_FILE) as f:
+                data = json.load(f)
+            ids = sorted({int(v["id"]) for variants in data["markers"].values()
+                          for v in variants})
+            _OVERTHINK_DATA = {
+                "ids": ids,
+                "open_ids": {int(i) for i in data["think_open_ids"]},
+                "close_ids": {int(i) for i in data["think_close_ids"]},
+            }
+            logger.info("overthink markers loaded: %d ids from %s",
+                        len(ids), OVERTHINK_MARKERS_FILE)
+        except Exception as e:
+            logger.warning("overthink markers unavailable (%s); penalty off", e)
+            _OVERTHINK_DATA = {}
+    return _OVERTHINK_DATA
+
+
+def _make_overthink_processor(penalty):
+    """Logits processor: subtract `penalty` from marker logits while inside
+    the model's thinking block (<mm:think>...</mm:think>, with the legacy
+    <think> pair also recognized).
+
+    Gating rules (review-hardened):
+    - First call: in_think is derived from the LAST prompt token only — the
+      enabled chat template seeds the open token as the final prompt token.
+      The prompt body is never scanned, so think-markup that merely appears
+      inside user/tool content (e.g. an agent reading a file about LLMs)
+      cannot latch the gate.
+    - Later calls: only newly generated tokens are scanned.
+    - Fail-safe direction: unrecognized templates leave the penalty off."""
+    data = _overthink_marker_data()
+    if not data or penalty <= 0:
+        return None
+    open_ids, close_ids = data["open_ids"], data["close_ids"]
+    lam = float(penalty)
+    state = {"scanned": 0, "in_think": False, "primed": False}
+
+    def _proc(tokens, logits):
+        global _OVERTHINK_MASK
+        try:
+            n = int(tokens.shape[-1])
+        except Exception:
+            n = len(tokens)
+        if not state["primed"]:
+            state["primed"] = True
+            state["in_think"] = n > 0 and int(tokens[n - 1]) in open_ids
+            state["scanned"] = n
+        elif n > state["scanned"]:
+            for t in tokens[state["scanned"]:n].tolist():
+                if t in open_ids:
+                    state["in_think"] = True
+                elif t in close_ids:
+                    state["in_think"] = False
+            state["scanned"] = n
+        if state["in_think"]:
+            if _OVERTHINK_MASK is None or _OVERTHINK_MASK.shape[-1] != logits.shape[-1]:
+                import numpy as _np
+                m = _np.zeros(logits.shape[-1], dtype=_np.float32)
+                m[data["ids"]] = -1.0
+                _OVERTHINK_MASK = mx.array(m)
+            logits = logits + _OVERTHINK_MASK.astype(logits.dtype) * lam
+        return logits
+
+    return _proc
+
+
+def _attach_overthink_processor(gen_kwargs, thinking_mode):
+    """Pop the per-request override, install the processor when active.
+    Never lets the raw param reach the engine kwargs. λ is clamped to a
+    finite (0, 8] — the paper's negative-λ ablation boosts overthinking
+    catastrophically and huge values hard-ban common words."""
+    with _runtime_tuning_lock:
+        lam = float(_runtime_tuning.get("overthink_penalty") or 0)
+    raw = gen_kwargs.pop("overthink_penalty", None)
+    if raw is not None and OVERTHINK_ALLOW_REQUEST_OVERRIDE:
+        try:
+            lam = float(raw)
+        except (TypeError, ValueError):
+            pass
+    if not (math.isfinite(lam) and 0 < lam <= 8.0):
+        return 0.0
+    if _enable_thinking_for_generation(thinking_mode):
+        proc = _make_overthink_processor(lam)
+        if proc is not None:
+            gen_kwargs.setdefault("logits_processors", []).append(proc)
+            # Loud on purpose: a silently-inactive penalty already burned one
+            # A/B run (env-whitelist gotcha). If this line is absent from the
+            # logs, the penalty is NOT running — no exceptions.
+            logger.info("overthink penalty attached (lambda=%.2f)", lam)
+            return lam
+    return 0.0
+
+
 def run_generation(model, processor, prompt, max_tokens, rank, image=None,
                    thinking_mode="adaptive", gen_params=None, progress_cb=None,
                    token_ids=None, session_id=None, session_source=None,
@@ -18153,6 +18360,7 @@ def run_generation(model, processor, prompt, max_tokens, rank, image=None,
         gen_kwargs["prompt_cache"] = cached_prompt_cache
     if gen_params:
         gen_kwargs.update(gen_params)
+    _attach_overthink_processor(gen_kwargs, thinking_mode)
     if multimodal_context is not None:
         _apply_multimodal_generation_inputs(
             gen_kwargs,
@@ -18821,6 +19029,7 @@ def run_generation_stream(model, processor, prompt, max_tokens, rank, image=None
         gen_kwargs["prompt_cache"] = cached_prompt_cache
     if gen_params:
         gen_kwargs.update(gen_params)
+    _attach_overthink_processor(gen_kwargs, thinking_mode)
     if multimodal_context is not None:
         _apply_multimodal_generation_inputs(
             gen_kwargs,

@@ -1,0 +1,819 @@
+{
+ "model": "mlx-community/MiniMax-M3-4bit",
+ "think_open_ids": [
+  200059,
+  200050
+ ],
+ "think_close_ids": [
+  200060,
+  200051
+ ],
+ "n_words": 41,
+ "n_ids": 134,
+ "markers": {
+  "perhaps": [
+   {
+    "variant": " perhaps",
+    "id": 9376
+   },
+   {
+    "variant": " Perhaps",
+    "id": 22397
+   },
+   {
+    "variant": "perhaps",
+    "id": 84961
+   },
+   {
+    "variant": "Perhaps",
+    "id": 39308
+   }
+  ],
+  "maybe": [
+   {
+    "variant": " maybe",
+    "id": 8257
+   },
+   {
+    "variant": " Maybe",
+    "id": 14636
+   },
+   {
+    "variant": "maybe",
+    "id": 58909
+   },
+   {
+    "variant": "Maybe",
+    "id": 25996
+   }
+  ],
+  "wait": [
+   {
+    "variant": " wait",
+    "id": 5704
+   },
+   {
+    "variant": " Wait",
+    "id": 34755
+   },
+   {
+    "variant": "wait",
+    "id": 27972
+   },
+   {
+    "variant": "Wait",
+    "id": 29286
+   }
+  ],
+  "actually": [
+   {
+    "variant": " actually",
+    "id": 4076
+   },
+   {
+    "variant": " Actually",
+    "id": 50171
+   },
+   {
+    "variant": "actually",
+    "id": 96620
+   },
+   {
+    "variant": "Actually",
+    "id": 68736
+   }
+  ],
+  "hold": [
+   {
+    "variant": " hold",
+    "id": 4081
+   },
+   {
+    "variant": " Hold",
+    "id": 24370
+   },
+   {
+    "variant": "hold",
+    "id": 6471
+   },
+   {
+    "variant": "Hold",
+    "id": 77217
+   }
+  ],
+  "hmm": [
+   {
+    "variant": "Hmm",
+    "id": 134610
+   }
+  ],
+  "alternatively": [
+   {
+    "variant": " alternatively",
+    "id": 68301
+   },
+   {
+    "variant": " Alternatively",
+    "id": 37114
+   },
+   {
+    "variant": "Alternatively",
+    "id": 82145
+   }
+  ],
+  "however": [
+   {
+    "variant": " however",
+    "id": 4732
+   },
+   {
+    "variant": " However",
+    "id": 3664
+   },
+   {
+    "variant": "however",
+    "id": 100813
+   },
+   {
+    "variant": "However",
+    "id": 12088
+   }
+  ],
+  "instead": [
+   {
+    "variant": " instead",
+    "id": 5561
+   },
+   {
+    "variant": " Instead",
+    "id": 14041
+   },
+   {
+    "variant": "instead",
+    "id": 94109
+   },
+   {
+    "variant": "Instead",
+    "id": 41222
+   }
+  ],
+  "but": [
+   {
+    "variant": " but",
+    "id": 745
+   },
+   {
+    "variant": " But",
+    "id": 2159
+   },
+   {
+    "variant": "but",
+    "id": 5617
+   },
+   {
+    "variant": "But",
+    "id": 3895
+   }
+  ],
+  "though": [
+   {
+    "variant": " though",
+    "id": 3977
+   },
+   {
+    "variant": " Though",
+    "id": 21495
+   },
+   {
+    "variant": "though",
+    "id": 4316
+   },
+   {
+    "variant": "Though",
+    "id": 35646
+   }
+  ],
+  "although": [
+   {
+    "variant": " although",
+    "id": 8293
+   },
+   {
+    "variant": " Although",
+    "id": 9472
+   },
+   {
+    "variant": "although",
+    "id": 45157
+   },
+   {
+    "variant": "Although",
+    "id": 16044
+   }
+  ],
+  "yet": [
+   {
+    "variant": " yet",
+    "id": 4675
+   },
+   {
+    "variant": " Yet",
+    "id": 16891
+   },
+   {
+    "variant": "yet",
+    "id": 73987
+   },
+   {
+    "variant": "Yet",
+    "id": 38152
+   }
+  ],
+  "rather": [
+   {
+    "variant": " rather",
+    "id": 4835
+   },
+   {
+    "variant": " Rather",
+    "id": 28142
+   },
+   {
+    "variant": "rather",
+    "id": 84434
+   },
+   {
+    "variant": "Rather",
+    "id": 86696
+   }
+  ],
+  "unless": [
+   {
+    "variant": " unless",
+    "id": 9713
+   },
+   {
+    "variant": " Unless",
+    "id": 37372
+   },
+   {
+    "variant": "unless",
+    "id": 59840
+   },
+   {
+    "variant": "Unless",
+    "id": 64182
+   }
+  ],
+  "otherwise": [
+   {
+    "variant": " otherwise",
+    "id": 8405
+   },
+   {
+    "variant": " Otherwise",
+    "id": 29253
+   },
+   {
+    "variant": "otherwise",
+    "id": 72877
+   },
+   {
+    "variant": "Otherwise",
+    "id": 110456
+   }
+  ],
+  "nonetheless": [
+   {
+    "variant": " nonetheless",
+    "id": 44426
+   },
+   {
+    "variant": " Nonetheless",
+    "id": 56068
+   },
+   {
+    "variant": "Nonetheless",
+    "id": 138502
+   }
+  ],
+  "nevertheless": [
+   {
+    "variant": " nevertheless",
+    "id": 38652
+   },
+   {
+    "variant": " Nevertheless",
+    "id": 30184
+   },
+   {
+    "variant": "Nevertheless",
+    "id": 79509
+   }
+  ],
+  "regardless": [
+   {
+    "variant": " regardless",
+    "id": 17013
+   },
+   {
+    "variant": " Regardless",
+    "id": 53536
+   },
+   {
+    "variant": "regardless",
+    "id": 164872
+   },
+   {
+    "variant": "Regardless",
+    "id": 78647
+   }
+  ],
+  "still": [
+   {
+    "variant": " still",
+    "id": 2235
+   },
+   {
+    "variant": " Still",
+    "id": 21921
+   },
+   {
+    "variant": "still",
+    "id": 63397
+   },
+   {
+    "variant": "Still",
+    "id": 34977
+   }
+  ],
+  "anyway": [
+   {
+    "variant": " anyway",
+    "id": 17743
+   },
+   {
+    "variant": " Anyway",
+    "id": 68715
+   },
+   {
+    "variant": "Anyway",
+    "id": 69776
+   }
+  ],
+  "or": [
+   {
+    "variant": " or",
+    "id": 436
+   },
+   {
+    "variant": " Or",
+    "id": 2607
+   },
+   {
+    "variant": "or",
+    "id": 268
+   },
+   {
+    "variant": "Or",
+    "id": 3836
+   }
+  ],
+  "either": [
+   {
+    "variant": " either",
+    "id": 4048
+   },
+   {
+    "variant": " Either",
+    "id": 37001
+   },
+   {
+    "variant": "either",
+    "id": 61975
+   },
+   {
+    "variant": "Either",
+    "id": 77416
+   }
+  ],
+  "whether": [
+   {
+    "variant": " whether",
+    "id": 3784
+   },
+   {
+    "variant": " Whether",
+    "id": 17934
+   },
+   {
+    "variant": "whether",
+    "id": 49352
+   },
+   {
+    "variant": "Whether",
+    "id": 32173
+   }
+  ],
+  "uncertain": [
+   {
+    "variant": " uncertain",
+    "id": 16828
+   },
+   {
+    "variant": "uncertain",
+    "id": 197297
+   }
+  ],
+  "unsure": [
+   {
+    "variant": " unsure",
+    "id": 49893
+   }
+  ],
+  "possibly": [
+   {
+    "variant": " possibly",
+    "id": 13065
+   },
+   {
+    "variant": " Possibly",
+    "id": 121124
+   },
+   {
+    "variant": "possibly",
+    "id": 99997
+   }
+  ],
+  "might": [
+   {
+    "variant": " might",
+    "id": 2578
+   },
+   {
+    "variant": " Might",
+    "id": 64341
+   },
+   {
+    "variant": "might",
+    "id": 104452
+   },
+   {
+    "variant": "Might",
+    "id": 177060
+   }
+  ],
+  "could": [
+   {
+    "variant": " could",
+    "id": 1448
+   },
+   {
+    "variant": " Could",
+    "id": 29209
+   },
+   {
+    "variant": "could",
+    "id": 50583
+   },
+   {
+    "variant": "Could",
+    "id": 36079
+   }
+  ],
+  "another": [
+   {
+    "variant": " another",
+    "id": 2762
+   },
+   {
+    "variant": " Another",
+    "id": 15256
+   },
+   {
+    "variant": "another",
+    "id": 62657
+   },
+   {
+    "variant": "Another",
+    "id": 14998
+   }
+  ],
+  "different": [
+   {
+    "variant": " different",
+    "id": 1797
+   },
+   {
+    "variant": " Different",
+    "id": 34063
+   },
+   {
+    "variant": "different",
+    "id": 72355
+   },
+   {
+    "variant": "Different",
+    "id": 66010
+   }
+  ],
+  "reconsider": [
+   {
+    "variant": " reconsider",
+    "id": 56197
+   }
+  ],
+  "rethink": [
+   {
+    "variant": " rethink",
+    "id": 92341
+   }
+  ],
+  "retry": [
+   {
+    "variant": " retry",
+    "id": 61263
+   },
+   {
+    "variant": " Retry",
+    "id": 173212
+   },
+   {
+    "variant": "retry",
+    "id": 126087
+   },
+   {
+    "variant": "Retry",
+    "id": 75210
+   }
+  ],
+  "revisit": [
+   {
+    "variant": " revisit",
+    "id": 83302
+   }
+  ],
+  "doubt": [
+   {
+    "variant": " doubt",
+    "id": 11495
+   },
+   {
+    "variant": " Doubt",
+    "id": 161409
+   }
+  ],
+  "confused": [
+   {
+    "variant": " confused",
+    "id": 24211
+   }
+  ],
+  "wrong": [
+   {
+    "variant": " wrong",
+    "id": 6304
+   },
+   {
+    "variant": " Wrong",
+    "id": 75926
+   },
+   {
+    "variant": "wrong",
+    "id": 84178
+   },
+   {
+    "variant": "Wrong",
+    "id": 87024
+   }
+  ],
+  "mistake": [
+   {
+    "variant": " mistake",
+    "id": 20929
+   }
+  ],
+  "error": [
+   {
+    "variant": " error",
+    "id": 4036
+   },
+   {
+    "variant": " Error",
+    "id": 14836
+   },
+   {
+    "variant": "error",
+    "id": 4454
+   },
+   {
+    "variant": "Error",
+    "id": 4085
+   }
+  ],
+  "incorrect": [
+   {
+    "variant": " incorrect",
+    "id": 23555
+   },
+   {
+    "variant": " Incorrect",
+    "id": 179852
+   },
+   {
+    "variant": "incorrect",
+    "id": 175486
+   },
+   {
+    "variant": "Incorrect",
+    "id": 129353
+   }
+  ]
+ },
+ "excluded_multi_token": {
+  "hmm": [
+   {
+    "variant": " hmm",
+    "n_tokens": 2
+   },
+   {
+    "variant": " Hmm",
+    "n_tokens": 2
+   },
+   {
+    "variant": "hmm",
+    "n_tokens": 2
+   }
+  ],
+  "alternatively": [
+   {
+    "variant": "alternatively",
+    "n_tokens": 2
+   }
+  ],
+  "nonetheless": [
+   {
+    "variant": "nonetheless",
+    "n_tokens": 2
+   }
+  ],
+  "nevertheless": [
+   {
+    "variant": "nevertheless",
+    "n_tokens": 2
+   }
+  ],
+  "anyway": [
+   {
+    "variant": "anyway",
+    "n_tokens": 2
+   }
+  ],
+  "uncertain": [
+   {
+    "variant": " Uncertain",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Uncertain",
+    "n_tokens": 2
+   }
+  ],
+  "unsure": [
+   {
+    "variant": " Unsure",
+    "n_tokens": 2
+   },
+   {
+    "variant": "unsure",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Unsure",
+    "n_tokens": 2
+   }
+  ],
+  "possibly": [
+   {
+    "variant": "Possibly",
+    "n_tokens": 2
+   }
+  ],
+  "reconsider": [
+   {
+    "variant": " Reconsider",
+    "n_tokens": 2
+   },
+   {
+    "variant": "reconsider",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Reconsider",
+    "n_tokens": 2
+   }
+  ],
+  "rethink": [
+   {
+    "variant": " Rethink",
+    "n_tokens": 2
+   },
+   {
+    "variant": "rethink",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Rethink",
+    "n_tokens": 3
+   }
+  ],
+  "backtrack": [
+   {
+    "variant": " backtrack",
+    "n_tokens": 2
+   },
+   {
+    "variant": " Backtrack",
+    "n_tokens": 2
+   },
+   {
+    "variant": "backtrack",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Backtrack",
+    "n_tokens": 2
+   }
+  ],
+  "recheck": [
+   {
+    "variant": " recheck",
+    "n_tokens": 2
+   },
+   {
+    "variant": " Recheck",
+    "n_tokens": 2
+   },
+   {
+    "variant": "recheck",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Recheck",
+    "n_tokens": 2
+   }
+  ],
+  "revisit": [
+   {
+    "variant": " Revisit",
+    "n_tokens": 2
+   },
+   {
+    "variant": "revisit",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Revisit",
+    "n_tokens": 2
+   }
+  ],
+  "doubt": [
+   {
+    "variant": "doubt",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Doubt",
+    "n_tokens": 2
+   }
+  ],
+  "confused": [
+   {
+    "variant": " Confused",
+    "n_tokens": 2
+   },
+   {
+    "variant": "confused",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Confused",
+    "n_tokens": 2
+   }
+  ],
+  "mistake": [
+   {
+    "variant": " Mistake",
+    "n_tokens": 2
+   },
+   {
+    "variant": "mistake",
+    "n_tokens": 2
+   },
+   {
+    "variant": "Mistake",
+    "n_tokens": 2
+   }
+  ]
+ }
+}
