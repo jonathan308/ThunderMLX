@@ -127,6 +127,14 @@ GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS = max(
     GENERATION_LOCK_REQUEST_OWNER_GRACE_SECONDS,
     float(os.environ.get("MLX_M3_GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS", "120") or "120"),
 )
+# Keepwarm ops are sub-second (3s worst-case cold ping); one has NO business
+# holding the generation lock longer. 2026-07-23: keepwarm-owned locks shared
+# the 120s control grace, so a hung keepwarm op made first-turn requests wait
+# the full 30s acquire timeout (5 victims in one day, 2x 30s). Own tier now.
+GENERATION_LOCK_KEEPWARM_OWNER_GRACE_SECONDS = max(
+    GENERATION_LOCK_HANDOFF_GRACE_SECONDS,
+    float(os.environ.get("MLX_M3_GENERATION_LOCK_KEEPWARM_OWNER_GRACE_SECONDS", "10") or "10"),
+)
 PREFILL_STEP_SIZE = int(os.environ.get("MLX_M3_PREFILL_STEP_SIZE", "128"))
 MLX_MAX_OPS_PER_BUFFER = int(os.environ.get("MLX_MAX_OPS_PER_BUFFER", "0") or "0")
 MLX_MAX_MB_PER_BUFFER = int(os.environ.get("MLX_MAX_MB_PER_BUFFER", "0") or "0")
@@ -168,7 +176,11 @@ def _should_recover_generation_lock(
     """Return true only when an ownerless generation lock is genuinely stale."""
     if not lock_locked or active_present or releasing_present:
         return False
-    if owner_kind in {"keepwarm", "control"}:
+    if owner_kind == "keepwarm":
+        return owner_age is not None and (
+            owner_age >= GENERATION_LOCK_KEEPWARM_OWNER_GRACE_SECONDS
+        )
+    if owner_kind == "control":
         return owner_age is not None and (
             owner_age >= GENERATION_LOCK_CONTROL_OWNER_GRACE_SECONDS
         )
@@ -20508,6 +20520,7 @@ def run_http_server(model, processor, rank):
         return result.get("value")
 
     def coordinated_keepwarm(size=32, repeats=1, reason="prompt-cache keepwarm"):
+        _op_started = time.time()
         with state_lock:
             if (
                 request_state.get("active") is not None
@@ -20592,6 +20605,15 @@ def run_http_server(model, processor, rank):
                 event["dataplane_ping"] = True
             return event
         finally:
+            held_s = time.time() - _op_started
+            if held_s > 5.0:
+                # Per-tick events log at debug (1 Hz cadence); a SLOW op is
+                # exactly the diagnostic we were blind to on 2026-07-23 —
+                # always loud.
+                logger.warning(
+                    "keepwarm op held generation lock %.1fs (%s)",
+                    held_s, reason,
+                )
             if op_channel_acquired:
                 _RANK0_OP_MUTEX.release()
             # Release only if we are still the recorded owner: after a
@@ -21030,10 +21052,12 @@ def run_http_server(model, processor, rank):
             # Bounded waits + recovery retries: a leaked lock with a single
             # queued waiter used to block until ANOTHER request arrived to
             # trigger the before-acquire recovery (P5b sat 6.5 min behind the
-            # one observed leak, 2026-07-07 09:52). Now every waiter re-runs
-            # the stale check itself every 30s — any leak costs <=30s.
+            # one observed leak, 2026-07-07 09:52). 5s slices (was 30s) so a
+            # stuck keepwarm/control owner is reclaimed within its grace tier
+            # instead of costing the waiter a full 30s (2026-07-23 incident:
+            # first-turn requests stalled 30.0s behind a hung keepwarm op).
             while True:
-                got = await asyncio.to_thread(generation_lock.acquire, True, 30.0)
+                got = await asyncio.to_thread(generation_lock.acquire, True, 5.0)
                 if got:
                     break
                 recover_stale_generation_lock(f"acquire-wait retry {req_id}")
