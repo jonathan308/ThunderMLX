@@ -1261,6 +1261,29 @@ async def api_runtime_overthink_off():
                                  "overthink_penalty": 0})
 
 
+@APP.post("/api/runtime/idle-release-set")
+async def api_runtime_idle_release_set(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        hours = int(float(body.get("hours", 3)))
+    except (TypeError, ValueError):
+        hours = 3
+    hours = max(1, min(72, hours))
+    result = runtime_tuning({"idle_release_hours": hours})
+    return JSONResponse(content={"ok": bool(result.get("ok")),
+                                 "idle_release_hours": hours})
+
+
+@APP.post("/api/runtime/idle-release-off")
+async def api_runtime_idle_release_off():
+    result = runtime_tuning({"idle_release_hours": 0})
+    return JSONResponse(content={"ok": bool(result.get("ok")),
+                                 "idle_release_hours": 0})
+
+
 @APP.post("/api/runtime/profile")
 async def api_runtime_profile(payload: dict):
     profile = str(payload.get("profile") or "").strip()

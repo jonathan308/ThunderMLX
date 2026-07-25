@@ -930,6 +930,9 @@ _runtime_tuning = {
     "overthink_penalty": int(
         float(os.environ.get("MLX_M3_OVERTHINK_PENALTY", "0") or "0")
     ),
+    "idle_release_hours": int(
+        float(os.environ.get("MLX_M3_IDLE_RELEASE_HOURS", "0") or "0")
+    ),
 }
 _applied_decode_runtime = {
     "decode_topk_reuse_tokens": None,
@@ -1045,6 +1048,11 @@ def _set_runtime_tuning(values, clamped_out=None):
         # Overthink logit penalty (arXiv 2606.00206): integer lambda, 0=off.
         # Rank-local sampling change only; safe to move live. Dashboard toggle.
         "overthink_penalty": (0, 8),
+        # Idle memory release: after N hours with no completed requests the
+        # rank0 janitor broadcasts a coordinated cache reset + memory clear
+        # (both ranks drop to a few GB wired; the next request re-wires the
+        # weights in ~7s). 0 = never release. Dashboard toggle.
+        "idle_release_hours": (0, 72),
     }
     # Storage caps: same pattern, except out-of-range integers CLAMP to the
     # guard rails (reported via clamped_out) instead of erroring; garbage
@@ -4784,6 +4792,96 @@ def _enforce_prompt_cache_size_limit():
     return dropped
 
 
+# Populated by run_http_server on rank0 only; the janitor uses it both to
+# gate coordinated (broadcast) drops on "no active/queued request" and as the
+# idle clock for the idle-release feature. On rank1 it stays None-filled and
+# the janitor keeps its original local-only behavior.
+_JANITOR_HTTP_VIEW = {"state_lock": None, "request_state": None, "rank": None}
+_IDLE_RELEASE_STATE = {"last_release_at": 0.0, "boot_at": time.time()}
+# Test hook: when >0, overrides hours*3600 as the idle-release threshold.
+_IDLE_RELEASE_OVERRIDE_SECONDS = float(
+    os.environ.get("MLX_M3_IDLE_RELEASE_OVERRIDE_SECONDS", "0") or "0")
+
+
+def _janitor_http_idle_snapshot():
+    """(idle_ok, last_activity_ts) from rank0's HTTP state; None off-rank0."""
+    lock = _JANITOR_HTTP_VIEW.get("state_lock")
+    rs = _JANITOR_HTTP_VIEW.get("request_state")
+    if lock is None or rs is None:
+        return None, None
+    with lock:
+        active = rs.get("active")
+        queued = int(rs.get("queued") or 0)
+        last = rs.get("last_request") or {}
+    idle_ok = active is None and queued == 0
+    last_ts = float(last.get("finished_at") or _IDLE_RELEASE_STATE["boot_at"])
+    return idle_ok, last_ts
+
+
+def _janitor_coordinated_drop(reason, clear_memory):
+    """Broadcast a both-rank cache reset; best-effort.
+
+    clear_memory=False (TTL path): drop cached KV on both ranks but leave
+    buffer pools and model residency wired — TTFT stays warm.
+    clear_memory=True (idle-release path): the deep clear — both ranks fall
+    to a few GB wired and the next request re-wires the model (~7s).
+    """
+    try:
+        _bcast({
+            "op": "reset_prompt_cache",
+            "reason": reason,
+            "clear_memory": clear_memory,
+            "clear_manifest": False,
+        }, _JANITOR_HTTP_VIEW.get("rank") or 0)
+        return True
+    except Exception as e:
+        logger.warning("janitor %s broadcast failed (falling back local): %s",
+                       reason, e)
+        return False
+
+
+def _janitor_tick():
+    # --- TTL expiry, now coordinated across ranks when safely idle ---------
+    ttl_eligible = False
+    if PROMPT_CACHE_ENABLED and PROMPT_CACHE_TTL_SECONDS > 0:
+        with _prompt_cache_lock:
+            holder = _prompt_cache_holder
+            if holder.get("cache") is not None and not holder.get("in_use"):
+                last_access = float(holder.get("last_access_at") or 0.0)
+                if last_access > 0:
+                    ttl_eligible = (
+                        time.time() - last_access >= PROMPT_CACHE_TTL_SECONDS)
+    if ttl_eligible:
+        idle_ok, _ = _janitor_http_idle_snapshot()
+        if idle_ok:  # rank0 with no traffic: clear rank1's twin too
+            _janitor_coordinated_drop("ttl_expired", clear_memory=False)
+        _expire_idle_prompt_cache()
+
+    # --- idle release: drop everything releasable after N idle hours -------
+    with _runtime_tuning_lock:
+        hours = float(_runtime_tuning.get("idle_release_hours") or 0)
+    if hours <= 0:
+        return
+    threshold = (_IDLE_RELEASE_OVERRIDE_SECONDS
+                 if _IDLE_RELEASE_OVERRIDE_SECONDS > 0 else hours * 3600.0)
+    idle_ok, last_ts = _janitor_http_idle_snapshot()
+    if idle_ok is None or not idle_ok:
+        return
+    now = time.time()
+    if now - last_ts < threshold:
+        return
+    if _IDLE_RELEASE_STATE["last_release_at"] >= last_ts:
+        return  # already released since the last real activity
+    logger.info(
+        "idle release: no requests for %.2fh (threshold %.2fh) — "
+        "coordinated cache reset + memory clear on both ranks",
+        (now - last_ts) / 3600.0, threshold / 3600.0)
+    _janitor_coordinated_drop("idle_release", clear_memory=True)
+    _reset_prompt_cache_and_clear_memory("idle_release")
+    _IDLE_RELEASE_STATE["last_release_at"] = now
+    logger.info("idle release complete; next request re-wires the model")
+
+
 def _start_prompt_cache_janitor():
     if not PROMPT_CACHE_ENABLED or PROMPT_CACHE_TTL_SECONDS <= 0:
         return
@@ -4793,7 +4891,7 @@ def _start_prompt_cache_janitor():
         while True:
             time.sleep(interval)
             try:
-                _expire_idle_prompt_cache()
+                _janitor_tick()
             except Exception as e:
                 logger.debug("prompt-cache janitor failed: %s", e)
 
@@ -8400,6 +8498,8 @@ def _generation_defaults_status():
         "top_p": DEFAULT_TOP_P,
         "top_k": DEFAULT_TOP_K,
         "min_p": DEFAULT_MIN_P,
+        "idle_release_hours": runtime_tuning.get("idle_release_hours"),
+        "idle_release_last_at": _IDLE_RELEASE_STATE.get("last_release_at") or None,
         "tool_temperature": TOOL_DEFAULT_TEMPERATURE,
         "tool_top_p": TOOL_DEFAULT_TOP_P,
         "tool_top_k": TOOL_DEFAULT_TOP_K,
@@ -20290,6 +20390,11 @@ def run_http_server(model, processor, rank):
             "logical_total": 0,
         },
     }
+    # Give the module-level janitor a window into HTTP request state so it
+    # can gate coordinated drops and drive the idle-release clock (rank0 only).
+    _JANITOR_HTTP_VIEW["state_lock"] = state_lock
+    _JANITOR_HTTP_VIEW["request_state"] = request_state
+    _JANITOR_HTTP_VIEW["rank"] = rank
     nonstream_coalescer = _NonstreamRequestCoalescer(
         enabled=NONSTREAM_COALESCE_ENABLED,
         replay_grace_seconds=NONSTREAM_COALESCE_GRACE_SECONDS,

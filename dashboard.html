@@ -467,6 +467,10 @@ footer{ margin-top:46px; border-top:3px solid var(--hair); padding-top:12px;
         <span class="chip" id="overthinkChip" title="Overthink guard: softly discourages hesitation words (wait/but/however…) inside the model's thinking only — quantized models over-hesitate at decision points (arXiv 2606.00206). Never touches tool calls or final answers. A/B: −22% thinking at 100% accuracy.">Overthink guard: …</span>
         <button class="btn sm" data-post="/api/runtime/overthink-on" title="Enable the overthink guard (λ=1)">Guard ON</button>
         <button class="btn sm" data-post="/api/runtime/overthink-off" title="Disable the overthink guard">Guard OFF</button>
+        <span class="chip" id="idleReleaseChip" title="Idle memory release: after N hours with no requests, both ranks drop their caches and model residency (wired memory falls to a few GB). The next request re-wires the model in ~7s. Weights stay on disk; nothing restarts.">Idle release: …</span>
+        <input class="btn sm" id="idleReleaseHours" type="number" min="1" max="72" step="1" value="3" style="width:3.5em" title="Hours of no use before release">
+        <button class="btn sm" id="idleReleaseSetBtn" title="Enable idle release after N hours">Idle rel ON</button>
+        <button class="btn sm" data-post="/api/runtime/idle-release-off" title="Never release memory when idle">Idle rel OFF</button>
       </div>
       <div class="btnrow" style="margin-top:12px">
         <button class="btn sm" data-post="/api/cache/reset" title="Drops only the live RAM KV cache">Clear RAM</button>
@@ -987,6 +991,20 @@ document.querySelectorAll("button[data-post]").forEach(btn => {
     btn.disabled = false;
     refresh();
   });
+});
+
+document.getElementById("idleReleaseSetBtn")?.addEventListener("click", async () => {
+  const btn = document.getElementById("idleReleaseSetBtn");
+  const hours = Number(document.getElementById("idleReleaseHours")?.value || 3);
+  btn.disabled = true; toast(`Idle release ${hours}h …`);
+  try{
+    const r = await fetch("/api/runtime/idle-release-set", {method:"POST",
+      headers:{"Content-Type":"application/json"}, body: JSON.stringify({hours})});
+    const j = await r.json().catch(() => ({}));
+    toast(r.ok && j.ok !== false ? `Idle release ${j.idle_release_hours}h ✓` : "Idle release ✕ " + (j.error || r.status));
+  }catch(e){ toast("Idle release ✕ " + e.message); }
+  btn.disabled = false;
+  refresh();
 });
 
 let currentActiveRequestId = null;
@@ -1800,6 +1818,8 @@ async function refresh(){
   const recent = h.recent_requests || [];
   const otp = h.generation_defaults?.overthink_penalty ?? 0;
   setText("overthinkChip", "Overthink guard: " + (otp > 0 ? `ON (λ=${otp})` : "OFF"));
+  const irh = Number(h.generation_defaults?.idle_release_hours ?? 0);
+  setText("idleReleaseChip", "Idle release: " + (irh > 0 ? `ON (${irh}h)` : "OFF"));
   const activeId = ar && ar.id ? String(ar.id) : null;
   if(cancelPendingRequestId && cancelPendingRequestId !== activeId) cancelPendingRequestId = null;
   currentActiveRequestId = activeId;
