@@ -51,3 +51,8 @@ ops/notes/sol_drafter_plan/
 ops/notes/gpt_sol_drafter_brief.md
 model_gateway.py.bak-*
 model_gateway.py.passthrough-*
+ops/bench/deep-swe/
+ops/bench/jobs/
+ops/bench/deepswe_results/
+ops/bench/deepswe.env
+ops/bench/swe_work/
