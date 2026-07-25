@@ -4158,6 +4158,25 @@ async def openai_proxy(rest: str, request: Request):
     if routed_model and routed_model != model:
         body = rewrite_json_model(body, str(routed_model))
         model = str(routed_model)
+    # Passive metadata probes must NEVER boot a backend: pollers hitting
+    # /v1/props or /v1/models/<id> used to wake M3 (evicting the omlx model
+    # mid-use) just to receive a 404. Only generation-class endpoints may
+    # trigger a backend switch; probes answer from the gateway itself.
+    if STATE.get("active_backend") != backend:
+        if rest in ("props", "version", "health", "slots"):
+            record_event("passive_probe_no_wakeup", path=f"/v1/{rest}",
+                         model=model, backend_preserved=STATE.get("active_backend"))
+            return JSONResponse(status_code=404, content={"error": {
+                "message": f"/v1/{rest} not served while backend is idle",
+                "type": "not_found"}})
+        if rest.startswith("models/") and (request.method or "GET").upper() == "GET":
+            record_event("passive_probe_no_wakeup", path=f"/v1/{rest}",
+                         model=model, backend_preserved=STATE.get("active_backend"))
+            return JSONResponse(content={
+                "id": model or rest.split("/", 1)[-1],
+                "object": "model",
+                "owned_by": "thundermlx",
+            })
     if backend == "m3":
         log_m3_wakeup_attribution(request, model, f"/v1/{rest}")
     ready = await ensure_backend(backend)
