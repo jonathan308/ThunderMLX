@@ -14,3 +14,5 @@ ops/publish_public.sh export-ignore
 # run_with_watchdog.py is exported WITH a sanitized shebang (publish_public.sh
 # rewrites line 1) — the public boot path needs the file, but the local shebang
 # is this machine's absolute venv python.
+docs/DEVELOPMENT-GUIDANCE.md export-ignore
+docs/PLATFORM-AUDIT-AND-ROADMAP.md export-ignore
