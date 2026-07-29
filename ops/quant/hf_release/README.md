@@ -1,13 +1,17 @@
 ---
 base_model: MiniMaxAI/MiniMax-M3
 library_name: mlx
-pipeline_tag: text-generation
+pipeline_tag: image-text-to-text
 tags:
 - mlx
 - minimax
+- multimodal
 - mixture-of-experts
 - mixed-precision
 - quantization
+- agent
+- coding
+- conversational
 - thundermlx
 license: other
 license_name: minimax

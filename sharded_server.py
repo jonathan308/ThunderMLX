@@ -768,9 +768,11 @@ MAX_CONCURRENT_REQUESTS = max(
 EFFECTIVE_MAX_CONCURRENT_REQUESTS = 1
 SSE_KEEPALIVE_SECONDS = float(os.environ.get("MLX_M3_SSE_KEEPALIVE_SECONDS", "5"))
 # Empty OpenAI deltas keep the transport alive, but some agent clients do not
-# count them as stream activity. During a buffered tool turn, periodically emit
-# an explicit reasoning-channel status so a live recovery cannot be mistaken
-# for a dead stream. 0 disables the client-visible pulse.
+# count them as stream activity. Before native tool markup begins, periodically
+# emit an explicit reasoning-channel status so a live recovery cannot be
+# mistaken for a dead stream. Once tool markup is buffering, only transport
+# heartbeats continue; a reasoning delta there would falsely reopen the
+# client's thinking UI after the model already closed it. 0 disables the pulse.
 TOOL_STREAM_PROGRESS_SECONDS = float(
     os.environ.get("MLX_M3_TOOL_STREAM_PROGRESS_SECONDS", "45") or "0"
 )
@@ -788,19 +790,21 @@ def _sse_keepalive_comment() -> str:
 def _tool_stream_progress_delta(
     *,
     has_tools,
+    tool_markup_buffering,
     now,
     last_payload_at,
     last_progress_pulse_at,
 ):
-    """Return a visible liveness pulse while native tool markup is buffered.
+    """Return a visible liveness pulse before native tool markup is buffered.
 
     Some OpenAI clients intentionally ignore empty deltas. Native MiniMax tool
-    arguments can remain behind the XML holdback for many minutes during a
-    large Write/Edit, so protocol comments and empty deltas alone do not reset
-    those clients' stream-idle timers.
+    turns can remain quiet for long stretches, but a reasoning pulse after the
+    tool boundary makes clients look stuck in thinking. At that boundary the
+    SSE comment and empty OpenAI delta remain as transport heartbeats instead.
     """
     if (
         has_tools
+        and not tool_markup_buffering
         and TOOL_STREAM_PROGRESS_SECONDS > 0
         and now - last_payload_at >= TOOL_STREAM_PROGRESS_SECONDS
         and now - last_progress_pulse_at >= TOOL_STREAM_PROGRESS_SECONDS
@@ -10818,6 +10822,40 @@ def _tool_name_map_from_schema(tools):
     return {name.lower(): name for name in _tool_names_from_schema(tools)}
 
 
+def _native_schema_tool_name(name, allowed):
+    """Resolve only an unambiguous case/punctuation variant from the schema."""
+    if not isinstance(name, str):
+        return None
+    stripped = name.strip()
+    if not stripped:
+        return None
+    if stripped in allowed:
+        return stripped
+    lowered = stripped.lower()
+    case_matches = {
+        candidate for candidate in allowed
+        if candidate.lower() == lowered
+    }
+    if len(case_matches) == 1:
+        return next(iter(case_matches))
+    if case_matches or not re.fullmatch(r"[a-z0-9._-]+", lowered):
+        return None
+    compact = re.sub(r"[._-]+", "", lowered)
+    if not compact:
+        return None
+    matches = {
+        candidate
+        for candidate in allowed
+        if (
+            re.fullmatch(r"[a-z0-9._-]+", candidate.lower())
+            and re.sub(r"[._-]+", "", candidate.lower()) == compact
+        )
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
 def _canonical_tool_name(name, name_map):
     if not isinstance(name, str):
         return None
@@ -14932,7 +14970,7 @@ def _validate_outgoing_tool_calls(
             return [], 0, []
         return ([], 0) if return_dropped else []
     name_map = _tool_name_map_from_schema(tools)
-    allowed = set(name_map.values())
+    allowed = _tool_names_from_schema(tools)
     successful_mutations = _successful_exact_mutation_fingerprints(
         processed_messages
     )
@@ -14958,12 +14996,20 @@ def _validate_outgoing_tool_calls(
 
         if not TOOL_COMPAT_OVERLAY:
             name = raw_name if isinstance(raw_name, str) else ""
+            if allowed:
+                name = _native_schema_tool_name(raw_name, allowed)
             if not name or (allowed and name not in allowed):
                 logger.warning("dropping outgoing tool call with unknown name=%r", raw_name)
                 dropped += 1
                 if raw_name:
                     dropped_names.append(str(raw_name))
                 continue
+            if name != raw_name:
+                logger.warning(
+                    "normalized punctuation-equivalent native tool name %r -> %r",
+                    raw_name,
+                    name,
+                )
             # Match oMLX / mlx-vlm native behavior: preserve a complete call
             # and let the client execute it or return an ordinary tool error.
             # Keep only lossless schema shaping. Native mode must not rewrite
@@ -21181,6 +21227,7 @@ def run_http_server(model, processor, rank):
                 "chars_raw": 0,
                 "reasoning_chars": 0,
                 "content_chars": 0,
+                "tool_markup_buffering": False,
                 "first_token_s": 0.0,
                 "last_token_s": 0.0,
                 "first_generator_token_s": 0.0,
@@ -23027,6 +23074,10 @@ def run_http_server(model, processor, rank):
                                     if any(rest.startswith(m) for m in _markers):
                                         tool_stream_pending = ""
                                         tool_stream_silenced = True
+                                        update_generation_slot(
+                                            active,
+                                            tool_markup_buffering=True,
+                                        )
                                         break
                                     if any(m.startswith(rest) for m in _markers):
                                         # could still become a marker — wait
@@ -23627,6 +23678,9 @@ def run_http_server(model, processor, rank):
                                 last_progress_pulse_at,
                             ) = _tool_stream_progress_delta(
                                 has_tools=bool(tools),
+                                tool_markup_buffering=bool(
+                                    active.get("tool_markup_buffering")
+                                ),
                                 now=now,
                                 last_payload_at=last_payload_at,
                                 last_progress_pulse_at=last_progress_pulse_at,

@@ -287,6 +287,7 @@ def check_buffered_tool_stream_progress_is_client_visible():
     assert interval > 0, interval
     delta, pulse_at = _tool_stream_progress_delta(
         has_tools=True,
+        tool_markup_buffering=False,
         now=interval + 1,
         last_payload_at=0,
         last_progress_pulse_at=0,
@@ -296,6 +297,7 @@ def check_buffered_tool_stream_progress_is_client_visible():
 
     quiet, unchanged = _tool_stream_progress_delta(
         has_tools=True,
+        tool_markup_buffering=False,
         now=interval + 2,
         last_payload_at=0,
         last_progress_pulse_at=pulse_at,
@@ -305,11 +307,22 @@ def check_buffered_tool_stream_progress_is_client_visible():
 
     no_tools, _ = _tool_stream_progress_delta(
         has_tools=False,
+        tool_markup_buffering=False,
         now=interval * 2,
         last_payload_at=0,
         last_progress_pulse_at=0,
     )
     assert no_tools == {}, no_tools
+
+    buffered_tool, unchanged = _tool_stream_progress_delta(
+        has_tools=True,
+        tool_markup_buffering=True,
+        now=interval * 2,
+        last_payload_at=0,
+        last_progress_pulse_at=0,
+    )
+    assert buffered_tool == {}, buffered_tool
+    assert unchanged == 0, unchanged
 
 
 def check_unknown_channel_does_not_buffer_forever():
@@ -2353,6 +2366,132 @@ def check_native_identical_tool_loop_steers_without_stopping():
         "content": "Stop polling that file and inspect /tmp/other instead.",
     })
     assert _native_tool_loop_steering_diag(genuine_user_steer, tools) is None
+
+
+def check_native_tool_name_punctuation_drift_is_schema_safe():
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "os__fs__write",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    }]
+    call = {
+        "type": "function",
+        "function": {
+            "name": "os.fs.write",
+            "arguments": {
+                "path": "/tmp/flappy.html",
+                "content": "<!doctype html>",
+            },
+        },
+    }
+    previous_overlay = server.TOOL_COMPAT_OVERLAY
+    try:
+        server.TOOL_COMPAT_OVERLAY = False
+        validated, dropped = _validate_outgoing_tool_calls(
+            [call],
+            tools,
+            return_dropped=True,
+        )
+        assert dropped == 0, (validated, dropped)
+        assert len(validated) == 1, validated
+        assert validated[0]["function"]["name"] == "os__fs__write", validated
+        assert json.loads(validated[0]["function"]["arguments"]) == {
+            "path": "/tmp/flappy.html",
+            "content": "<!doctype html>",
+        }, validated
+
+        unknown, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "os.fs.delete",
+                    "arguments": {"path": "/tmp/flappy.html"},
+                },
+            }],
+            tools,
+            return_dropped=True,
+        )
+        assert unknown == [] and dropped == 1, (unknown, dropped)
+
+        spaced, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "os fs write",
+                    "arguments": call["function"]["arguments"],
+                },
+            }],
+            tools,
+            return_dropped=True,
+        )
+        assert spaced == [] and dropped == 1, (spaced, dropped)
+
+        ambiguous_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("foo.bar", "foo_bar")
+        ]
+        ambiguous, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {
+                    "name": "foo-bar",
+                    "arguments": {},
+                },
+            }],
+            ambiguous_tools,
+            return_dropped=True,
+        )
+        assert ambiguous == [] and dropped == 1, (ambiguous, dropped)
+
+        case_collision_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in ("Foo", "foo")
+        ]
+        case_ambiguous, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {"name": "FOO", "arguments": {}},
+            }],
+            case_collision_tools,
+            return_dropped=True,
+        )
+        assert case_ambiguous == [] and dropped == 1, (
+            case_ambiguous,
+            dropped,
+        )
+        exact_case, dropped = _validate_outgoing_tool_calls(
+            [{
+                "type": "function",
+                "function": {"name": "Foo", "arguments": {}},
+            }],
+            case_collision_tools,
+            return_dropped=True,
+        )
+        assert len(exact_case) == 1 and dropped == 0, (exact_case, dropped)
+        assert exact_case[0]["function"]["name"] == "Foo", exact_case
+    finally:
+        server.TOOL_COMPAT_OVERLAY = previous_overlay
 
 
 def _repeated_named_tool_messages(tool_name, count):
@@ -5323,6 +5462,7 @@ def main():
     check_stream_analysis_channel()
     check_buffered_tool_stream_progress_is_client_visible()
     check_native_identical_tool_loop_steers_without_stopping()
+    check_native_tool_name_punctuation_drift_is_schema_safe()
     check_unknown_channel_does_not_buffer_forever()
     check_image_generations_bypass_text_prompt_cache()
     check_malformed_positional_xml_tool_call_recovers()

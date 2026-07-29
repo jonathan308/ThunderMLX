@@ -55,7 +55,11 @@ def main():
             "temperature", "top_p", "top_k", "min_p", "seed",
             "repetition_penalty", "thinking_budget",
         ),
-        "THINKING_DEFAULT_REPETITION_PENALTY": 1.10,
+        "THINKING_DEFAULT_MIN_P": 0.0,
+        "THINKING_DEFAULT_REPETITION_PENALTY": 1.0,
+        "THINKING_DEFAULT_TEMPERATURE": 1.0,
+        "THINKING_DEFAULT_TOP_K": 0,
+        "THINKING_DEFAULT_TOP_P": 0.95,
         "THINKING_MIN_TEMPERATURE": 0.5,
         "TOOL_DEFAULT_MIN_P": 0.0,
         "TOOL_DEFAULT_REPETITION_PENALTY": 1.08,
@@ -81,12 +85,16 @@ def main():
     )
     thinking_prose = params({"thinking_mode": "enabled"})
     failures += check(
-        thinking_prose["temperature"] == 0.5,
-        "thinking prose still receives the temperature floor",
+        thinking_prose["temperature"] == 1.0,
+        "thinking prose receives the published temperature default",
     )
     failures += check(
-        thinking_prose["repetition_penalty"] == 1.10,
-        "thinking prose still receives its anti-loop penalty",
+        thinking_prose["top_p"] == 0.95,
+        "thinking prose receives the published top-p default",
+    )
+    failures += check(
+        thinking_prose["repetition_penalty"] == 1.0,
+        "thinking prose keeps the neutral repetition penalty",
     )
     explicit = params(
         {"thinking_mode": "enabled", "temperature": 0.35}, tools
@@ -112,6 +120,7 @@ def main():
         "_tool_choice_disables_tools": lambda request: (
             request.get("tool_choice") == "none"
         ),
+        "_file_write_chunk_hint": lambda tools: "",
         "_tool_loop_steering_text": loop_steering_text,
     }
     load_function("_tool_choice_required_name", hint_ns)
@@ -154,7 +163,7 @@ def main():
         {"triggered": True, "reasons": ["repeated_tool"]},
     )
     failures += check(
-        steered_thinking[0]["content"] == "DYNAMIC LOOP STEER",
+        steered_thinking[-1]["content"] == "DYNAMIC LOOP STEER",
         "thinking tool loops still receive dynamic recovery steering",
     )
     no_path_thinking = add_hint(
@@ -163,8 +172,10 @@ def main():
         tools,
     )
     failures += check(
-        no_path_thinking == [{"role": "user", "content": "work"}],
-        "thinking prompts without anchored path metadata stay untouched",
+        len(no_path_thinking) == 2
+        and "Tool availability rule" in no_path_thinking[0]["content"]
+        and "Tool execution rule" in no_path_thinking[0]["content"],
+        "thinking tool turns receive the compact cache-stable primer",
     )
     action_no_path = add_hint(
         [{"role": "user", "content": "Create a complete app.py file."}],
@@ -172,8 +183,8 @@ def main():
         tools,
     )
     failures += check(
-        "Tool execution rule" in action_no_path[0]["content"],
-        "clear thinking action requests receive a compact execution rule",
+        action_no_path[0]["content"] == no_path_thinking[0]["content"],
+        "action requests keep the same cache-stable execution rule",
     )
     action_after_tool = add_hint(
         [
@@ -207,9 +218,8 @@ def main():
         tools,
     )
     failures += check(
-        explanation_no_path
-        == [{"role": "user", "content": "Explain how to create an app.py file."}],
-        "explanatory prompts do not force a tool call",
+        explanation_no_path[0]["content"] == no_path_thinking[0]["content"],
+        "explanatory prompts keep the same non-forcing tool primer",
     )
     initial_no_think = add_hint(
         messages, {"thinking_mode": "disabled"}, tools
@@ -226,9 +236,9 @@ def main():
         {"triggered": True, "reasons": ["repeated_tool"]},
     )
     failures += check(
-        steered_no_think[0]["content"]
-        == initial_no_think[0]["content"] + "\n\nDYNAMIC LOOP STEER",
-        "no-thinking loops combine primer, path anchor, and steering",
+        steered_no_think[0]["content"] == initial_no_think[0]["content"]
+        and steered_no_think[-1]["content"] == "DYNAMIC LOOP STEER",
+        "no-thinking loops preserve the primer and append steering",
     )
     disabled = add_hint(
         messages,

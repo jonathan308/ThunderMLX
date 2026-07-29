@@ -27,9 +27,8 @@ cp "$HERE/README.md" "$SRC/README.md"
 find "$SRC" -name '._*' -delete
 
 export HF_HUB_ENABLE_HF_TRANSFER=1
-huggingface-cli repo create "$REPO" --repo-type model -y 2>/dev/null || true
-huggingface-cli upload "$REPO" "$SRC" . \
-  --repo-type model \
-  --commit-message "MiniMax-M3 mixed-precision 4.5-bit MLX quant (ThunderMLX)"
+hf repos create "$REPO" --repo-type model 2>/dev/null || true
+# upload-large-folder: resumable, chunked — re-running resumes where it left off.
+hf upload-large-folder "$REPO" "$SRC" --repo-type model
 
 echo "LIVE: https://huggingface.co/$REPO"
