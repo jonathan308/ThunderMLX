@@ -348,12 +348,6 @@ if [[ "$RANK0_LIMIT" != "0" && "${RANK0_WIRED_GB:-0}" -gt "$RANK0_LIMIT" ]] || \
 fi
 echo ""
 
-echo "Unloading duplicate MiniMax-M3 from separate oMLX port ${OMLX_PORT}, if present..."
-curl -s --max-time 8 -X POST \
-  "http://127.0.0.1:${OMLX_PORT}/admin/api/models/MiniMax-M3-4bit/unload" \
-  >/dev/null 2>&1 || true
-echo ""
-
 echo "Syncing cluster code to rank 1..."
 if /bin/zsh "$CLUSTER/sync_rank1.sh"; then
   echo "  rank 1 synced"

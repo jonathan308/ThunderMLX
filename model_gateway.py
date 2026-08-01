@@ -50,6 +50,9 @@ CLAUDE_MODEL_IDS = set(env_list("M3_GATEWAY_CLAUDE_MODEL_IDS", "Claude-Code,Clau
 # (agent UIs pick up everything listed, and the Claude shim shouldn't be offered).
 CLAUDE_MODELS_VISIBLE = env_bool("M3_GATEWAY_CLAUDE_MODELS_VISIBLE", False)
 DEFAULT_MODEL_ID = os.environ.get("M3_GATEWAY_DEFAULT_MODEL_ID", "Minimax-M3-No-Think").strip() or "Minimax-M3-No-Think"
+# Model-less requests follow the session already in flight instead of
+# hard-defaulting to M3 (see _sticky_default_model). 0 restores old behavior.
+STICKY_EMPTY_MODEL = env_bool("M3_GATEWAY_STICKY_EMPTY_MODEL", True)
 AUTO_SWITCH = env_bool("M3_GATEWAY_AUTO_SWITCH", True)
 ALLOW_START_M3 = env_bool("M3_GATEWAY_ALLOW_START_M3", True)
 ALLOW_STOP_M3 = env_bool("M3_GATEWAY_ALLOW_STOP_M3", True)
@@ -424,6 +427,25 @@ STATE: dict[str, Any] = {
 }
 
 
+def _sticky_default_model() -> str | None:
+    """Model id to use when a client sends an empty model field.
+
+    Returns the id last successfully routed if that backend is still the active
+    one, so a model-less side-call (title generation, agent summary) follows the
+    session the user is actually in rather than yanking the cluster back to M3.
+    None means "no opinion" and the caller falls back to DEFAULT_MODEL_ID.
+    """
+    if not STICKY_EMPTY_MODEL:
+        return None
+    last = STATE.get("last_routed_model")
+    if not last:
+        return None
+    backend = STATE.get("active_backend")
+    if backend and backend != "unknown" and backend_for_model(last) == backend:
+        return str(last)
+    return None
+
+
 def canonical_m3_model_id(model: str | None) -> str | None:
     """Map common client spelling/case variants to a visible M3 model id."""
     raw = str(model or "").strip()
@@ -572,8 +594,14 @@ def normalize_openai_json_body(body: bytes) -> tuple[bytes, str | None, bool]:
     model = str(raw_model or "").strip()
     changed = False
     if not model:
-        payload["model"] = DEFAULT_MODEL_ID
-        model = DEFAULT_MODEL_ID
+        # An empty model must NOT force an anchor swap. zcode sends model-less
+        # requests (title/summary/agent side-calls); defaulting them straight to
+        # DEFAULT_MODEL_ID woke the M3 cluster out from under whichever backend
+        # the user had actually selected, then the real request was refused by
+        # the grace window (2026-07-31). Prefer the backend already serving:
+        # if oMLX has a model loaded and M3 is not up, stay on oMLX.
+        model = _sticky_default_model() or DEFAULT_MODEL_ID
+        payload["model"] = model
         changed = True
     canonical_m3 = canonical_m3_model_id(model)
     if canonical_m3 and canonical_m3 != model:
@@ -2796,6 +2824,12 @@ async def unload_omlx_loaded_models() -> dict[str, Any]:
     return {"ok": ok, "results": results}
 
 
+def _note_routed_model(model: str | None) -> None:
+    """Remember the last explicitly-requested model for sticky defaulting."""
+    if model:
+        STATE["last_routed_model"] = str(model)
+
+
 def _note_backend_traffic(backend: str) -> None:
     if backend == "m3":
         STATE["last_m3_traffic"] = time.time()
@@ -2861,6 +2895,24 @@ async def stop_m3_for_omlx() -> dict[str, Any]:
     if not ALLOW_STOP_M3:
         return {"ok": False, "error": "M3 auto-stop disabled"}
     busy = _m3_busy_reason(health)
+    # A bare "recently had traffic" refusal made model switching unreliable
+    # (2026-07-31): a background agent turn stamps last_m3_traffic, then the
+    # user's very next request to another backend is refused for the rest of
+    # the grace window, so they resend until it happens to land outside it.
+    # An idle-but-recent M3 is safe to stop — just wait the window out instead
+    # of erroring. Real work (active request / queued depth) still refuses.
+    if busy and "traffic" in busy:
+        deadline = time.time() + STOP_M3_GRACE_S + 5
+        while time.time() < deadline:
+            await asyncio.sleep(2)
+            health = await m3_health()
+            if not health:
+                return {"ok": True, "already_stopped": True}
+            busy = _m3_busy_reason(health)
+            if not busy or "traffic" not in busy:
+                break
+        if busy and "traffic" in busy:
+            record_event("stop_m3_grace_wait_timeout", reason=busy)
     if busy:
         record_event("stop_m3_refused_busy", reason=busy)
         return {"ok": False, "error": f"M3 busy — auto-stop refused: {busy}"}
@@ -4134,7 +4186,23 @@ async def openai_proxy(rest: str, request: Request):
     body, normalized_model, normalized = normalize_openai_json_body(body)
     model = normalized_model if normalized_model is not None else await request_model(request, body)
     if normalized:
-        record_event("defaulted_empty_model", path=f"/v1/{rest}", model=model)
+        record_event("defaulted_empty_model", path=f"/v1/{rest}", model=model,
+                     sticky=bool(STATE.get("last_routed_model")))
+        # A model-less request may USE a running backend but must never START
+        # one. zcode fires these for titles/summaries; booting the 160 GB
+        # cluster for a title (and evicting the model the user selected) is
+        # never what anyone wants. Tell the client to be explicit instead.
+        if backend_for_model(model) == "m3" and not await m3_health():
+            record_event("defaulted_empty_model_refused_wake", model=model)
+            return JSONResponse(status_code=503, content={"error": {
+                "message": ("Request had no model field. The gateway will not "
+                            "start the M3 cluster for an unspecified model — "
+                            "send an explicit model id."),
+                "type": "model_required"}})
+    else:
+        # Only an explicit client-supplied model updates stickiness, so a
+        # defaulted side-call can never redefine the session's backend.
+        _note_routed_model(model)
     route = await resolve_requested_model(model)
     if not route.get("ok"):
         record_event(

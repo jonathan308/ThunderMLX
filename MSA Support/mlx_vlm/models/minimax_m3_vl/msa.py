@@ -18,6 +18,9 @@ _NATIVE_TOPK_SELECT_MODE = os.environ.get(
 _NATIVE_MSA_TOPK_MODE = os.environ.get(
     "MLX_MINIMAX_MSA_NATIVE_TOPK", "auto"
 ).lower()
+_FUSED_MSA_TOPK_ENABLED = os.environ.get(
+    "MLX_M3_MSA_FUSED_TOPK", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 _DIRECT_DECODE_EVAL_MODE = os.environ.get(
     "MLX_M3_DIRECT_DECODE_EVAL_MODE", "small"
 ).strip().lower()
@@ -47,6 +50,7 @@ _KERNEL_STATS = {
     "decode_select_v2_calls": 0,
     "topk_native": 0,
     "topk_fallback": 0,
+    "topk_fused": 0,
     "topk_native_error": 0,
     "topk_ineligible": 0,
     "prefill_attention_calls": 0,
@@ -1344,6 +1348,65 @@ def _select_msa_topk_from_block_scores_fallback(
     return mx.where(topk_idx < num_blocks, topk_idx.astype(mx.int32), invalid)
 
 
+def _build_msa_block_scores_fused(
+    idx_queries: mx.array,
+    idx_keys: mx.array,
+    q_start: int,
+    scale: float,
+    block_size: int,
+) -> Optional[mx.array]:
+    """Fused Metal block-score build for the MSA top-k stage.
+
+    Returns block_scores [B, H_idx, L, num_blocks] fp32 identical in semantics
+    to the score stage of :func:`build_grouped_msa_topk` (causal token mask,
+    128-token block max, -inf padding), or None when the shape/dtype is not
+    eligible so callers can fall back to the reference path. B=1, D=128,
+    block_size=128, bfloat16 inputs only."""
+    if not _FUSED_MSA_TOPK_ENABLED:
+        return None
+    if not mx.metal.is_available():
+        return None
+    if idx_queries.ndim != 4 or idx_keys.ndim != 4:
+        return None
+    B, H_idx, L, dim = idx_queries.shape
+    Bk, H_k, total_k, k_dim = idx_keys.shape
+    if B != 1 or Bk != 1 or H_k != 1 or dim != 128 or k_dim != 128:
+        return None
+    if int(block_size) != 128 or L < 1 or total_k < 1:
+        return None
+    if idx_queries.dtype != mx.bfloat16 or idx_keys.dtype != mx.bfloat16:
+        return None
+
+    q = mx.contiguous(idx_queries.reshape(H_idx, L, dim))
+    k = mx.contiguous(idx_keys.reshape(total_k, k_dim))
+    scale_arr = mx.array([float(scale)], dtype=mx.float32)
+
+    num_blocks = (int(total_k) + 127) // 128
+    q_tile, chunk_blocks, threads = 32, 8, 256
+    chunks = (num_blocks + chunk_blocks - 1) // chunk_blocks
+    qtiles = (int(L) + q_tile - 1) // q_tile
+    groups = int(H_idx) * qtiles * chunks
+    return _MSA_TOPK_SCORE_FUSED(
+        inputs=[q, k, scale_arr],
+        template=[
+            ("H", int(H_idx)),
+            ("L", int(L)),
+            ("TOTAL_K", int(total_k)),
+            ("NUM_BLOCKS", num_blocks),
+            ("Q_START", int(q_start)),
+            ("BLOCK_SIZE", 128),
+            ("DIM", 128),
+            ("Q_TILE", q_tile),
+            ("CHUNK_BLOCKS", chunk_blocks),
+            ("THREADS", threads),
+        ],
+        grid=(groups * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[(int(H_idx), int(L), num_blocks)],
+        output_dtypes=[mx.float32],
+    )[0].reshape(1, int(H_idx), int(L), num_blocks)
+
+
 def _build_grouped_msa_topk_native(
     idx_queries: mx.array,
     idx_keys: mx.array,
@@ -1889,6 +1952,130 @@ _MSA_TOPK_SELECT = mx.fast.metal_kernel(
 )
 
 
+# Fused MSA top-k SCORE builder (ThunderMLX overlay, 2026-07-29).
+#
+# Replaces the Python blockwise score loop (and the standard builder's full
+# [H, L, total_k] fp32 score materialization) with a single Metal pass that
+# computes token scores for a 32-query tile x 8 KV blocks, applies the causal
+# mask in registers, and reduces each 128-token block to its block max in
+# threadgroup memory. K/V and Q are read as bfloat16 (their native storage
+# dtype), halving score-build bandwidth vs the fp32 upcast path, and the only
+# global-memory output is the small [H, L, num_blocks] fp32 block-score tensor.
+# Semantics match build_grouped_msa_topk's score stage exactly:
+#   block_scores[h, l, b] = max_{t in block b, t <= q_start + l} scale * <q, k>
+# with -inf for fully masked/padded blocks. The downstream top-k selection is
+# untouched. Kill switch: MLX_M3_MSA_FUSED_TOPK=0.
+_MSA_TOPK_SCORE_FUSED = mx.fast.metal_kernel(
+    name="minimax_m3_msa_topk_score_fused",
+    input_names=["idx_q", "idx_k", "scale_in"],
+    output_names=["block_scores"],
+    header="#include <metal_simdgroup>\nusing namespace metal;\n",
+    source=r"""
+        uint tg = threadgroup_position_in_grid.x;
+        uint tid = thread_index_in_threadgroup;
+
+        uint chunks = (NUM_BLOCKS + CHUNK_BLOCKS - 1) / CHUNK_BLOCKS;
+        uint qtiles = (L + Q_TILE - 1) / Q_TILE;
+        uint chunk = tg % chunks;
+        uint qt = (tg / chunks) % qtiles;
+        uint h = tg / (chunks * qtiles);
+        if (h >= H) {
+            return;
+        }
+
+        uint qi4 = tid >> 5;         // 8 groups of 4 query rows
+        uint lane = tid & 31;        // 32 lanes cover 64 tokens (2 each)
+        int q_row0 = int(qt * Q_TILE + qi4 * 4);
+        bool q_live = q_row0 < int(L);
+
+        threadgroup bfloat16_t q_s[Q_TILE * (DIM + 4)];
+
+        // Stage the query tile (zero-padded past L).
+        for (uint e = tid; e < Q_TILE * DIM; e += THREADS) {
+            uint r = e / DIM;
+            uint d = e % DIM;
+            int row = int(qt * Q_TILE + r);
+            bfloat16_t val = 0.0bf;
+            if (row < int(L)) {
+                val = idx_q[(h * L + uint(row)) * DIM + d];
+            }
+            q_s[r * (DIM + 4) + d] = val;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float scale = float(scale_in[0]);
+        uint kv_block_base = chunk * CHUNK_BLOCKS;
+        const threadgroup bfloat4* qrows[4];
+        for (uint g = 0; g < 4; ++g) {
+            qrows[g] = (const threadgroup bfloat4*)&q_s[(qi4 * 4 + g) * (DIM + 4)];
+        }
+
+        // Register-tiled hot loop: each thread owns 4 queries x 2 tokens so
+        // every K load is reused across 4 queries. Two passes cover the full
+        // 128-token block; block max is reduced across the whole simdgroup.
+        for (uint b = 0; b < CHUNK_BLOCKS; ++b) {
+            uint kv_block = kv_block_base + b;
+            if (kv_block >= NUM_BLOCKS) {
+                break;
+            }
+            float qmax[4] = {-INFINITY, -INFINITY, -INFINITY, -INFINITY};
+            for (uint pass = 0; pass < 2; ++pass) {
+                uint ta = kv_block * BLOCK_SIZE + pass * 64 + lane * 2;
+                uint tb = ta + 1;
+                const device bfloat4* ka = (const device bfloat4*)&idx_k[ta * DIM];
+                const device bfloat4* kb = (const device bfloat4*)&idx_k[tb * DIM];
+                bool va = ta < TOTAL_K;
+                bool vb = tb < TOTAL_K;
+                float4 acc[4][2];
+                for (uint g = 0; g < 4; ++g) {
+                    acc[g][0] = float4(0.0f);
+                    acc[g][1] = float4(0.0f);
+                }
+                for (uint d4 = 0; d4 < DIM / 4; ++d4) {
+                    float4 kva = float4(ka[d4]);
+                    float4 kvb = float4(kb[d4]);
+                    for (uint g = 0; g < 4; ++g) {
+                        float4 qv = float4(qrows[g][d4]);
+                        acc[g][0] = fma(qv, kva, acc[g][0]);
+                        acc[g][1] = fma(qv, kvb, acc[g][1]);
+                    }
+                }
+                for (uint g = 0; g < 4; ++g) {
+                    int q_abs = Q_START + q_row0 + int(g);
+                    if (va && int(ta) <= q_abs) {
+                        qmax[g] = max(qmax[g],
+                            ((acc[g][0].x + acc[g][0].y) + (acc[g][0].z + acc[g][0].w)) * scale);
+                    }
+                    if (vb && int(tb) <= q_abs) {
+                        qmax[g] = max(qmax[g],
+                            ((acc[g][1].x + acc[g][1].y) + (acc[g][1].z + acc[g][1].w)) * scale);
+                    }
+                }
+            }
+            for (uint g = 0; g < 4; ++g) {
+                qmax[g] = max(qmax[g], simd_shuffle_xor(qmax[g], 16));
+                qmax[g] = max(qmax[g], simd_shuffle_xor(qmax[g], 8));
+                qmax[g] = max(qmax[g], simd_shuffle_xor(qmax[g], 4));
+                qmax[g] = max(qmax[g], simd_shuffle_xor(qmax[g], 2));
+                qmax[g] = max(qmax[g], simd_shuffle_xor(qmax[g], 1));
+            }
+            if (lane == 0 && q_live) {
+                for (uint g = 0; g < 4; ++g) {
+                    int q_row = q_row0 + int(g);
+                    if (q_row < int(L)) {
+                        float m = qmax[g];
+                        if (m != m) {
+                            m = -INFINITY;
+                        }
+                        block_scores[(h * L + uint(q_row)) * NUM_BLOCKS + kv_block] = m;
+                    }
+                }
+            }
+        }
+    """,
+)
+
+
 _MSA_DECODE_B1_SIMD = mx.fast.metal_kernel(
     name="minimax_m3_msa_decode_b1_simd",
     input_names=["q", "k", "v", "topk_idx", "topk_valid", "scale"],
@@ -1988,6 +2175,24 @@ def build_grouped_msa_topk(
     if native is not None:
         return native
 
+    block_scores_fused = _build_msa_block_scores_fused(
+        idx_queries,
+        idx_keys,
+        q_start,
+        scale,
+        block_size,
+    )
+    if block_scores_fused is not None:
+        _stat("topk_fused")
+        return _select_msa_topk_from_block_scores(
+            block_scores_fused,
+            q_start=q_start,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        )
+
     _stat("topk_fallback")
     B, H_idx, L, _ = idx_queries.shape
     total_len = idx_keys.shape[2]
@@ -2062,6 +2267,24 @@ def build_grouped_msa_topk_blockwise(
     )
     if native is not None:
         return native
+
+    block_scores_fused = _build_msa_block_scores_fused(
+        idx_queries,
+        idx_keys,
+        q_start,
+        scale,
+        block_size,
+    )
+    if block_scores_fused is not None:
+        _stat("topk_fused")
+        return _select_msa_topk_from_block_scores(
+            block_scores_fused,
+            q_start=q_start,
+            block_size=block_size,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+        )
 
     _stat("topk_fallback")
     B, H_idx, L, _ = idx_queries.shape
